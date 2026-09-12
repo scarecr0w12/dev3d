@@ -7,12 +7,14 @@ import { resolveInWorkspace } from './paths.ts';
 import { createFsTools } from './fs.ts';
 import { createShellTools } from './shell.ts';
 import { createDefaultTools, createToolRegistry } from './registry.ts';
+import { TOOL_IDS } from '../org/defaultCompany.ts';
 import type { Tool, ToolContext } from './types.ts';
 
 function makeContext(workspaceRoot: string, overrides?: Partial<ToolContext>): ToolContext {
   return {
     workspaceRoot,
     writtenPaths: new Set<string>(),
+    plan: [],
     requestApproval: async () => true,
     autoApproveShell: false,
     log: () => {},
@@ -197,20 +199,15 @@ test('registry registers tools, rejects duplicates, and builds schemas', () => {
   for (const tool of defaults) registry.register(tool);
 
   const names = registry.names();
-  assert.equal(names.length, 9);
-  for (const id of [
-    'think',
-    'list_dir',
-    'read_file',
-    'search_files',
-    'write_file',
-    'edit_file',
-    'run_shell',
-    'web_search',
-    'web_fetch',
-  ]) {
-    assert.ok(registry.get(id), `registry should contain ${id}`);
-  }
+  // Every tool the org chart can grant must exist, and nothing else may. The
+  // two lists are the security surface, so they are compared rather than
+  // counted: a new tool that nobody can be granted, or a grant for a tool that
+  // does not exist, is a defect either way.
+  assert.deepEqual(
+    [...names].sort(),
+    [...TOOL_IDS].sort(),
+    'the registry must offer exactly the tool ids the org chart declares',
+  );
 
   assert.throws(() => registry.register(defaults[0]!), /already has a tool/);
 

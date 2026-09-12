@@ -162,6 +162,15 @@ async function executeToolCall(
     // must not be able to see each other's files.
     workspaceRoot: req.run.workspacePath,
     writtenPaths: req.writtenPaths,
+    // The run's own plan array, by reference: a tool that edits it must edit the
+    // run, so the next turn - and the operator's console - sees the change.
+    plan: req.run.plan,
+    onPlanChange: () => {
+      // Persisted with the run like any other run state, and pushed to the
+      // console on the existing `run.updated` event rather than a new one.
+      req.run.updatedAt = Date.now();
+      deps.sink.emit({ type: 'run.updated', run: structuredClone(req.run), at: Date.now() });
+    },
     autoApproveShell: deps.config.autoApproveShell,
     signal: req.signal,
     log: (level, message) => {

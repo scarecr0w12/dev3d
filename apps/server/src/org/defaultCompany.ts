@@ -62,12 +62,17 @@ export type SkillId = (typeof SKILL_IDS)[number];
  */
 export const TOOL_IDS = [
   'think',
+  'todo_write',
   'list_dir',
   'read_file',
   'search_files',
+  'glob',
+  'grep',
   'write_file',
   'edit_file',
+  'apply_patch',
   'run_shell',
+  'git',
   'web_search',
   'web_fetch',
 ] as const;
@@ -75,20 +80,16 @@ export const TOOL_IDS = [
 export type ToolId = (typeof TOOL_IDS)[number];
 
 /** Read-only reconnaissance, safe for anyone. */
-const READ_TOOLS: ToolId[] = ['think', 'list_dir', 'read_file'];
+const READ_TOOLS: ToolId[] = ['think', 'todo_write', 'list_dir', 'read_file', 'glob', 'grep', 'git'];
 /** Read plus the ability to write documents (specs, plans, reports). */
 const DOC_TOOLS: ToolId[] = [...READ_TOOLS, 'write_file', 'web_search', 'web_fetch'];
 /** A developer: reads, writes, edits and executes inside the workspace. */
 const DEV_TOOLS: ToolId[] = [
-  'think',
-  'list_dir',
-  'read_file',
+  ...DOC_TOOLS,
   'search_files',
-  'write_file',
   'edit_file',
+  'apply_patch',
   'run_shell',
-  'web_search',
-  'web_fetch',
 ];
 
 function policy(p: Partial<ModelPolicy> & { defaultTier: ModelTier }): ModelPolicy {

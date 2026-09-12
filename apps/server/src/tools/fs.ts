@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { join } from 'node:path';
 import type { Tool, ToolContext, ToolResult } from './types.ts';
 import { resolveInWorkspace, toWorkspaceRelative } from './paths.ts';
+import { SKIPPED_DIRS, globMatches } from './match.ts';
 
 const MAX_LIST_ENTRIES = 200;
 const MAX_READ_LINES = 400;
@@ -20,7 +21,6 @@ const MAX_SEARCH_FILE_BYTES = 512 * 1024; // 512 KB
 const MAX_SEARCH_MATCHES = 120;
 const MAX_LINE_DISPLAY = 300;
 const LIST_MAX_DEPTH = 4;
-const SKIPPED_DIRS = new Set(['node_modules', '.git']);
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -55,51 +55,6 @@ function guarded(run: Tool['run']): Tool['run'] {
       return fail(`Tool error: ${errMsg(e)}`);
     }
   };
-}
-
-// ---------------------------------------------------------------------------
-// glob matching (`*` and `**`) - no dependency, hand-rolled.
-// ---------------------------------------------------------------------------
-
-function globToRegExp(glob: string): RegExp {
-  let out = '^';
-  let i = 0;
-  while (i < glob.length) {
-    const c = glob[i]!;
-    if (c === '*') {
-      if (glob[i + 1] === '*') {
-        if (glob[i + 2] === '/') {
-          out += '(?:.*/)?'; // `**/` matches zero or more leading segments
-          i += 3;
-        } else {
-          out += '.*'; // `**` matches across separators
-          i += 2;
-        }
-      } else {
-        out += '[^/]*'; // `*` matches within one segment
-        i += 1;
-      }
-    } else if (c === '?') {
-      out += '[^/]';
-      i += 1;
-    } else if ('\\^$.|+()[]{}'.includes(c)) {
-      out += `\\${c}`;
-      i += 1;
-    } else {
-      out += c;
-      i += 1;
-    }
-  }
-  out += '$';
-  return new RegExp(out, 'i');
-}
-
-function globMatches(glob: string, relPath: string): boolean {
-  if (!glob) return true;
-  // A glob with no path separator (e.g. `*.ts`) is treated as matching at any
-  // depth, so `*.ts` finds `src/foo.ts` as well as `foo.ts`.
-  const effective = glob.includes('/') ? glob : `**/${glob}`;
-  return globToRegExp(effective).test(relPath);
 }
 
 // ---------------------------------------------------------------------------

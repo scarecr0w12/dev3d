@@ -7,8 +7,11 @@
 import type { ToolSchema } from '@dev3d/core';
 import type { Tool, ToolRegistry } from './types.ts';
 import { createFsTools } from './fs.ts';
+import { createCodeTools } from './code.ts';
 import { createShellTools } from './shell.ts';
 import { createWebTools } from './web.ts';
+import { createGitTools } from './git.ts';
+import { createPlanTools } from './plan.ts';
 import { createMiscTools } from './misc.ts';
 
 export function createToolRegistry(): ToolRegistry {
@@ -47,5 +50,13 @@ export function createToolRegistry(): ToolRegistry {
 }
 
 export function createDefaultTools(): Tool[] {
-  return [...createFsTools(), ...createShellTools(), ...createWebTools(), ...createMiscTools()];
+  return [
+    ...createFsTools(),
+    ...createCodeTools(),
+    ...createShellTools(),
+    ...createWebTools(),
+    ...createGitTools(),
+    ...createPlanTools(),
+    ...createMiscTools(),
+  ];
 }

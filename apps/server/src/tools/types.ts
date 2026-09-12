@@ -9,7 +9,7 @@
  * read the message and correct course.
  */
 
-import type { ApprovalKind, ToolSchema } from '@dev3d/core';
+import type { AgentPlanStep, ApprovalKind, ToolSchema } from '@dev3d/core';
 
 export interface ToolApprovalRequest {
   kind: ApprovalKind;
@@ -22,6 +22,23 @@ export interface ToolContext {
   workspaceRoot: string;
   /** Workspace-relative paths written so far in this run. */
   writtenPaths: Set<string>;
+  /**
+   * The run's working plan, shared by every turn of the run.
+   *
+   * It is a live reference to the run's own array, so a tool that edits it has
+   * changed the run: `todo_write` replaces the contents in place rather than
+   * assigning a new array, which keeps every later turn looking at the same one.
+   */
+  plan: AgentPlanStep[];
+  /**
+   * Announce that the plan changed, so the operator sees it without waiting for
+   * the run to end.
+   *
+   * A callback rather than the tool emitting an event itself: tools do not know
+   * about runs or the event sink, and keeping it that way is what lets the whole
+   * tool layer be tested with a bare context object.
+   */
+  onPlanChange?(): void;
   /** Ask the human. Resolves false when denied or when nobody can answer. */
   requestApproval(req: ToolApprovalRequest): Promise<boolean>;
   /** When true, run_shell skips the approval round trip. */
