@@ -1,0 +1,126 @@
+{
+  "id": "dev3d.cost-guard",
+  "name": "Cost guard",
+  "version": "1.1.0",
+  "description": "Keeps the cheap work cheap: routes intake, summarising and research to the least expensive capable model, adds a small local model to the catalog for it to aim at, and offers a cost-auditor role and a spend-review pipeline.",
+  "apiVersion": "1",
+  "author": "dev3d",
+  "license": "MIT",
+  "permissions": ["models", "routing", "skills", "agents", "pipelines", "settings"],
+  "settings": [
+    {
+      "key": "aggressiveness",
+      "label": "How hard to push down-tier",
+      "type": "select",
+      "description": "Balanced honours the role's policy and only overrides the cheapest task classes. Aggressive pulls everything except coding and review down a tier.",
+      "default": "balanced",
+      "options": ["gentle", "balanced", "aggressive"]
+    },
+    {
+      "key": "localOnly",
+      "label": "Never prefer a hosted provider",
+      "type": "boolean",
+      "description": "When on, the cheap task classes are pinned to the local provider even if a hosted model is cheaper.",
+      "default": false
+    },
+    {
+      "key": "maxPromptTokens",
+      "label": "Warn above this prompt size",
+      "type": "number",
+      "description": "Only used for the plugin's own logging; it does not truncate anything.",
+      "default": 12000,
+      "min": 1000,
+      "max": 200000
+    }
+  ],
+  "contributes": {
+    "models": [
+      {
+        "id": "local/qwen2.5-coder-7b-instruct",
+        "providerId": "local",
+        "label": "Qwen 2.5 Coder 7B (local)",
+        "tier": "small",
+        "contextWindow": 32768,
+        "maxOutputTokens": 4096,
+        "costPerMTokIn": 0,
+        "costPerMTokOut": 0,
+        "capabilities": { "tools": true, "vision": false, "reasoning": false, "streaming": true },
+        "strengths": ["summarize", "intake", "routing"]
+      }
+    ],
+    "skills": [
+      {
+        "id": "cost-aware-delegation",
+        "name": "Cost-aware delegation",
+        "description": "Decide whether a task needs a frontier model at all, and say which tier is actually justified.",
+        "tags": ["cost", "process", "routing"],
+        "taskClasses": ["routing", "summarize", "planning"],
+        "body": "# Cost-aware delegation\n\nBefore you reach for a strong model, answer three questions in writing:\n\n1. **What does this task actually require?** Parsing, summarising and re-formatting need none of the reasoning a frontier model is priced for.\n2. **What is the cost of being wrong?** A wrong intake summary costs a re-run. A wrong migration costs a day.\n3. **Is the expensive model buying anything?** If you cannot name the specific step that needs the extra capability, you do not need it.\n\n## Say this\n\n> This is a summarise-and-reformat task. A small model is sufficient; I would spend the budget on the review stage instead.\n\n## Not this\n\n> I will use the most capable model available to be safe.\n\nSafety is not a reason to escalate. Specific, named difficulty is."
+      }
+    ],
+    "routingRules": [
+      {
+        "id": "cheap-first-for-mechanical-work",
+        "description": "Intake and summarising are mechanical: prefer the cheapest capable model, and prefer a local runtime when one is configured.",
+        "taskClass": "intake",
+        "tier": "small",
+        "preferProviderIds": ["local", "deepseek"]
+      },
+      {
+        "id": "no-frontier-for-summaries",
+        "description": "A summary never needs the strongest tier.",
+        "taskClass": "summarize",
+        "tier": "nano",
+        "avoidModelIds": ["gpt-4o", "claude-3-5-sonnet-latest", "o3-mini"]
+      }
+    ],
+    "roleTemplates": [
+      {
+        "id": "cost-auditor",
+        "displayName": "Mira",
+        "title": "Cost auditor",
+        "departmentId": "frontend",
+        "seniority": "senior",
+        "rank": 2,
+        "reportsTo": null,
+        "mission": "keep the office honest about what it spends, and say when a cheaper route would do",
+        "responsibilities": [
+          "read a run's turns and name the ones that bought nothing",
+          "propose the cheapest model that would still have finished the task",
+          "refuse to call a summary a research problem"
+        ],
+        "skillIds": ["cost-aware-delegation", "technical-writing", "code-review"],
+        "allowedTools": ["think", "read_file", "list_dir", "search_files"],
+        "modelPolicy": { "defaultTier": "standard", "minTier": "small", "maxTier": "strong" },
+        "seatId": null,
+        "roomId": null,
+        "canDelegate": false,
+        "maxDirectReports": 0,
+        "persona": { "voice": "dry, specific, allergic to waste", "values": ["evidence", "thrift", "candour"] },
+        "appearance": { "bodyColor": "#facc15", "accentColor": "#78350f", "height": 1 },
+        "maxTurnsPerStage": 4
+      }
+    ],
+    "pipelines": [
+      {
+        "id": "spend-review",
+        "name": "Spend review",
+        "description": "Read the runs the office has already paid for and say which spend bought nothing. Two stages, no code written.",
+        "stages": [
+          {
+            "kind": "review",
+            "name": "Audit",
+            "roleIds": ["cost-auditor"],
+            "mode": "single"
+          },
+          {
+            "kind": "report",
+            "name": "Report",
+            "roleIds": ["cost-auditor"],
+            "mode": "single"
+          }
+        ]
+      }
+    ]
+  }
+}

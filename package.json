@@ -1,0 +1,27 @@
+{
+  "name": "dev3d",
+  "version": "1.0.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "description": "A 3D office where a hierarchy of LLM agents actually does the work.",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=22.11"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "dev:server": "pnpm --filter @dev3d/server dev",
+    "dev:web": "pnpm --filter @dev3d/web dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "test:server": "cd apps/server && node --test --test-isolation=none \"src/**/*.test.ts\"",
+    "test:web": "node apps/web/.verify/smoke.ts",
+    "smoke": "node scripts/smoke-ws.mjs",
+    "check:css": "node scripts/check-css.mjs",
+    "check:failures": "node scripts/check-failure-paths.mjs",
+    "inspect:glb": "node scripts/inspect-glb.mjs apps/web/public/office/office.glb",
+    "shoot": "node scripts/shoot-state.mjs"
+  }
+}

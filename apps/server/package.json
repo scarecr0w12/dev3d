@@ -1,0 +1,26 @@
+{
+  "name": "@dev3d/server",
+  "version": "1.0.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "description": "dev3d orchestrator: org chart, model router, tool-execution loop, and hierarchical run engine.",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:node": "node src/index.ts",
+    "start": "tsx src/index.ts",
+    "start:node": "node src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --test-isolation=none \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@dev3d/core": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

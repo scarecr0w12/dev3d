@@ -1,0 +1,30 @@
+{
+  "id": "dev3d.office-echo",
+  "name": "Office echo",
+  "version": "1.0.0",
+  "description": "A minimal code plugin: registers one tool employees can call, and logs run lifecycles. It exists to prove the code path and to be copied.",
+  "apiVersion": "1",
+  "author": "dev3d",
+  "license": "MIT",
+  "entry": "index.mjs",
+  "permissions": ["tools", "events", "settings"],
+  "settings": [
+    {
+      "key": "prefix",
+      "label": "Echo prefix",
+      "type": "string",
+      "description": "Prepended to whatever the tool echoes back.",
+      "default": "echo"
+    },
+    {
+      "key": "announceRuns",
+      "label": "Log every run that starts",
+      "type": "boolean",
+      "description": "Writes a debug line to the orchestrator log when a run is created.",
+      "default": true
+    }
+  ],
+  "contributes": {
+    "toolNames": ["echo"]
+  }
+}

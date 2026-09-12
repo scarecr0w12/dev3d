@@ -1,0 +1,68 @@
+{
+  "id": "dev3d.local-coder",
+  "name": "Local coder",
+  "version": "1.0.0",
+  "description": "Registers a whole provider: a local OpenAI-compatible model server, its endpoint and the model it serves. The keyless loopback base URL is what tells the office it can be reached without a credential.",
+  "apiVersion": "1",
+  "author": "dev3d",
+  "license": "MIT",
+  "permissions": ["providers", "models", "settings"],
+  "settings": [
+    {
+      "key": "enabledForCoding",
+      "label": "Let it take coding turns",
+      "type": "boolean",
+      "description": "Off by default. When on, the model is a candidate for coding too, not just summarising. Purely informational to the operator right now: this plugin is data, so it cannot change a role's policy.",
+      "default": false
+    }
+  ],
+  "contributes": {
+    "providers": [
+      {
+        "id": "lmstudio",
+        "label": "LM Studio (local)",
+        "kind": "openai-compat",
+        "baseUrl": "http://127.0.0.1:1234/v1",
+        "keyless": true
+      }
+    ],
+    "models": [
+      {
+        "id": "lmstudio/qwen2.5-coder-14b",
+        "providerId": "lmstudio",
+        "label": "Qwen2.5 Coder 14B (LM Studio)",
+        "tier": "small",
+        "contextWindow": 32768,
+        "maxOutputTokens": 4096,
+        "costPerMTokIn": 0,
+        "costPerMTokOut": 0,
+        "capabilities": { "tools": true, "vision": false, "reasoning": false, "streaming": true },
+        "strengths": ["intake", "summarize"]
+      }
+    ],
+    "uiPanels": [
+      {
+        "id": "local-model-status",
+        "title": "Local model",
+        "placement": "settings",
+        "summary": "What this plugin registered, and how to point it somewhere else.",
+        "body": [
+          {
+            "kind": "keyValue",
+            "label": "Registered provider",
+            "rows": [
+              { "key": "provider id", "value": "lmstudio" },
+              { "key": "endpoint", "value": "http://127.0.0.1:1234/v1" },
+              { "key": "credential", "value": "none — keyless loopback" },
+              { "key": "model", "value": "lmstudio/qwen2.5-coder-14b (small, $0)" }
+            ]
+          },
+          {
+            "kind": "note",
+            "text": "This panel is data, not code. The console renders it from the manifest, so nothing this plugin ships ever runs in your browser. To move the endpoint, edit plugins/dev3d.local-coder/plugin.json and refresh."
+          }
+        ]
+      }
+    ]
+  }
+}

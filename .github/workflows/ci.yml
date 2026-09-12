@@ -1,0 +1,91 @@
+# Everything the release claims must actually run, so this is the same set of
+# commands the README documents - not a second, weaker set written for CI.
+#
+# Two deliberate choices:
+#
+#   - **`node`, not `pnpm`, for the suites.** pnpm's dependency checks spawn
+#     child processes with piped stdio, which is fine on a runner but means the
+#     commands here are the same ones that work in a restricted sandbox. What CI
+#     proves is what a contributor can run.
+#   - **Ubuntu, on the lowest supported Node.** `engines` says >=22.11, and
+#     node:sqlite is the one dependency that cannot be installed away, so the
+#     floor is the interesting version to test.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The published floor, and the current LTS: a feature that only works on
+        # the newer one is a feature that does not work for half the readers.
+        node: ['22.11.0', '22.x']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (core, server, web, harness)
+        run: |
+          node packages/core/node_modules/typescript/bin/tsc -p packages/core/tsconfig.json --noEmit
+          node apps/server/node_modules/typescript/bin/tsc -p apps/server/tsconfig.json --noEmit
+          node apps/web/node_modules/typescript/bin/tsc -p apps/web/tsconfig.json --noEmit
+          node apps/web/node_modules/typescript/bin/tsc -p apps/web/.verify/tsconfig.json --noEmit
+
+      - name: Server tests
+        working-directory: apps/server
+        run: node --test --test-isolation=none "src/**/*.test.ts"
+
+      - name: Web store harness
+        run: node apps/web/.verify/smoke.ts
+
+      - name: Failure paths
+        run: node scripts/check-failure-paths.mjs
+
+      - name: Stylesheet check
+        run: node scripts/check-css.mjs
+
+      - name: Office asset
+        run: node scripts/inspect-glb.mjs apps/web/public/office/office.glb
+
+      - name: Build
+        working-directory: apps/web
+        run: node node_modules/vite/bin/vite.js build
+
+      - name: The orchestrator boots and answers
+        run: |
+          node apps/server/src/index.ts > /tmp/dev3d.log 2>&1 &
+          for attempt in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8787/api/health > /tmp/health.json; then break; fi
+            sleep 0.5
+          done
+          cat /tmp/health.json
+          node --input-type=module -e "
+            import { readFileSync } from 'node:fs';
+            const health = JSON.parse(readFileSync('/tmp/health.json', 'utf8'));
+            if (health.ok !== true) { console.error('health did not report ok'); process.exit(1); }
+            console.log('mode:', health.llmMode, '| store:', health.store);
+          "
+
+      - name: Live protocol against that server
+        run: node scripts/smoke-ws.mjs
+
+      - name: Stop the orchestrator
+        if: always()
+        run: pkill -f 'apps/server/src/index.ts' || true

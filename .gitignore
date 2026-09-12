@@ -1,0 +1,40 @@
+node_modules/
+dist/
+dist-ssr/
+*.tsbuildinfo
+
+# pnpm's local store, when it is configured to live inside the checkout
+# (`store-dir=.pnpm-store`). It is a cache, not source, and it is thousands of
+# files - 4,500 of them in the first commit this repository ever made.
+.pnpm-store/
+
+# local config + secrets
+.env
+.env.local
+.env.*.local
+
+# runtime state
+data/
+workspace/
+# projects the office works in (created from the Projects tab)
+workspaces/
+logs/
+*.log
+
+# `plugins/` is deliberately NOT ignored: it holds the example plugins that ship
+# with the office. Installs from a marketplace land in data/plugins (ignored).
+
+# headless renders from scripts/screenshot.ps1
+.screenshots/
+
+# blender scratch
+*.blend1
+*.blend2
+blender/exports/tmp/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/

@@ -1,0 +1,9 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# esbuild (pulled in by tsx and vite) needs its install script to link the
+# correct platform binary. pnpm 10+ blocks build scripts by default, so each
+# dependency that legitimately needs one is opted in here.
+allowBuilds:
+  esbuild: true

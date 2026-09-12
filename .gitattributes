@@ -1,0 +1,43 @@
+# Normalise line endings on checkout so a Windows clone and a Linux clone produce
+# the same diff. The repository is developed on Windows and verified on Linux in
+# CI, and without this every file that crosses between them shows as fully
+# rewritten - which buries the real change.
+* text=auto eol=lf
+
+# Declared explicitly rather than inferred, because these are the ones that
+# actually break something when they are wrong.
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.mjs  text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.css  text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.sql  text eol=lf
+
+# Windows-only helper; it needs CRLF to run under PowerShell's default policy.
+*.ps1  text eol=crlf
+
+# Binary. Git would otherwise try to diff a 280 KB GLB as text and report it as
+# changed on every checkout.
+*.glb  binary
+*.gltf binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.webp binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
+*.sqlite binary
+
+# Generated, and enormous. `linguist-generated` keeps them out of language stats
+# and collapses them in review.
+apps/web/dist/**    -diff linguist-generated
+data/**             -diff
+.screenshots/**     -diff
+
+# pnpm's lockfile is generated but reviewed: it is the supply chain, so it should
+# show up in a diff rather than be hidden.
+pnpm-lock.yaml      text eol=lf
