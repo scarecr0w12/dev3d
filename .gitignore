@@ -27,6 +27,10 @@ logs/
 # headless renders from scripts/screenshot.ps1
 .screenshots/
 
+# scratch directories this repository's own tooling is pointed at, so a
+# diagnostic run cannot accidentally commit its cache
+.gh-cache/
+
 # blender scratch
 *.blend1
 *.blend2

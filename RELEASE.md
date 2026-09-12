@@ -102,7 +102,7 @@ the UI is served by the orchestrator it talks to.
 
 - **No npm publish.** The packages are `private: true`. This is an application
   you run, not a library you install.
-- **No compiled artifacts.** Everything runs from source: Node 22 executes the
+- **No compiled artifacts.** Everything runs from source: Node 24 executes the
   TypeScript directly, and the web bundle is built on demand. The only build
   output that exists is `apps/web/dist`, which is served by the orchestrator and
   is not committed.

@@ -21,25 +21,31 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # The published floor, and the current LTS: a feature that only works on
-        # the newer one is a feature that does not work for half the readers.
-        node: ['22.11.0', '22.x']
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          # One version on purpose, and it is the floor: `engines` says >=24, and
+          # the suites need Node 24 for `--test-isolation=none` and for the
+          # unflagged `node:sqlite`. A matrix that also tested an older Node would
+          # be testing a configuration the project does not support.
+          node-version: '24.x'
 
       - name: Enable corepack
         run: corepack enable
 
       - name: Install
-        run: pnpm install --frozen-lockfile
+        # `corepack enable` alone leaves whatever corepack version the runner's
+        # Node shipped with, and an old one cannot verify the signatures pnpm
+        # publishes under - it fails with "Cannot find matching keyid", which
+        # looks like a pnpm problem and is not one. Install a current corepack,
+        # then let it read `packageManager` from package.json.
+        run: |
+          npm install --global corepack@latest
+          corepack enable
+          pnpm install --frozen-lockfile
 
       - name: Typecheck (core, server, web, harness)
         run: |
@@ -69,6 +75,9 @@ jobs:
         run: node node_modules/vite/bin/vite.js build
 
       - name: The orchestrator boots and answers
+        env:
+          # No provider keys on a runner, and the office must still come up.
+          DEV3D_LLM_MODE: mock
         run: |
           node apps/server/src/index.ts > /tmp/dev3d.log 2>&1 &
           for attempt in $(seq 1 40); do
@@ -80,11 +89,15 @@ jobs:
             import { readFileSync } from 'node:fs';
             const health = JSON.parse(readFileSync('/tmp/health.json', 'utf8'));
             if (health.ok !== true) { console.error('health did not report ok'); process.exit(1); }
-            console.log('mode:', health.llmMode, '| store:', health.store);
+            console.log('mode:', health.llmMode, '| store:', health.store, '| version:', health.version);
           "
 
       - name: Live protocol against that server
         run: node scripts/smoke-ws.mjs
+
+      - name: Orchestrator log on failure
+        if: failure()
+        run: cat /tmp/dev3d.log || true
 
       - name: Stop the orchestrator
         if: always()

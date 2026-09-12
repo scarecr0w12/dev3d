@@ -7,7 +7,7 @@
   "description": "A 3D office where a hierarchy of LLM agents actually does the work.",
   "packageManager": "pnpm@11.22.0",
   "engines": {
-    "node": ">=22.11"
+    "node": ">=24.0.0"
   },
   "scripts": {
     "dev": "pnpm -r --parallel dev",

@@ -20,6 +20,10 @@ Everything below is implemented and verified: the engine, transport and
 persistence end to end against a running server; the web UI by typecheck, a
 runtime reducer harness, and a production bundle that the orchestrator serves.
 
+**Requires Node 24 or newer.** The suites run TypeScript directly via
+`node --test --test-isolation=none`, and persistence is built on the unflagged
+`node:sqlite`; both mean Node 24. See [Quick start](#quick-start).
+
 | Area | State |
 |---|---|
 | Shared domain contracts (`packages/core`) | Complete |
@@ -50,12 +54,19 @@ covers, which is what a reader actually needs.
 ## Quick start
 
 ```bash
-pnpm install                 # Node >= 22.11
+pnpm install                 # Node >= 24
 cp .env.example .env         # optional: add provider keys for live models
 
 pnpm dev:server              # orchestrator on http://127.0.0.1:8787
 pnpm dev:web                 # office UI on http://127.0.0.1:5273 (proxies /api and /ws)
 ```
+
+**Node 24 or newer, and this is a real requirement rather than a preference.**
+Two things need it: `node --test --test-isolation=none`, which the suites use to
+run TypeScript directly without a build step, and the unflagged `node:sqlite`
+that persistence is built on. On Node 22 the *server* runs but `pnpm test` does
+not, which is the worst of both — you would be running an untested tree. CI
+checks this: the test suite is executed on a real runner, not just typechecked.
 
 **No API keys are required.** With none configured the server boots in `mock`
 mode: the entire pipeline still runs, employees are scripted instead of billed,
@@ -755,7 +766,7 @@ Nothing here authenticates. Bind it to localhost.
 
 ## Persistence
 
-`node:sqlite` is built into Node 22+, so dev3d has a real database with zero
+`node:sqlite` is built into Node 24, so dev3d has a real database with zero
 dependencies: the org chart, every run, turn, artifact and approval, plus an
 append-only event log. An event is persisted *before* it is broadcast, so a
 reconnecting client replaying from the log sees a superset of what it had, never
