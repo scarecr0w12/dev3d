@@ -12,6 +12,7 @@ import { createShellTools } from './shell.ts';
 import { createWebTools } from './web.ts';
 import { createGitTools } from './git.ts';
 import { createPlanTools } from './plan.ts';
+import { createMemoryTools } from './memory.ts';
 import { createMiscTools } from './misc.ts';
 
 export function createToolRegistry(): ToolRegistry {
@@ -57,6 +58,7 @@ export function createDefaultTools(): Tool[] {
     ...createWebTools(),
     ...createGitTools(),
     ...createPlanTools(),
+    ...createMemoryTools(),
     ...createMiscTools(),
   ];
 }

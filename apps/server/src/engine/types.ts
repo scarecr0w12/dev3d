@@ -13,6 +13,7 @@ import type {
   ApprovalKind,
   Artifact,
   EmployeeState,
+  MemoryFact,
   OrgChart,
   Pipeline,
   Role,
@@ -86,6 +87,51 @@ export interface EngineDeps {
   pipelines: (workspaceId?: string) => Pipeline[];
   /** Preferences contributed by plugins, consulted when routing a turn. */
   routingHints?: () => RoutingHint[];
+  /**
+   * What the office remembers, as this employee is allowed to see it.
+   *
+   * A function rather than the memory service itself, so the engine depends on
+   * "ask a question, get facts" instead of on the store - which is what lets the
+   * whole engine be driven in a test with a list of facts and no database. The
+   * scope is resolved inside the runtime from the workspace and role, so the
+   * engine cannot widen it by passing something else.
+   *
+   * It may return a promise, because semantic recall has to embed the query
+   * first. The turn awaits it once, up front, and hands the resolved facts to the
+   * `recall` tool through the context - so the tool stays synchronous and a model
+   * calling it never pays for a second embedding round trip mid-turn.
+   *
+   * Optional because an engine without memory is still a working engine: the
+   * prompt section and the `recall` tool both disappear cleanly when it is absent.
+   */
+  recall?: (input: {
+    workspaceId: string;
+    roleId: string | null;
+    query: string;
+    limit?: number;
+  }) => MemoryFact[] | Promise<MemoryFact[]>;
+  /**
+   * The same lookup, lexical only, synchronously.
+   *
+   * All three of the `recall` variants exist for one reason each, and the reason
+   * is that embedding costs a network round trip:
+   *
+   *  - `recall` may be async, so the prompt index can be semantically ranked - it
+   *    runs once per turn, and the turn is already awaiting other work.
+   *  - this one is synchronous, so the `recall` **tool** needs no async signature
+   *    and a model that calls it mid-turn pays nothing extra.
+   *  - the turn seeds a cache from the async call, so the overwhelmingly common
+   *    case - the model asking the question the prompt already asked - is answered
+   *    from memory instead of from a second search.
+   *
+   * Optional, and absent means the tool falls back to whatever `recall` gave it.
+   */
+  recallSync?: (input: {
+    workspaceId: string;
+    roleId: string | null;
+    query: string;
+    limit?: number;
+  }) => MemoryFact[];
   employees: EmployeeTracker;
   sink: EventSink;
   approvals: ApprovalBroker;

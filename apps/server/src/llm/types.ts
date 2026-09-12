@@ -54,4 +54,30 @@ export interface LlmProvider {
    * have opposite consequences for routing.
    */
   listModels?(): Promise<DiscoveredModel[]>;
+  /**
+   * Turn text into vectors, for the memory layer's optional semantic search.
+   *
+   * Optional for the same reason `listModels` is, and the omission is
+   * meaningful rather than a gap to be filled in later: **not every provider
+   * serves embeddings at all.** Anthropic does not; a local runtime usually does
+   * not until a model is pulled. So an adapter that cannot embed must leave this
+   * unimplemented rather than answering with a substitute, because a fabricated
+   * vector would make every semantic search silently meaningless - results that
+   * look ranked and are not.
+   *
+   * The office treats an absent method, and a thrown error, identically: the
+   * memory layer runs without semantic search and says so. This must **throw**
+   * on failure rather than resolving to an empty array, so that "the request
+   * failed" cannot be mistaken for "these texts have no embedding".
+   */
+  embed?(req: EmbedRequest): Promise<number[][]>;
 }
+
+export interface EmbedRequest {
+  /** The embedding model to call, as the provider names it. */
+  model: string;
+  /** The texts to embed, in order. The result must align with this array. */
+  texts: string[];
+  signal?: AbortSignal;
+}
+

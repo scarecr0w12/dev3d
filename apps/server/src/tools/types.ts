@@ -9,7 +9,7 @@
  * read the message and correct course.
  */
 
-import type { AgentPlanStep, ApprovalKind, ToolSchema } from '@dev3d/core';
+import type { AgentPlanStep, ApprovalKind, MemoryFact, ToolSchema } from '@dev3d/core';
 
 export interface ToolApprovalRequest {
   kind: ApprovalKind;
@@ -39,6 +39,18 @@ export interface ToolContext {
    * tool layer be tested with a bare context object.
    */
   onPlanChange?(): void;
+  /**
+   * Search the office's memory, already confined to what this employee may see.
+   *
+   * A callback rather than the fact store itself, for the same reason the plan
+   * callback is: the tool layer must not know about stores or scopes, and a tool
+   * that could name its own scope is a tool that could read another floor's
+   * memory. The caller resolves the scope and hands back only permitted facts.
+   *
+   * Absent when the engine runs without memory, which the `recall` tool reports
+   * rather than treating as an empty result.
+   */
+  recall?(query: string, limit: number): MemoryFact[];
   /** Ask the human. Resolves false when denied or when nobody can answer. */
   requestApproval(req: ToolApprovalRequest): Promise<boolean>;
   /** When true, run_shell skips the approval round trip. */

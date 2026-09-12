@@ -1,47 +1,32 @@
 /**
- * stdio transport: an MCP server run as a child process, speaking
- * newline-delimited JSON-RPC over its stdin and stdout.
+ * stdio transport: a peer run as a child process, speaking newline-delimited
+ * JSON-RPC over its stdin and stdout.
  *
  * This is how nearly every published MCP server is used — `npx -y
  * @modelcontextprotocol/server-filesystem /path` and its many relatives — so it
- * is the transport that decides whether the integration is useful in practice.
+ * is the transport that decides whether an integration is useful in practice. It
+ * is also exactly what the Agent Client Protocol needs, which is why it lives
+ * here rather than under either protocol: an academic distinction about which
+ * JSON-RPC dialect is flowing would otherwise have been paid for twice.
  *
  * Two details that are easy to get wrong and expensive to debug:
  *
- *  - **stdout is the wire.** Anything a server prints there that is not a
+ *  - **stdout is the wire.** Anything a peer prints there that is not a
  *    JSON-RPC message corrupts the stream, so a line that does not parse is
- *    logged and skipped rather than treated as fatal. Servers do occasionally
+ *    logged and skipped rather than treated as fatal. Peers do occasionally
  *    print banners.
  *  - **stderr is a diagnostic channel, not a wire.** It is read continuously and
  *    kept in a ring buffer. Both halves matter: leaving it unread can fill the
- *    pipe and wedge the server, and keeping it all would grow without bound.
+ *    pipe and wedge the process, and keeping it all would grow without bound.
  */
 
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import type { McpTransport } from './client.ts';
+import type { ChildLike, JsonRpcTransport, SpawnLike } from './transport.ts';
 
-/**
- * The slices of a child process this transport actually uses.
- *
- * Narrowed deliberately: `spawn` can then be injected in a test without a real
- * child process being involved, which is the only way to exercise the framing
- * and error paths on a machine where a sandbox forbids piped stdio altogether.
- */
-export interface ChildLike extends EventEmitter {
-  readonly stdin: { write(chunk: string): unknown; end(): unknown; destroyed: boolean };
-  readonly stdout: EventEmitter & { setEncoding(encoding: string): unknown };
-  readonly stderr: EventEmitter & { setEncoding(encoding: string): unknown };
-  kill(signal?: NodeJS.Signals): boolean;
-  readonly exitCode: number | null;
-  readonly signalCode: NodeJS.Signals | null;
-}
-
-export type SpawnLike = (
-  command: string,
-  args: string[],
-  options: Record<string, unknown>,
-) => ChildLike;
+// Re-exported for the callers that used to find them here. The definitions live
+// in `transport.ts` because the one-shot vendor transport needs the same seam.
+export type { ChildLike, SpawnLike };
 
 export interface StdioTransportOptions {
   command: string;
@@ -65,7 +50,7 @@ export interface StdioTransportOptions {
 const DEFAULT_STDERR_LINES = 50;
 const DEFAULT_START_TIMEOUT_MS = 15_000;
 
-export class StdioTransport implements McpTransport {
+export class StdioTransport implements JsonRpcTransport {
   readonly label: string;
   private readonly options: StdioTransportOptions;
   private child: ChildLike | null = null;
@@ -101,11 +86,14 @@ export class StdioTransport implements McpTransport {
     });
     this.child = child;
 
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => this.consume(chunk));
+    // Both are optional in the shared `ChildLike`, because a caller may ignore a
+    // descriptor. This transport always pipes them, so the guards are for the
+    // type rather than for a case that happens here.
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => this.consume(chunk));
 
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => {
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (chunk: string) => {
       for (const line of chunk.split('\n')) {
         const text = line.trimEnd();
         if (text === '') continue;
@@ -162,10 +150,15 @@ export class StdioTransport implements McpTransport {
   }
 
   send(message: unknown): void {
-    if (this.child === null || this.child.stdin.destroyed) {
+    // stdin is nullable in the shared `ChildLike`, because a caller may spawn
+    // with `stdio: 'ignore'` on that descriptor. This transport always pipes it,
+    // so a missing pipe means the child is gone rather than that it was never
+    // there - either way there is nothing to write to.
+    const stdin = this.child?.stdin ?? null;
+    if (this.child === null || stdin === null || stdin.destroyed) {
       throw new Error(`${this.label} is not running.`);
     }
-    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+    stdin.write(`${JSON.stringify(message)}\n`);
   }
 
   onMessage(handler: (raw: unknown) => void): void {
@@ -183,10 +176,10 @@ export class StdioTransport implements McpTransport {
     this.child = null;
     if (child === null) return;
 
-    child.stdout.removeAllListeners();
-    child.stderr.removeAllListeners();
+    child.stdout?.removeAllListeners();
+    child.stderr?.removeAllListeners();
     try {
-      child.stdin.end();
+      child.stdin?.end();
     } catch {
       // The pipe may already be gone; nothing to do about it.
     }

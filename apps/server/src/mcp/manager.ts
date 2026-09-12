@@ -19,7 +19,7 @@
 
 import type { Tool, ToolRegistry, ToolResult } from '../tools/types.ts';
 import { McpClient, type McpToolInfo, type McpTransport } from './client.ts';
-import { StdioTransport } from './stdio.ts';
+import { StdioTransport } from '../rpc/stdio.ts';
 import { HttpTransport } from './http.ts';
 
 export type McpServerState = 'connecting' | 'ready' | 'failed' | 'disabled';

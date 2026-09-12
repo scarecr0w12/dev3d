@@ -15,6 +15,7 @@
 import { randomUUID } from 'node:crypto';
 import type {
   ChatMessage,
+  MemoryFact,
   Role,
   Run,
   Skill,
@@ -29,7 +30,7 @@ import { routeModel } from '../router/modelRouter.ts';
 import { selectSkills } from '../skills/loader.ts';
 import type { ToolContext, ToolResult } from '../tools/types.ts';
 import { estimateComplexity } from './complexity.ts';
-import { buildTurnMessages, taskClassForStage } from './prompt.ts';
+import { buildTurnMessages, MEMORY_PROMPT_LIMIT, taskClassForStage } from './prompt.ts';
 import type { EngineDeps, RunKnowledge, StageUtterance } from './types.ts';
 
 /** Hard ceiling on model<->tool round trips inside a single turn. */
@@ -79,6 +80,16 @@ export interface TurnRequest {
   writtenPaths: Set<string>;
   turnIndex: number;
   signal: AbortSignal;
+  /**
+   * The facts the prompt index was built from, and the query it was built with.
+   *
+   * Carried on the request because the tool context is assembled in a different
+   * function from the one that resolves memory, and the `recall` tool needs both:
+   * the same query is answered from here rather than searched twice, since it is
+   * the question a model asks most often and it has already been paid for.
+   */
+  memoryFacts: MemoryFact[];
+  memoryQuery: string;
 }
 
 interface ToolCallOutcome {
@@ -171,6 +182,31 @@ async function executeToolCall(
       req.run.updatedAt = Date.now();
       deps.sink.emit({ type: 'run.updated', run: structuredClone(req.run), at: Date.now() });
     },
+    // Memory is resolved for this employee, in this workspace, by the runtime -
+    // so the tool cannot name a scope of its own and read another floor's facts.
+    //
+    // The query the prompt index already ran is answered from `indexedFacts`
+    // rather than searched again, because that is the question a model asks most
+    // often and it has already been paid for. Anything else goes through the
+    // synchronous lexical lookup, so the tool needs no async signature and a
+    // mid-turn call costs no embedding round trip.
+    ...(deps.recall === undefined
+      ? {}
+      : {
+          recall: (query: string, limit: number): MemoryFact[] => {
+            if (query.trim() === req.memoryQuery && req.memoryFacts.length > 0) {
+              return req.memoryFacts.slice(0, Math.max(0, limit));
+            }
+            return deps.recallSync !== undefined
+              ? deps.recallSync({
+                  workspaceId: req.run.workspaceId,
+                  roleId: req.role.id,
+                  query,
+                  limit,
+                })
+              : req.memoryFacts.slice(0, Math.max(0, limit));
+          },
+        }),
     autoApproveShell: deps.config.autoApproveShell,
     signal: req.signal,
     log: (level, message) => {
@@ -329,7 +365,46 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
     },
     lastError: null,
   });
+
+
   deps.sink.emit({ type: 'turn.started', turn: { ...turn }, at: Date.now() });
+
+  // --- memory: a short index, so the employee knows there is something to ask --
+  //
+  // The query is the brief and the purpose rather than the full upstream
+  // knowledge: this is orientation, and a query built from everything already in
+  // the prompt would just retrieve the prompt back.
+  //
+  // Resolved once, up front, and awaited - so when semantic memory is configured
+  // the query is embedded exactly once per turn rather than on every `recall` the
+  // model happens to make. It runs after `turn.started` on purpose: an embedding
+  // round trip must not be able to delay the console showing that the employee has
+  // picked the work up.
+  const indexed =
+    deps.recall === undefined
+      ? { shown: [] as MemoryFact[], total: 0 }
+      : await (async () => {
+          const shown = await deps.recall!({
+            workspaceId: run.workspaceId,
+            roleId: role.id,
+            query: req.memoryQuery,
+            limit: MEMORY_PROMPT_LIMIT,
+          });
+          // A second, unfiltered count rather than `shown.length`, because the
+          // prompt tells the employee how many facts it is *not* seeing - and a
+          // count that only ever equalled the visible ones would silently claim
+          // the index is complete.
+          const all = await deps.recall!({
+            workspaceId: run.workspaceId,
+            roleId: role.id,
+            query: '',
+            limit: Number.MAX_SAFE_INTEGER,
+          });
+          return { shown, total: all.length };
+        })();
+  // Handed to the tool layer so `recall` can answer the prompt's own question
+  // without searching again.
+  req.memoryFacts = indexed.shown;
 
   // --- the loop ------------------------------------------------------------
   const messages: ChatMessage[] = buildTurnMessages({
@@ -348,6 +423,8 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
       .filter((s): s is Skill => s !== undefined),
     activeSkills,
     grantedTools,
+    memoryFacts: indexed.shown,
+    memoryTotal: indexed.total,
   });
 
   const usage: UsageRecord = { tokensIn: 0, tokensOut: 0, costUsd: 0 };

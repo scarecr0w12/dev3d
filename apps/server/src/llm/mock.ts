@@ -515,6 +515,43 @@ async function mockChat(req: ChatRequest): Promise<ChatResult> {
   };
 }
 
+/** The width of the mock embedder's vectors. Small, and only ever compared. */
+export const MOCK_EMBEDDING_DIMENSIONS = 64;
+
+/**
+ * A deterministic stand-in for a real embedding model.
+ *
+ * It is a **hashing bag of words**, which is the honest thing for a mock to be:
+ * it has no idea what the text means, but two texts that share words land near
+ * each other and two that share nothing do not. That is enough to exercise the
+ * whole semantic path - storage, alignment, cosine ranking, degradation - in
+ * tests and in `mock` mode, without a key and without pretending the office can
+ * actually understand a paraphrase.
+ *
+ * Deterministic on purpose, down to the bucket assignment, so a test that ranks
+ * two facts gets the same order every run.
+ */
+export function mockEmbedding(text: string, dimensions = MOCK_EMBEDDING_DIMENSIONS): number[] {
+  const vector = new Array<number>(dimensions).fill(0);
+  const tokens = text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  for (const token of tokens) {
+    // FNV-1a: tiny, stable across runs, and spreads short tokens well enough
+    // that distinct words rarely collide into one bucket.
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < token.length; i += 1) {
+      hash ^= token.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    const bucket = hash % dimensions;
+    vector[bucket] = (vector[bucket] ?? 0) + 1;
+  }
+  // Normalised, so a cosine comparison is a plain dot product and a long fact
+  // does not outrank a short one merely for having more words.
+  const norm = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
+  if (norm === 0) return vector;
+  return vector.map((v) => v / norm);
+}
+
 export function createMockProvider(cfg: ProviderConfig, models?: ModelSpec[]): LlmProvider {
   const provider: LlmProvider = {
     id: cfg.id,
@@ -522,6 +559,21 @@ export function createMockProvider(cfg: ProviderConfig, models?: ModelSpec[]): L
     models: models ?? [],
     isConfigured: () => true,
     chat: mockChat,
+    /**
+     * Implemented even in mock mode so the semantic path is demonstrable with no
+     * key at all, exactly as the whole pipeline is.
+     *
+     * The width comes from the model name, so a test - or an operator in mock
+     * mode - can exercise both the correct-width path and the refusal that
+     * protects the index from a vector it cannot use. A model name with no width
+     * in it gets the default, which is deliberately *not* the index width: the
+     * wrong-model case is the one worth hitting by accident.
+     */
+    embed: async (req) => {
+      const requested = /(\d{2,4})/.exec(req.model);
+      const dimensions = requested ? Number(requested[1]) : MOCK_EMBEDDING_DIMENSIONS;
+      return req.texts.map((text) => mockEmbedding(text, dimensions));
+    },
   };
   return provider;
 }

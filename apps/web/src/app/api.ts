@@ -221,6 +221,20 @@ export const api = {
       method: 'POST',
     }),
   /**
+   * Re-probes every configured third-party vendor.
+   *
+   * The common case this exists for is "I just installed Codex and it still says
+   * no signal" - and the alternative to a button is restarting the orchestrator,
+   * which drops every in-flight run.
+   *
+   * It re-probes; it does not re-read the vendor list. Adding a vendor is a
+   * restart, because the delegation tools are registered once at boot and a
+   * vendor with a status row and no tool behind it would be worse than one that
+   * is simply absent.
+   */
+  refreshVendors: () =>
+    request<{ vendors: unknown[] }>('/api/vendors/refresh', 60_000, { method: 'POST' }),
+  /**
    * Fallback path for a direct chat when the socket is not open. Normally the
    * `chat` command goes over the WebSocket and the reply arrives as a
    * `direct.message` event.

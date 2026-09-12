@@ -59,11 +59,13 @@ curl -s localhost:8787/api/runs/<runId>
 | **Run engine** | Four stage modes — `single`, `parallel`, `debate`, `review-loop` — with a tool loop, spend ceiling and cancellation |
 | **Org chart** | 13 roles across 8 departments, 3 shipped pipelines, editable live from the console |
 | **Model layer** | Provider discovery, a curated metadata overlay, learned quality from the office's own turns, pooled benchmarks, uptime, and a cost-aware router |
-| **Tools** | 14 built-in tools, every one confined to the run's workspace root — plus any tool an MCP server provides |
+| **Tools** | 15 built-in tools, every one confined to the run's workspace root — plus any tool an MCP server provides |
 | **MCP** | Connect Model Context Protocol servers (stdio or Streamable HTTP); their tools are published to employees as `mcp__<server>__<tool>` |
+| **Vendors** | Engage third-party agent harnesses — Codex, DeepSeek Harness, Hermes, and anything you can name a command for — as read-only contractors. Each is published as `agent__<id>__delegate`, and each is docked in the 3D office as a rented terminal rather than dressed up as an employee |
 | **Knowledge** | 15 skill documents selected per turn, plus stage summaries and artifacts threaded forward |
+| **Memory** | Facts the office keeps between runs — conventions, decisions and pitfalls — with full-text recall for employees and a supersession ledger that never overwrites |
 | **Plugins** | Providers, models, skills, routing rules, tools, role templates, pipelines and console panels — without editing this repository |
-| **The office** | A generated 3D building: one floor per organisation, block-kit growth, per-floor styles |
+| **The office** | A generated 3D building: one floor per organisation, block-kit growth, per-floor styles, and idle employees who get up, walk about and talk to each other |
 | **Persistence** | SQLite through `node:sqlite`, with a memory fallback that keeps the office booting |
 
 ---
@@ -74,7 +76,7 @@ curl -s localhost:8787/api/runs/<runId>
 every other surface floats over it.
 
 ```
-┌─ top bar ── brand · Office|Plan|Projects|Org|Runs|Activity|Routing & cost|Skills|Plugins|Settings ─┐
+┌─ top bar ── brand · Office|Plan|Projects|Org|Runs|Activity|Routing & cost|Skills|Memory|Vendors|Plugins|Settings ─┐
 │                                                                              │
 │                        the office (full-bleed canvas)                        │
 │                                                                              │
@@ -114,6 +116,22 @@ never by hard-coded coordinates, and avatars are built procedurally from
 idle bob, a pulse while thinking, typing while working, turning toward the room
 while talking. Clicking one raycasts and selects it, adding a pulsing floor ring
 and easing the camera in. `prefers-reduced-motion` is honoured.
+
+**An idle office is a lived-in one.** An employee whose status is `idle` gets up,
+walks somewhere and stands about: the lounge, the lobby, the middle of the dev
+floor, or — more often than anywhere else — a colleague's desk, where the two of
+them turn to face each other and swap a few lines of office small talk in speech
+bubbles. Being on your feet is a different pose from sitting: the figure rises
+onto its legs, strides in proportion to the ground it is covering, and the name
+plate climbs with it. Status still comes first, so `working`, `thinking`,
+`blocked` and `offline` bodies never leave their chairs, and a run that starts
+while somebody is at the coffee machine walks them back to it.
+
+Where they can walk is **sampled from the model rather than authored**: every mesh
+standing between ankle and head is an obstacle — walls and doorways included — so
+a route goes through a real doorway and a sealed room stays sealed. At most a
+quarter of the floor is up at once. The whole layer is one click off (**Liveliness**
+in the HUD) and off by itself under `prefers-reduced-motion`.
 
 ### Plan — the conversation before the work
 
@@ -311,7 +329,7 @@ truth**; where a provider publishes real ones, discovery overwrites them.
 
 ## Tools and confinement
 
-Fourteen built-in tools:
+Fifteen built-in tools:
 
 | Tool | What it is for |
 |---|---|
@@ -329,6 +347,7 @@ Fourteen built-in tools:
 | `git` | Inspect the repository without asking (`status`, `diff`, `log`, `show`, `blame`, …), and save work with approval (`add`, `commit`, `checkout -b`, `stash push`, `cherry-pick`, `tag`). |
 | `web_search` | Search the web. |
 | `web_fetch` | Fetch one URL and return its text. |
+| `recall` | Search what the office has written down: conventions, decisions, and traps that already cost somebody time. |
 
 - Every path funnels through one `resolveInWorkspace` choke point that rejects
   `..`, absolute paths outside the root, and Windows drive-relative tricks like
@@ -357,6 +376,117 @@ add/complete API invites drift between what the model believes the list is and
 what it is, while resending it makes each call self-consistent and impossible to
 half-apply. It is emitted with `run.updated`, so the console can show progress
 without a new protocol surface.
+
+---
+
+## Memory
+
+**Everything a run learns used to die with the run.** Stage summaries, artifacts and
+the files people wrote were threaded forward *within* a run and forgotten at the end
+of it, so the office could not answer the questions that make a second attempt
+cheaper than a first: what did we try here before, did it work, and what did we
+decide the last time this came up. The only thing that survived was learned model
+quality — and that records whether a model *answered*, never whether the work was
+good.
+
+Memory is facts the office keeps. A fact is a convention, a decision, or a pitfall:
+something a person would otherwise have to work out twice.
+
+```
+Memory page ─────────────────────────────────────────────────────────────┐
+│ Active · 4        │ Ledger                                             │
+│ ┌ correct ───────────────────────────────────────────────────────────┐ │
+│ │ Node 24 is required: node:sqlite is unflagged and the suites need │ │
+│ │ it.                              [convention] [everywhere]         │ │
+│ │ written by the operator · recalled 3×   correct  retract           │ │
+│ └────────────────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Nothing is derived from a transcript.** The evidence on memory systems is
+unusually clear that the *write* path, not retrieval, is where they fail: a model
+asked to distil a transcript into "memories" omits what mattered and invents what
+did not, and every later turn inherits the mistake. So there is no extraction step
+and no model in the write path at all. A fact exists because an operator wrote it
+down, which is the one write path that cannot hallucinate. Employees get `recall`,
+which reads.
+
+**A correction supersedes; it never overwrites.** Changing a fact writes a
+*replacement* and marks the original no longer true, keeping its wording and
+recording the moment it stopped being true. So both questions stay answerable — what
+do we believe now, and what did we believe in March — where last-write-wins would
+have silently destroyed the second. The ledger tab shows the whole chain, including
+what the office no longer believes.
+
+**Nothing is deleted for being old.** There is no decay, no TTL and no sweep, and the
+store has no delete to call. A fact nobody has recalled in six months is not thereby
+wrong; it is the thing that matters the moment it comes up again. Age affects
+ranking. Only an explicit retraction removes a fact from current belief, and it stays
+on record even then.
+
+**Scope is the boundary, and it is enforced in one place.** A fact belongs to the
+installation, to one floor, or to one role, and an employee sees its own scopes and
+nothing inward — the same containment rule that stops one floor reading another's
+files. A correction cannot move a fact to a wider scope, so a floor's note cannot be
+quietly promoted to installation-wide guidance.
+
+**Facts arrive by being asked for, not by being injected.** Every employee's prompt
+carries a short index — a handful of facts and a count of how many more are on
+record — and `recall` fetches the rest. That split is deliberate. Always-injected
+context was measured raising inference cost by over 20% without improving task
+success, because an agent follows every instruction it is handed whether or not it
+bears on the task; while letting the model decide *whether* to search fails silently,
+one study measuring under half the recall it should have got with the tool sitting
+right there. An index plus a tool is neither: the employee knows there is something
+to ask about, and asking is an ordinary tool call.
+
+**Search is full-text, in the database the office already has.** FTS5 with BM25,
+which is compiled into Node's own SQLite — no extension, no service, no dependency.
+Measured against a brute-force vector scan on the same corpus it is roughly three
+orders of magnitude faster and six times smaller, and the queries this workload
+generates are file paths, identifiers, error strings and symbol names, which is
+exactly where lexical search is strongest.
+
+A fact the store cannot rank is still a fact: without FTS5 the store says so, recall
+falls back to an unranked scan, and the Memory page shows the degradation rather
+than pretending the results are ordered.
+
+**Semantic search is available, off by default, and needs two things.**
+`DEV3D_MEMORY_VECTORS=true` loads the `sqlite-vec` index, and
+`DEV3D_MEMORY_EMBEDDING=provider/model` names where text becomes vectors —
+because DeepSeek and Anthropic serve no embeddings at all, and a bare model
+name is ambiguous across vendors. With either missing, recall stays lexical and
+the office says so.
+
+When both are present, **full text still selects the candidates and vectors only
+order them.** That ordering is the design, not an implementation detail: the
+scope filter, the activity filter and the containment rule live on the one code
+path that already enforces them, so switching semantic search on cannot widen
+what a search may return. Facts with no vector yet keep their lexical position
+rather than being ranked, because an unmeasured fact is not a dissimilar one.
+A failing embedder degrades to the lexical answer instead of to no answer, and a
+vector of the wrong width is refused rather than truncated.
+
+It is off by default because FTS5 measured about three orders of magnitude
+faster and six times smaller than a brute-force vector scan, and because the
+queries this workload produces — file paths, identifiers, error strings — are
+exactly where BM25 is strongest. The measurements behind that decision, and the
+cases where embeddings would genuinely win, are in
+[`docs/memory-systems.md`](docs/memory-systems.md).
+
+```
+GET    /api/memory                     → the whole ledger, current and superseded
+GET    /api/memory/search?q=…          → ranked recall, scoped to a floor and role
+POST   /api/memory                     { scope, kind, text, … }        → write
+POST   /api/memory/:id/retract         → stop believing it, keep the record
+POST   /api/memory/embed               { limit }                      → embed facts
+                                          that have no vector yet
+```
+
+Facts are written from the **Memory** page or the API. `recall` is read-only and
+granted alongside the reconnaissance tools, so most employees who can read the
+workspace can also read the notes about it. The exception is deliberate: the CEO
+holds a short executive list - no `grep`, no `glob` - and no `recall` either.
 
 ---
 
@@ -411,6 +541,80 @@ has a **Reload servers** button that re-reads the config and reconnects — so e
 `mcp.json` takes effect without restarting the orchestrator. A server that was
 removed is disconnected and its tools withdrawn; the ones already connected are left
 alone.
+
+---
+
+## Vendors
+
+Beyond model APIs, you can engage **other agent harnesses** — Codex, DeepSeek
+Harness, Hermes, OpenClaw, or anything you can name a command for — and let
+employees hand them work. One line gets you started:
+
+```bash
+DEV3D_VENDORS="codex;dsh;hermes;openclaw"    # or: fast=codex;cheap=dsh
+```
+
+Each becomes a tool employees may call, published as
+`agent__<id>__delegate`, and each is **docked in the 3D office** as a rented
+terminal: a plinth, a screen in the vendor's own colour, and a beacon. Dim on
+standby, lit and scrolling while a delegation runs. Not a person — a `Role` here
+means staff, with a desk, a manager and a code review, and a harness somebody else
+operates is neither.
+
+They live in the **rack room** when the floor has grown one, and in **reception**
+when it has not. Every configured vendor is docked whether or not anything is in
+flight, so you can see who you have on retainer — and an unreachable one is
+visibly dead rather than simply missing.
+
+### Two ways to talk to one
+
+| Transport | Harnesses | What it buys |
+|---|---|---|
+| `command` | `codex`, `dsh`, `hermes` | Reach. Run it once with a prompt, read stdout, done. |
+| `acp` | `openclaw`, and the rest of the [ACP Registry](https://agentclientprotocol.com/get-started/registry) | **Mediation.** The agent's tool calls are visible as they happen, its reads are confined to the run's workspace by dev3d itself, its writes are refused outright, and every action it reports is put to you first. |
+
+### Read-only, and how much of that is a guarantee
+
+Delegations are read-only in this release. That single word covers three different
+things, and the Vendors page never blurs them:
+
+| | Who makes it true | For example |
+|---|---|---|
+| **sandboxed** | the harness, with an OS sandbox dev3d asked for | Codex, `-s read-only` |
+| **mediated** | **dev3d**, over ACP: writes refused, reads confined, tool calls approved one by one | OpenClaw |
+| **requested** | nobody — the task text asks and nothing enforces it | DSH, Hermes |
+
+A guarantee and a request are not the same thing, and a panel that renders both as
+a green "read-only" badge is lying by omission. The `requested` level is also the
+only one nothing bounds, so it is the one that asks you to approve a delegation up
+front; `mediated` asks per tool call instead, which is a better question.
+
+A delegation runs in the **run's workspace**. Two things it deliberately does
+*not* do: a vendor reports no cost dev3d can see (it bills its own subscription),
+so the run's spend ceiling cannot bound it and the per-vendor timeout is the real
+limit; and two delegations to the same vendor are serialised, because a harness is
+one machine with one quota behind it.
+
+Auth is the vendor's own business. `codex login`, `hermes config set`, an OpenClaw
+Gateway that has to be running first — a dev3d provider key does nothing for any of
+them, and each vendor's panel says so rather than letting you conclude the
+integration is broken.
+
+`vendors.json` covers anything that needs a custom command or transport:
+
+```jsonc
+{
+  "vendors": [
+    { "id": "codex", "preset": "codex" },
+    { "id": "openclaw", "preset": "openclaw" },
+    { "id": "boxed", "preset": "codex", "command": "/opt/boxed/codex",
+      "label": "Boxed Codex", "timeoutMs": 600000,
+      "capabilities": { "readOnlyEnforcement": "sandbox" } }
+  ]
+}
+```
+
+See [docs/external-agents.md](docs/external-agents.md) for the design.
 
 ---
 
@@ -571,6 +775,8 @@ The ones that matter most:
 | `DEV3D_MODEL_DISCOVERY` | `true` | Ask providers what they serve. `false` keeps the office fully offline. |
 | `DEV3D_BENCHMARKS` | `true` | Pooled quality through OpenRouter's benchmark API. Needs `OPENROUTER_API_KEY`. |
 | `DEV3D_ENDPOINT_HEALTH` | `true` | Upstream uptime, which needs no key. |
+| `DEV3D_MEMORY_VECTORS` | `false` | Load the `sqlite-vec` index so recall can re-rank by meaning. Off is a complete configuration. |
+| `DEV3D_MEMORY_EMBEDDING` | *(empty)* | `provider/model` for embeddings. Required for semantic recall; empty keeps it lexical. |
 | `DEV3D_RUN_BUDGET_USD` | `5.00` | Hard ceiling per run. |
 | `DEV3D_SOFT_SPEND_APPROVAL_USD` | `1.50` | Ask a human before crossing this. `0` disables. |
 | `DEV3D_MAX_CONCURRENCY` | `4` | Parallel employees inside one company. |
@@ -583,6 +789,11 @@ The ones that matter most:
 | `DEV3D_MCP_CONFIG` | `./mcp.json` | The MCP server file. An empty value disables the file. |
 | `DEV3D_MCP_SERVERS` | *(empty)* | Inline servers: `<id>=<command> [args…]`, separated by `;`. |
 | `DEV3D_MCP_GRANT_ROLES` | `shell-roles` | Who may call MCP tools: role ids, `*`, or `none`. |
+| `DEV3D_VENDOR_DELEGATION` | `true` | Allow engaging third-party vendors. Does nothing until one is configured. |
+| `DEV3D_VENDORS` | *(empty)* | Inline vendors, separated by `;`: a preset name, or `<id>=<preset>`. Presets: `codex`, `dsh`, `hermes`. |
+| `DEV3D_VENDORS_CONFIG` | `./vendors.json` | The vendor file, for anything needing a custom command. An empty value disables the file. |
+| `DEV3D_VENDOR_GRANT_ROLES` | `delegate-roles` | Who may hand work to a vendor: `delegate-roles`, role ids, `*`, or `none`. |
+| `DEV3D_VENDOR_REQUIRE_CAN_DELEGATE` | `true` | Also require `Role.canDelegate` on the org chart, in addition to the grant above. |
 
 Provider keys: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 `ANTHROPIC_API_KEY`, and `DEV3D_LOCAL_BASE_URL` for any OpenAI-compatible local
@@ -619,6 +830,24 @@ console says so with the remedy.
 ## Known gaps
 
 - **No authentication.** Everything is unauthenticated and intended for localhost.
+- **Memory is written by hand.** A fact exists because an operator wrote it down;
+  nothing derives one from a run. That is deliberate — extraction is where memory
+  systems are measured to fail most — but it means the office does not yet remember
+  anything nobody thought to record. Reading past runs, turns and artifacts is the
+  next slice and needs no extraction at all.
+- **Recall is lexical unless you switch it on.** Facts are found by full-text search
+  by default, so a question phrased entirely in different words from the fact can
+  miss it. Semantic re-ranking exists but is off, unused in this tree, and
+  unmeasured against a real workload - see `docs/memory-systems.md`.
+- **Embeddings are backfilled lazily.** Switching vectors on does not embed the
+  existing store in one go: a search embeds a handful of unembedded facts as it
+  passes, and `POST /api/memory/embed` drains them in batches. Until a fact has a
+  vector it simply keeps its lexical rank, so the feature is never wrong, only
+  partially applied.
+- **Nothing scores a fact by whether it helped.** Reads are counted, which is the
+  raw material for outcome-weighted ranking, but no run outcome is attached to the
+  facts it was shown yet — so a fact that is recalled and useless is indistinguishable
+  from one that is recalled and load-bearing.
 - **A run cannot be moved between floors.** `workspaceId` is frozen at submit time;
   closing a floor does not migrate its history anywhere.
 - **The office composition has not been judged by eye.** Headless Chrome renders it
@@ -638,6 +867,10 @@ console says so with the remedy.
 - **No avatars in the GLB.** Employees are built procedurally in the browser from
   `Role.appearance`. That is deliberate, and it means the avatars are deliberately
   simple.
+- **Where idle employees wander is per browser.** The liveliness layer is
+  client-side and seeded per session, so two consoles watching the same floor
+  agree about the work and disagree about the strolls. Nothing about a walk is a
+  fact about the office, so nothing about it is stored or sent.
 - **Direct messages carry no tools.** A conversation outside a pipeline routes on the
   role's default tier and answers from the model alone; it cannot read the workspace,
   and the reply says so rather than pretending.

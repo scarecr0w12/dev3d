@@ -17,7 +17,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
-import type { ClientCommand, McpServerStatus, QualityOpinion, ServerEvent, SkillSummary } from '@dev3d/core';
+import type {
+  ClientCommand,
+  McpServerStatus,
+  MemoryFactInput,
+  QualityOpinion,
+  ServerEvent,
+  SkillSummary,
+} from '@dev3d/core';
 import { toSkillSummary } from '@dev3d/core';
 import { loadConfig, detectConfigDrift } from './config.ts';
 import type { ProviderConfig } from './config.ts';
@@ -34,6 +41,9 @@ import { createRuntime, type LogFn, type Runtime } from './server/runtime.ts';
 import { loadSkills, loadSkillsWithReport } from './skills/loader.ts';
 import { openStore } from './store/store.ts';
 import { createDefaultTools, createToolRegistry } from './tools/registry.ts';
+import { createVendorTools } from './tools/vendor.ts';
+import { loadVendorConfig, parseVendorGrantPolicy } from './vendors/config.ts';
+import { VendorRegistry } from './vendors/registry.ts';
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 } as const;
 
@@ -124,7 +134,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const log = makeLogger(config.logLevel);
 
-  const store = openStore(config.dbPath, log);
+  const store = openStore(config.dbPath, log, { vectors: config.memoryVectors });
   // Reported rather than thrown: a malformed skill is a typo in a markdown file,
   // and it must not be the reason the office refuses to open. The loader logs
   // each file it skips with its reason; this is the one-line summary.
@@ -141,6 +151,10 @@ async function main(): Promise<void> {
   // Held so shutdown can close every MCP connection rather than leaving child
   // processes behind.
   let mcpRef: McpManager | null = null;
+  // Held for the same reason, and for the re-probe route: a vendor is a child
+  // process too, and one left mid-delegation at shutdown is a process the
+  // operator did not ask for.
+  let vendorsRef: VendorRegistry | null = null;
 
   /** How many recent turns the learned layer reads. Bounded, and generous. */
   const LEARNED_TURN_WINDOW = 2_000;
@@ -342,6 +356,47 @@ async function main(): Promise<void> {
     });
   }
 
+  /**
+   * Third-party vendors, if any are configured.
+   *
+   * Built before the runtime, and their tools registered before it too, because
+   * the runtime filters a role's tool grant against the registry: a vendor tool
+   * that appeared after the chart was read would be ungrantable until a restart.
+   *
+   * Nothing here is awaited. A probe spawns a process, and an office that would
+   * not open until three harnesses had answered `--version` would be an office
+   * that does not open on a machine where none of them are installed.
+   */
+  const vendorConfig = config.vendorDelegation
+    ? loadVendorConfig(process.env, config.repoRoot)
+    : { vendors: [], problems: [], file: null };
+  for (const problem of vendorConfig.problems) {
+    log('warn', 'vendors', problem);
+  }
+  const vendorPolicy = parseVendorGrantPolicy(process.env);
+  const vendors = new VendorRegistry(vendorConfig.vendors, {
+    log: (level, scope, message) => log(level, scope, message),
+  });
+  vendorsRef = vendors;
+  for (const tool of createVendorTools({
+    registry: vendors,
+    log: (level, scope, message) => log(level, scope, message),
+  })) {
+    tools.register(tool);
+  }
+  if (!config.vendorDelegation) {
+    log('info', 'vendors', 'vendor delegation is switched off (DEV3D_VENDOR_DELEGATION=false)');
+  } else if (vendorConfig.vendors.length > 0) {
+    log(
+      'info',
+      'vendors',
+      `${vendorConfig.vendors.length} vendor(s) configured${vendorConfig.file === null ? '' : ` from ${vendorConfig.file}`}; checking in the background`,
+    );
+    void vendors.start().catch((e: unknown) => {
+      log('error', 'vendors', `probe failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  }
+
   const runtime = createRuntime({
     config,
     store,
@@ -355,6 +410,16 @@ async function main(): Promise<void> {
     // `mcpGrantRoles` in config.ts.
     mcpToolNames: () => mcp.toolNames(),
     mcpStatus: () => mcp.status() as McpServerStatus[],
+    // The vendor bay travels with the office state, so the console can say who
+    // is on site and the 3D view can dock a terminal for each of them.
+    vendorStatus: () => vendors.states(),
+    vendorToolNames: () => vendors.toolNames(),
+    vendorPolicy: {
+      enabled: config.vendorDelegation,
+      configPath: vendorConfig.file,
+      grantRoles: vendorPolicy.grantRoles,
+      requireCanDelegate: vendorPolicy.requireCanDelegate,
+    },
   });
   runtimeRef = runtime;
 
@@ -393,6 +458,11 @@ async function main(): Promise<void> {
     org: runtime.org,
     pipelines: runtime.pipelines,
     routingHints: () => pluginHost.contributions().routingHints,
+    recall: runtime.recallAsync,
+    // The lexical half, for the `recall` tool: a model calling it mid-turn must
+    // not trigger an embedding round trip, and the query the prompt index already
+    // asked is served from the turn's own facts.
+    recallSync: runtime.recall,
     employees: runtime.employees,
     sink: runtime.sink,
     approvals: runtime.approvals,
@@ -686,6 +756,27 @@ async function main(): Promise<void> {
           return;
         }
 
+        // ------------------------------------------------------------- memory
+        case 'rememberFact': {
+          const result = runtime.rememberFact(cmd.fact);
+          // The failure goes back to the socket that asked and nowhere else: a
+          // rejected write is a mistake in one console, not news for the office.
+          if (!result.ok) {
+            push(ws, { type: 'error', message: result.error, at: Date.now() });
+            return;
+          }
+          return;
+        }
+
+        case 'retractFact': {
+          const result = runtime.retractFact(cmd.factId);
+          if (!result.ok) {
+            push(ws, { type: 'error', message: result.error, at: Date.now() });
+            return;
+          }
+          return;
+        }
+
         case 'resync': {
           push(ws, { type: 'hello', state: runtime.state(), at: Date.now() });
           return;
@@ -808,6 +899,86 @@ async function main(): Promise<void> {
       if (path === '/api/skills') {
         const summaries: SkillSummary[] = skills.map(toSkillSummary);
         sendJson(res, 200, summaries);
+        return;
+      }
+
+      // ------------------------------------------------------------------ memory
+      /**
+       * The whole record, including what the office no longer believes.
+       *
+       * Served over HTTP rather than carried in every state frame because it is
+       * unbounded: the live socket gets the active facts, and the history is a
+       * question the Memory page asks when somebody opens the ledger.
+       */
+      if (path === '/api/memory' && req.method === 'GET') {
+        sendJson(res, 200, runtime.memoryLedger());
+        return;
+      }
+
+      /**
+       * Search memory as one employee, or as nobody in particular.
+       *
+       * The scopes are resolved from the workspace and role on the query string,
+       * so an operator browsing a floor sees what that floor's people see - which
+       * is the only way to tell whether a fact is actually reachable.
+       */
+      if (path === '/api/memory/search' && req.method === 'GET') {
+        const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+        const workspaceId = url.searchParams.get('workspaceId') ?? runtime.activeWorkspaceId();
+        const roleId = url.searchParams.get('roleId');
+        const q = url.searchParams.get('q') ?? '';
+        const limitRaw = Number(url.searchParams.get('limit') ?? '25');
+        const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(100, Math.floor(limitRaw))) : 25;
+        sendJson(res, 200, await runtime.recallAsync({ workspaceId, roleId, query: q, limit }));
+        return;
+      }
+
+      /**
+       * Embed facts that have no vector yet.
+       *
+       * Explicit rather than automatic so an operator controls the spend against a
+       * metered embedding endpoint, and bounded by `limit` per call so one request
+       * cannot become a thousand upstream calls. Reports what it did rather than
+       * claiming success: a partial drain is the honest answer, and zero with
+       * semantic switched off is a real answer rather than a failure.
+       */
+      if (path === '/api/memory/embed' && req.method === 'POST') {
+        const body = await readJson<{ limit?: unknown }>(req, res);
+        if (body === null) return;
+        const raw = Number(body.limit ?? 32);
+        const limit = Number.isFinite(raw) ? Math.max(1, Math.min(256, Math.floor(raw))) : 32;
+        const embedded = await runtime.embedMemory(limit);
+        sendJson(res, 200, { embedded, semantic: runtime.memory().semantic() });
+        return;
+      }
+
+      /**
+       * Write a fact down, or correct one.
+       *
+       * Validation lives in the runtime, so this route and the socket command
+       * enforce identically and neither can drift into accepting something the
+       * other refuses.
+       */
+      if (path === '/api/memory' && req.method === 'POST') {
+        const body = await readJson<Record<string, unknown>>(req, res);
+        if (body === null) return;
+        const result = runtime.rememberFact(body as unknown as MemoryFactInput);
+        if (!result.ok) {
+          sendJson(res, 400, { error: result.error });
+          return;
+        }
+        sendJson(res, 201, { fact: result.fact, superseded: result.superseded });
+        return;
+      }
+
+      const retractMatch = /^\/api\/memory\/([^/]+)\/retract$/.exec(path);
+      if (retractMatch?.[1] !== undefined && req.method === 'POST') {
+        const result = runtime.retractFact(retractMatch[1]);
+        if (!result.ok) {
+          sendJson(res, 400, { error: result.error });
+          return;
+        }
+        sendJson(res, 200, { fact: result.fact });
         return;
       }
 
@@ -1012,6 +1183,36 @@ async function main(): Promise<void> {
         // reach it — the same full-state event every other change uses.
         broadcast({ type: 'office.updated', state: runtime.state(), at: Date.now() });
         sendJson(res, 200, { servers: status, problems: fresh.problems, file: fresh.file });
+        return;
+      }
+
+      /**
+       * Re-read the vendor config and re-probe.
+       *
+       * Worth having as a route rather than only as a boot step, because the
+       * common case is "I just installed Codex and it is still showing as not on
+       * site" - and the alternative is restarting the orchestrator, which drops
+       * every in-flight run.
+       *
+       * This re-reads config but does **not** rebuild the registered tools: the
+       * tool registry is built once at boot, and a vendor added by an edit here
+       * would have a status row with no tool behind it. Adding a vendor is a
+       * restart; re-probing one that was reported unreachable is not.
+       */
+      if (path === '/api/vendors/refresh' && req.method === 'POST') {
+        if (vendorsRef === null) {
+          sendJson(res, 503, { error: 'Vendor delegation is not running in this process.' });
+          return;
+        }
+        await vendorsRef.refresh();
+        const states = vendorsRef.states();
+        log(
+          'info',
+          'vendors',
+          `refresh: ${states.filter((v) => v.status === 'docked').length}/${states.length} vendor(s) on site`,
+        );
+        broadcast({ type: 'office.updated', state: runtime.state(), at: Date.now() });
+        sendJson(res, 200, { vendors: states });
         return;
       }
 

@@ -48,6 +48,10 @@ import type {
   PluginPersistedState,
   PluginSystemState,
   McpServerStatus,
+  MemoryFact,
+  MemoryFactInput,
+  MemoryRecord,
+  VendorState,
 } from '@dev3d/core';
 import {
   DEFAULT_STYLE_PRESET,
@@ -72,6 +76,7 @@ import type { ActiveContributions } from '../plugins/host.ts';
 import type { Store } from '../store/store.ts';
 import { resolveInWorkspace } from '../tools/paths.ts';
 import type { ApprovalBroker, EmployeeTracker, EventSink, OrgAccess } from '../engine/types.ts';
+import { createMemoryService, scopesFor, type MemoryService } from './memory.ts';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error', scope: string, message: string) => void;
 
@@ -153,6 +158,48 @@ export interface Runtime {
   state(): OfficeState;
   subscribe(fn: (event: ServerEvent) => void): () => void;
   emit(event: ServerEvent): void;
+
+  // ------------------------------------------------------------------- memory
+  /**
+   * Write a fact down, or correct one, as an operator.
+   *
+   * Superseding and creating are one call because they are one act: a correction
+   * that only added the new fact would leave two active facts contradicting each
+   * other, which is worse than the mistake being corrected.
+   */
+  rememberFact(
+    input: MemoryFactInput,
+  ): { ok: true; fact: MemoryFact; superseded: MemoryFact | null } | { ok: false; error: string };
+  /** Stop believing a fact, without recording what replaced it. */
+  retractFact(id: string): { ok: true; fact: MemoryFact } | { ok: false; error: string };
+  /** The whole record, including superseded and retracted facts. */
+  memoryFacts(): MemoryFact[];
+  /** The record with its arithmetic: total, inactive, and whether search ranks. */
+  memoryLedger(): MemoryRecord;
+  /**
+   * Search memory as one employee would see it.
+   *
+   * The scope set is derived here rather than passed in, so a caller cannot ask
+   * for a floor it is not in: containment is decided in one place instead of at
+   * every call site.
+   */
+  recall(input: {
+    workspaceId: string;
+    roleId: string | null;
+    query: string;
+    limit?: number;
+  }): MemoryFact[];
+  /** The same recall, with semantic re-ranking when the office has it configured. */
+  recallAsync(input: {
+    workspaceId: string;
+    roleId: string | null;
+    query: string;
+    limit?: number;
+  }): Promise<MemoryFact[]>;
+  /** Embed facts that have no vector yet, up to `limit`. Returns how many were. */
+  embedMemory(limit: number): Promise<number>;
+  /** The service itself, for the engine to build a tool and a prompt section from. */
+  memory(): MemoryService;
 
   org: OrgAccess;
   employees: EmployeeTracker;
@@ -378,6 +425,52 @@ export function mcpGrantedForRole(
   return grants.includes('*') || grants.includes(role.id);
 }
 
+/** The vendor policy the runtime needs, resolved from config at boot. */
+export interface VendorGrantConfig {
+  enabled: boolean;
+  configPath: string | null;
+  /** Role ids that may hand work to a vendor. `['*']` means every role. */
+  grantRoles: string[];
+  /** Whether `Role.canDelegate` is also required. */
+  requireCanDelegate: boolean;
+}
+
+/**
+ * May this role hand work to a third-party vendor?
+ *
+ * A pure exported function, tested directly, for the same reason
+ * `mcpGrantedForRole` is one: this decides whether an employee can launch
+ * somebody else's process against the workspace, and that is the one part of the
+ * integration that should not have to be inferred from a working happy path.
+ *
+ * Two independent gates, and both must open:
+ *
+ *  - `Role.canDelegate` - the org chart's own answer to "may this person put work
+ *    on somebody else", which existed on the contract and, until now, was read by
+ *    nothing at all. Wiring it here is what finally gives an operator's edit to
+ *    that field an effect.
+ *  - the grant policy - `DEV3D_VENDOR_GRANT_ROLES`, default `delegate-roles`,
+ *    meaning "whoever can already delegate". A marker rather than role ids for the
+ *    same reason MCP uses one: role ids belong to a chart an operator can rename,
+ *    and a hardcoded list would quietly stop matching.
+ *
+ * Default-deny in every ambiguous case, because the failure mode on the other
+ * side is an unconfined third-party process touching a project directory.
+ */
+export function vendorsGrantedForRole(
+  role: Pick<Role, 'id' | 'canDelegate'>,
+  policy: VendorGrantConfig,
+): boolean {
+  if (!policy.enabled) return false;
+  if (policy.requireCanDelegate && !role.canDelegate) return false;
+  const grants = policy.grantRoles;
+  if (grants.length === 0) return false;
+  // `delegate-roles` is the marker form: the `canDelegate` check above has
+  // already done the work, so the marker itself grants nobody extra.
+  if (grants.length === 1 && grants[0] === 'delegate-roles') return true;
+  return grants.includes('*') || grants.includes(role.id);
+}
+
 export function createRuntime(opts: {
   config: ServerConfig;
   store: Store;
@@ -400,8 +493,62 @@ export function createRuntime(opts: {
   mcpToolNames?: () => string[];
   /** MCP server status for the console. */
   mcpStatus?: () => McpServerStatus[];
+  /**
+   * The third-party vendors this office has engaged, for the console and the 3D
+   * office.
+   *
+   * A supplier rather than a list because a vendor's status changes while the
+   * office runs - it is probed at boot, engaged mid-run, and can fail at any
+   * point - and the office state is assembled on every broadcast.
+   */
+  vendorStatus?: () => VendorState[];
+  /**
+   * The vendor delegation tools currently registered, so they can be granted.
+   *
+   * Separate from `vendorStatus` because status is what the console shows and
+   * this is what the org chart may hand out - and, as with MCP, a registered tool
+   * is not automatically a grant.
+   */
+  vendorToolNames?: () => string[];
+  /** Who may engage a vendor. Absent means nobody, which is the safe default. */
+  vendorPolicy?: VendorGrantConfig;
 }): Runtime {
   const { config, store, registry, log } = opts;
+
+  /**
+   * Memory is built here rather than by the engine, because the runtime is the
+   * only thing that writes to the store and a second writer would be the start of
+   * the two disagreeing. The engine reads it through `memory()`.
+   *
+   * The embedder is assembled from the registry only when an operator has named
+   * an embedding endpoint, and it is deliberately forgiving: an adapter that does
+   * not implement `embed` at all - Anthropic serves no embeddings, and a local
+   * runtime usually has none until a model is pulled - leaves semantic ranking
+   * switched off rather than failing at boot. Absent capability is a
+   * configuration, not an error.
+   */
+  const embedding = config.memoryEmbedding;
+  const embedProvider = embedding === null ? undefined : registry.get(embedding.providerId);
+  const memory = createMemoryService(
+    store,
+    config.memoryVectors && embedding !== null && embedProvider?.embed !== undefined
+      ? {
+          embed: (texts) =>
+            // Re-looked-up on every call so enabling a plugin provider, or a
+            // provider appearing later in the boot, does not leave memory bound
+            // to an adapter that has since been replaced.
+            registry.get(embedding.providerId)!.embed!({ model: embedding.model, texts }),
+        }
+      : {},
+  );
+  if (config.memoryVectors && embedding !== null && embedProvider?.embed === undefined) {
+    log(
+      'warn',
+      'memory',
+      `semantic memory is switched on but provider "${embedding.providerId}" offers no embeddings endpoint; ` +
+        'recall stays lexical',
+    );
+  }
 
   const office: Office = migrateOffice(store.loadOffice(), config);
   const pipelines: Pipeline[] = defaultPipelines();
@@ -964,16 +1111,47 @@ export function createRuntime(opts: {
     return { ...role, allowedTools: [...role.allowedTools, ...missing] };
   }
 
+  /**
+   * The role as the engine should see it, with the vendor delegation tools added
+   * to its grant when policy allows.
+   *
+   * The same shape as `withMcpGrants` and for the same reason: a vendor can be
+   * configured, added or switched off while the office runs, so its tool is
+   * granted at the point of use rather than frozen into the operator's org chart.
+   * Written into the chart instead, disabling a vendor would leave a grant behind
+   * naming a tool that no longer exists - which `turn.ts` drops silently, so the
+   * employee would simply find that delegating stopped working with no reason
+   * anywhere.
+   *
+   * Gated on `canDelegate` as well as the grant policy; see
+   * `vendorsGrantedForRole` for why both gates exist.
+   */
+  function withVendorGrants(role: Role | undefined): Role | undefined {
+    if (role === undefined) return undefined;
+    const policy = opts.vendorPolicy;
+    if (policy === undefined) return role;
+    if (!vendorsGrantedForRole(role, policy)) return role;
+    const vendorTools = opts.vendorToolNames?.() ?? [];
+    if (vendorTools.length === 0) return role;
+    const missing = vendorTools.filter((name) => !role.allowedTools.includes(name));
+    if (missing.length === 0) return role;
+    return { ...role, allowedTools: [...role.allowedTools, ...missing] };
+  }
+
   const orgAccess: OrgAccess = {
     chart: (workspaceId) => {
       const workspace = workspaceById(workspaceId) ?? office.workspaces[0];
       if (!workspace) return { company: defaultCompany(), departments: [], roles: [], pipelineIds: [], updatedAt: Date.now() };
       return workspace.org;
     },
-    // MCP tools are added at the point of use rather than written into the org
-    // chart, because a server can come and go while the office is running: the
-    // chart is the operator's document, and the tools are the network's.
-    role: (roleId, workspaceId) => withMcpGrants(workspaceById(workspaceId)?.org.roles.find((role) => role.id === roleId)),
+    // MCP tools and vendor delegation tools are both added at the point of use
+    // rather than written into the org chart, because a server can come and go
+    // while the office is running: the chart is the operator's document, and the
+    // external capabilities are the network's.
+    role: (roleId, workspaceId) =>
+      withVendorGrants(
+        withMcpGrants(workspaceById(workspaceId)?.org.roles.find((role) => role.id === roleId)),
+      ),
     workspace: (workspaceId) => workspaceById(workspaceId),
     workspaces: () => office.workspaces,
   };
@@ -1050,6 +1228,18 @@ export function createRuntime(opts: {
         configPath: config.mcpConfigPath,
         grantRoles: [...config.mcpGrantRoles],
         servers: opts.mcpStatus?.() ?? [],
+      },
+      memory: memory.state(),
+      // The vendor bay: who is on site, and who may engage them. Assembled on
+      // every broadcast rather than captured, because a vendor's status moves
+      // while the office runs - probed at boot, engaged mid-run, and able to fail
+      // at any point.
+      vendorBay: {
+        enabled: opts.vendorPolicy?.enabled ?? false,
+        configPath: opts.vendorPolicy?.configPath ?? null,
+        grantRoles: [...(opts.vendorPolicy?.grantRoles ?? [])],
+        requireCanDelegate: opts.vendorPolicy?.requireCanDelegate ?? true,
+        vendors: opts.vendorStatus?.() ?? [],
       },
       workspaces: summaries(),
       company: structuredClone(workspace?.org.company ?? defaultCompany()),
@@ -1356,6 +1546,60 @@ export function createRuntime(opts: {
       const resolved = resolveStyle(parsed);
       commitWorkspace(workspace, `"${workspace.name}" restyled to ${resolved.preset.name}`);
       return { ok: true };
+    },
+
+    // ----------------------------------------------------------------- memory
+    rememberFact(input) {
+      const result = memory.record(input, 'operator');
+      if (!result.ok) return result;
+      // One event carries both halves of a correction. The client applies the new
+      // fact and invalidates the old one from a single frame, so a console can
+      // never briefly hold two active facts that contradict each other.
+      emit({
+        type: 'memory.created',
+        fact: structuredClone(result.fact),
+        superseded: result.superseded === null ? null : structuredClone(result.superseded),
+        at: Date.now(),
+      });
+      return result;
+    },
+
+    retractFact(id) {
+      const result = memory.retract(id);
+      if (!result.ok) return result;
+      emit({ type: 'memory.retracted', fact: structuredClone(result.fact), at: Date.now() });
+      return result;
+    },
+
+    memoryFacts: () => memory.ledger().facts,
+    memoryLedger: () => memory.ledger(),
+    memory: () => memory,
+
+    recall({ workspaceId, roleId, query, limit }) {
+      const facts = memory.search(query, scopesFor(workspaceId, roleId), limit ?? 8);
+      // Only a recall that returned something counts as a read. Recording the
+      // attempt would make a fact look used because it was searched for, which is
+      // the opposite of the signal this is meant to collect.
+      if (facts.length > 0) memory.noteRead(facts.map((f) => f.id), Date.now());
+      return facts;
+    },
+
+    /**
+     * Recall for a caller that can wait, which is every interactive one.
+     *
+     * Kept separate from the synchronous `recall` rather than replacing it: the
+     * engine's tool loop and the HTTP route both await, but a synchronous caller
+     * should not be forced through a promise to get the lexical answer it would
+     * have got anyway.
+     */
+    async recallAsync({ workspaceId, roleId, query, limit }) {
+      const facts = await memory.searchAsync(query, scopesFor(workspaceId, roleId), limit ?? 8);
+      if (facts.length > 0) memory.noteRead(facts.map((f) => f.id), Date.now());
+      return facts;
+    },
+
+    async embedMemory(limit) {
+      return memory.embedMissing(limit);
     },
 
     state,

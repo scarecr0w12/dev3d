@@ -190,6 +190,15 @@ export interface ServerConfig {
   mcpGrantRoles: string[];
   /** True when `mcpGrantRoles` means "whoever already has run_shell". */
   mcpGrantToShellRoles: boolean;
+  /**
+   * Whether third-party vendors may be engaged at all.
+   *
+   * On by default, but like MCP it does nothing until a vendor is configured:
+   * with none named, no process is spawned and nothing is probed. Off is the
+   * switch for a locked-down install where the office must never launch a
+   * program it did not ship.
+   */
+  vendorDelegation: boolean;
   /** Resolved mode: `live` only when a provider is actually configured. */
   llmMode: LlmMode;
   /** What the operator asked for, before resolving `auto`. */
@@ -280,6 +289,29 @@ export interface ServerConfig {
   endpointHealthProviderIds: string[];
   endpointHealthCachePath: string | null;
   endpointHealthTtlMs: number;
+  /**
+   * Whether memory recall may use vector search in addition to full text.
+   *
+   * **Off by default, and off is a complete configuration.** Lexical recall is
+   * measured to be about three orders of magnitude faster and six times smaller
+   * than a brute-force vector scan, and the queries this workload produces are
+   * paths, identifiers and error strings - the regime where BM25 is strongest.
+   * The ceiling of lexical search has to be measured on real queries before a
+   * native, pre-v1 dependency earns a place in a server that otherwise depends
+   * only on `ws`.
+   *
+   * Switching it on also requires an embedding source. With none configured this
+   * flag does nothing and the office says so rather than pretending otherwise.
+   */
+  memoryVectors: boolean;
+  /**
+   * The embedding endpoint to use, as `provider/model`, or null when none is set.
+   *
+   * A setting rather than an inference, because "which provider can embed" is not
+   * a question the catalog answers: DeepSeek and Anthropic serve none at all,
+   * OpenRouter and OpenAI do, and a local runtime depends on what has been pulled.
+   */
+  memoryEmbedding: { providerId: string; model: string } | null;
   providers: ProviderConfig[];
   /** Number of keys loaded from .env, reported at boot. */
   dotEnvCount: number;
@@ -343,6 +375,26 @@ function buildProviders(): ProviderConfig[] {
       // A local runtime needs no key, so it counts as configured once a base
       // URL is explicitly provided.
       hint: 'Set DEV3D_LOCAL_BASE_URL (e.g. Ollama, vLLM, LM Studio) to use local models.',
+    },
+    /**
+     * The scripted provider, declared as a real provider so an embedding
+     * endpoint can name it.
+     *
+     * `mock` mode already swaps every adapter for the scripted one, but that
+     * leaves no provider whose *id* is `mock` - so `DEV3D_MEMORY_EMBEDDING=mock/...`
+     * would name something that does not exist and semantic memory would be
+     * impossible to exercise without a key. That would break the promise the rest
+     * of the office keeps in mock mode: that the whole pipeline is demonstrable
+     * with no credentials. It contributes no models, so it never appears in the
+     * catalog and cannot be routed a turn.
+     */
+    {
+      id: 'mock',
+      label: 'Mock (scripted)',
+      kind: 'mock',
+      baseUrl: 'mock://scripted',
+      apiKey: null,
+      hint: 'The scripted provider. Used to exercise the pipeline without a key.',
     },
   ];
 }
@@ -434,8 +486,8 @@ export function loadConfig(): ServerConfig {
         .filter((part) => part !== '');
       return { mcpGrantRoles: roles, mcpGrantToShellRoles: shellRoles };
     })(),
-    modelDiscovery: str('DEV3D_MODEL_DISCOVERY', 'true').toLowerCase() !== 'false',
-    discoveryTtlMs: Math.max(0, num('DEV3D_MODEL_DISCOVERY_TTL_MS', 6 * 60 * 60 * 1000)),
+    vendorDelegation: str('DEV3D_VENDOR_DELEGATION', 'true').toLowerCase() !== 'false',
+    modelDiscovery: str('DEV3D_MODEL_DISCOVERY', 'true').toLowerCase() !== 'false',    discoveryTtlMs: Math.max(0, num('DEV3D_MODEL_DISCOVERY_TTL_MS', 6 * 60 * 60 * 1000)),
     discoveryCachePath: (() => {
       // Caching is on by default so a restart does not depend on every vendor
       // being reachable. `off` is the escape hatch for a locked-down install
@@ -471,6 +523,19 @@ export function loadConfig(): ServerConfig {
     // Ten minutes: uptime is a rolling 30-minute figure, so refreshing much
     // faster than that would re-ask for a number that has barely moved.
     endpointHealthTtlMs: Math.max(0, num('DEV3D_ENDPOINT_HEALTH_TTL_MS', 10 * 60 * 1000)),
+    memoryVectors: str('DEV3D_MEMORY_VECTORS', 'false').toLowerCase() === 'true',
+    memoryEmbedding: (() => {
+      // `provider/model`, because a bare model name is ambiguous across vendors -
+      // `text-embedding-3-small` on OpenAI and a same-named slug on a gateway are
+      // different vectors, and blending them would make every distance a lie.
+      // A model id may itself contain slashes (OpenRouter slugs do), so only the
+      // first segment is the provider.
+      const raw = str('DEV3D_MEMORY_EMBEDDING', '').trim();
+      if (raw === '') return null;
+      const slash = raw.indexOf('/');
+      if (slash <= 0 || slash === raw.length - 1) return null;
+      return { providerId: raw.slice(0, slash), model: raw.slice(slash + 1) };
+    })(),
     llmMode,
     llmModeSetting,
     llmModeReason,

@@ -31,7 +31,8 @@ pnpm dev:web                 # office UI on http://127.0.0.1:5273 (proxies /api 
 packages/core      Shared contracts. No network, no filesystem, no React.
                    Both the orchestrator and the UI compile against exactly
                    these types, which is what keeps the wire protocol honest.
-                   model.ts, skill.ts, org.ts, run.ts, style.ts, events.ts
+                   model.ts, skill.ts, org.ts, run.ts, style.ts, events.ts,
+                   memory.ts
 
 apps/server        The orchestrator.
   config.ts        Env-driven configuration; mock/live resolution.
@@ -40,17 +41,20 @@ apps/server        The orchestrator.
                    and the fail-over registry.
   router/          Cost-aware model selection.
   skills/          Skill markdown loader, index, and per-turn selection.
-  tools/           The 14 built-in tools, all confined to the workspace root.
+  tools/           The 15 built-in tools, all confined to the workspace root.
+  server/          Runtime: org chart, roster, approvals, event fan-out, and
+                   memory.ts - the fact store's rules: supersede, retract, scope.
   mcp/             MCP client: JSON-RPC, the stdio and HTTP transports, and the
                    manager that publishes remote tools into the registry.
   org/             The shipped company and its pipelines.
   engine/          complexity -> prompt -> turn -> stage -> run.
   store/           SQLite persistence (node:sqlite), with a memory fallback.
-  server/          Runtime: org chart, roster, approvals, event fan-out.
   index.ts         HTTP + WebSocket entry point.
 
 apps/web           The office UI (React 18 + three.js): the client store, the
-                   office and floor model, the console panels, and the styles.
+                   office and floor model (navgrid.ts samples the loaded floor
+                   for walkable space; liveliness.ts decides what idle people
+                   do with it), the console panels, and the styles.
 
 plugins/           The shipped example plugins, loaded on a fresh boot.
 skills/*.md        15 skill documents, loaded from disk at boot.
@@ -76,15 +80,16 @@ One command per suite, each covering something the others cannot.
 # and that a corrupt style degrades to its preset instead of into a shader
 cd packages/core && node --test --test-isolation=none "src/**/*.test.ts"
 
-# server: 415 tests — 411 pass, 4 skipped, 0 fail (47 cover plugins, 13 the block layout, 5 the floor style)
+# server: 558 tests — 554 pass, 4 skipped, 0 fail (101 cover vendors, 47 plugins, 13 the block layout, 5 the floor style, 42 memory)
 cd apps/server && node --test --test-isolation=none "src/**/*.test.ts"
 
 # live protocol: drives a RUNNING server as a real client — 202 checks
 node scripts/smoke-ws.mjs
 
-# the office store's reducer, driven with one frame per event variant — 129 checks,
+# the office store's reducer, driven with one frame per event variant — 192 checks,
 # including that every preset dresses every role and every material in both GLBs
-# maps to one
+# maps to one, that the walking layer walks real routes over a real floor plan, and
+# that the pose it hands an avatar is the pose the avatar draws
 node apps/web/.verify/smoke.ts
 
 # the degradation promises: no database, a malformed skill file, an empty skills dir
@@ -119,7 +124,7 @@ node scripts/inspect-glb.mjs apps/web/public/office/office.glb
 - **Core: 14 tests** — the style model: preset completeness, sparse-patch
   resolution, and that a corrupt style degrades to its preset instead of into a
   shader.
-- **Server: 411 pass, 4 skipped, 0 fail.** The engine tests drive real runs — real
+- **Server: 554 pass, 4 skipped, 0 fail.** The engine tests drive real runs — real
   pipelines, real router, real tool loop — against the scripted provider and a
   scratch workspace, proving files land on disk, budget halts, cancellation is
   safe, debates produce verdicts, the review loop sends work back to the
@@ -158,7 +163,7 @@ node scripts/inspect-glb.mjs apps/web/public/office/office.glb
   context (and switching back), installation settings being changed and
   validated, a malformed body being a 400 rather than a 500, and post-run
   invariants. It clears anything a previous run left behind, so it is idempotent.
-- **Web harness: 129 checks.** A typecheck cannot prove a reducer correct, so
+- **Web harness: 192 checks.** A typecheck cannot prove a reducer correct, so
   `apps/web/.verify/smoke.ts` drives the real store with one synthetic frame per
   `ServerEvent` variant, including that an `org.updated` for another floor is
   ignored rather than applied to the one on screen, and that a `plan.reply` is
@@ -170,7 +175,15 @@ node scripts/inspect-glb.mjs apps/web/public/office/office.glb
   thread twice. It also covers the building's arithmetic — floor heights, the
   lowest-floor fallback, and which floor shows walls — because those are the
   rules that decide whether the office reads as a building at all, and they are
-  wrong in ways a typecheck cannot see.
+  wrong in ways a typecheck cannot see. The last third of it covers the walking
+  layer, which is two pieces of pure logic that a typecheck cannot see either: a
+  grid sampled from obstacle boxes must route through a doorway, refuse a sealed
+  room and never be walkable beyond the geometry; and the director that decides
+  who gets up must leave every working employee at their desk, keep the room from
+  emptying, bring somebody back when work arrives, seat everybody the instant the
+  layer is switched off, and replay identically from the same seed. It drives a
+  synthetic floor rather than the GLB, so a route, a conversation and a deadlock
+  are all reachable in a test.
 - **`check-css.mjs`: clean.** A typecheck cannot tell you that
   `className="poput-left"` is a typo, and after the stage layout landed the
   stylesheet still carried the whole retired three-column grid. This compares the
@@ -183,7 +196,7 @@ node scripts/inspect-glb.mjs apps/web/public/office/office.glb
   catalogue down. That last one is why the check exists: `loadSkills` runs in
   `main()` before the server listens, so an unhandled error in a single markdown
   file the README invites you to write would stop the office booting at all.
-- **Build: 89 modules, clean.** The bundle is served from `apps/web/dist` by the
+- **Build: 92 modules, clean.** The bundle is served from `apps/web/dist` by the
   orchestrator's static handler, alongside `office.glb`. Rebuilding is picked up
   on refresh; the server does not need restarting.
 
@@ -210,8 +223,8 @@ the others cannot.
    cd packages/core && node --test --test-isolation=none "src/**/*.test.ts"
    ```
 
-3. **Server tests** — 415 tests, 411 pass, 4 skipped, 0 fail (47 cover plugins,
-   13 the block layout, 5 the floor style).
+3. **Server tests** — 437 tests, 433 pass, 4 skipped, 0 fail (47 cover plugins,
+   13 the block layout, 5 the floor style, 42 memory).
 
    ```bash
    cd apps/server && node --test --test-isolation=none "src/**/*.test.ts"
@@ -223,7 +236,7 @@ the others cannot.
    node scripts/smoke-ws.mjs
    ```
 
-5. **Web reducer harness** — one frame per event variant; 129 checks, including
+5. **Web reducer harness** — one frame per event variant; 192 checks, including
    that every preset dresses every role and every material in both GLBs maps to
    one.
 
@@ -444,3 +457,32 @@ Each reports itself skipped with that reason rather than failing, and each still
 runs, and still has to pass, anywhere child processes are allowed. Nothing else in
 the MCP layer is skipped: the protocol, the client, the manager and the
 configuration are all tested through injected transports, so they run everywhere.
+
+**The vendor layer is the same, and it is the reason it was built that way.** Not
+one of its 101 tests is skipped, including the ones about a harness that hangs, one
+that cannot start at all, and one that prints more than the output cap — all of
+which a real process will not perform on demand. `apps/server/src/vendors/testing.ts`
+is a scripted `SpawnLike`: the transport declares the seam, and the fake is the
+reference implementation of it, the same trade `llm/mock.ts` makes. A transport
+that spawned directly would have been untestable on exactly the machines most
+likely to run the suite in CI.
+
+**The ACP tests go one layer further and inject the wire, not a process.** That is
+what makes the interesting protocol cases expressible at all: an agent that refuses
+a read outside the workspace, one that asks for a write it was told it could not
+have, one that asks permission with nobody to answer, one that dies mid-turn, one
+that never answers. None of those is something a real harness will do on request,
+and all of them are the behaviour the read-only claim actually rests on.
+
+**The same limitation reaches the bundle step, one level up.** `vite build` fails
+with `spawn EPERM` under a sandbox that blocks piped child stdio, because esbuild
+needs a helper process. It builds normally anywhere else, and CI is presumably
+such a place. Worth knowing before concluding that a build failure is a code
+failure: the error names esbuild, not the source.
+
+**The vendor configuration has a documented format, so its example is tested.**
+`vendors.json.example` is loaded by the real reader in `config.test.ts`, and the
+assertions pin the two things most likely to rot: that the four presets keep their
+documented `readOnlyEnforcement` levels — the claim the panel repeats to an
+operator, and the one most tempting to over-egg — and that the custom-command
+example ships `enabled: false` so copying the file does not start a process.

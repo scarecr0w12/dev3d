@@ -6,7 +6,7 @@
  * same table, so a dot in the org chart and a body in the office always agree.
  */
 
-import type { EmployeeStatus } from '@dev3d/core';
+import type { EmployeeStatus, VendorStatus } from '@dev3d/core';
 
 export const STATUS_LABEL: Record<EmployeeStatus, string> = {
   offline: 'offline',
@@ -62,4 +62,73 @@ export function statusLabel(status: EmployeeStatus): string {
 
 export function statusColor(status: EmployeeStatus): string {
   return STATUS_COLOR[status];
+}
+
+/**
+ * The third-party vendor vocabulary.
+ *
+ * A **separate** set of total maps rather than more keys in the ones above, and
+ * the reason is the type system doing its job: `Record<EmployeeStatus, …>` will
+ * refuse a `VendorStatus` key at compile time, so the two vocabularies cannot
+ * drift into each other by accident. An employee is a person at a desk with a
+ * mood; a vendor is a machine somebody else operates, and "on site" is not a
+ * synonym for "idle".
+ *
+ * The *colours* are deliberately shared with the employee table where the meaning
+ * is the same - lime for working, red for failed, slate for absent - because
+ * reusing a colour for a new meaning is how a legend stops being readable. What
+ * differs is the words, and the silhouette on the floor.
+ */
+export const VENDOR_STATUS_LABEL: Record<VendorStatus, string> = {
+  offsite: 'off site',
+  unreachable: 'no signal',
+  docked: 'on site',
+  engaged: 'engaged',
+  errored: 'fault',
+};
+
+export const VENDOR_STATUS_COLOR: Record<VendorStatus, string> = {
+  // Dimmer than an employee's `offline`, because a vendor that was never
+  // configured and one that is switched off are both "not here", and neither
+  // should draw the eye.
+  offsite: '#475569',
+  unreachable: '#f59e0b',
+  docked: '#38bdf8',
+  engaged: '#a3e635',
+  errored: '#f87171',
+};
+
+export interface VendorStatusStyle {
+  color: string;
+  intensity: number;
+}
+
+export const VENDOR_STATUS_STYLE: Record<VendorStatus, VendorStatusStyle> = {
+  offsite: { color: '#334155', intensity: 0.04 },
+  unreachable: { color: '#f59e0b', intensity: 0.16 },
+  docked: { color: '#38bdf8', intensity: 0.62 },
+  engaged: { color: '#a3e635', intensity: 1.05 },
+  errored: { color: '#f87171', intensity: 0.85 },
+};
+
+/**
+ * Legend order for the vendor bay: what an operator is looking for first.
+ *
+ * `engaged` leads because a busy vendor is the thing worth noticing, then
+ * availability, then the two ways one can be missing.
+ */
+export const VENDOR_STATUS_ORDER: readonly VendorStatus[] = [
+  'engaged',
+  'docked',
+  'unreachable',
+  'errored',
+  'offsite',
+];
+
+export function vendorStatusLabel(status: VendorStatus): string {
+  return VENDOR_STATUS_LABEL[status];
+}
+
+export function vendorStatusColor(status: VendorStatus): string {
+  return VENDOR_STATUS_COLOR[status];
 }

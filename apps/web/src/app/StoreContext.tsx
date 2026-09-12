@@ -15,6 +15,7 @@ import type {
   Department,
   DirectMessage,
   EmployeeState,
+  MemoryState,
   OfficeState,
   PluginSystemState,
   Role,
@@ -177,6 +178,12 @@ export function usePlanReplies(): PlanReply[] {
 export function useNotices(): Notice[] {
   const store = useStore();
   return useSyncExternalStore(store.subscribeNotices, store.getNotices);
+}
+
+/** What the office remembers, from the live slice rather than a re-fetch. */
+export function useMemory(): MemoryState {
+  const store = useStore();
+  return useSyncExternalStore(store.subscribeMemory, store.getMemory);
 }
 
 // ------------------------------------------------------------- derived slices

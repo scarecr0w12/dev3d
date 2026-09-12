@@ -27,18 +27,33 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
-import type { EmployeeState, OfficeStyle, Role, RoleAppearance, WorkspaceSummary } from '@dev3d/core';
+import type {
+  EmployeeState,
+  EmployeeStatus,
+  OfficeStyle,
+  Role,
+  RoleAppearance,
+  VendorState,
+  VendorStatus,
+  WorkspaceSummary,
+} from '@dev3d/core';
 
-import { usePrefersReducedMotion } from '../app/hooks';
+import { usePrefersReducedMotion, useStoredState } from '../app/hooks';
 import { useOffice, useSelection, useStore } from '../app/StoreContext';
 import { FALLBACK_APPEARANCE } from '../app/store';
 import { STATUS_COLOR, STATUS_LABEL, STATUS_ORDER } from '../app/status';
+import { VENDOR_STATUS_COLOR, VENDOR_STATUS_LABEL } from '../app/status';
 import { StylePanel } from '../console/StylePanel';
 import { indexAnchors, roomLabel } from './anchors';
 import { floorOffset, floorVisibility, resolveFloorId } from './floors';
 import type { AnchorStats, OfficeAnchors } from './anchors';
 import { createAvatar } from './avatar';
+import { createVendorAvatar, defaultVendorColor } from './vendorAvatar';
 import type { Avatar } from './avatar';
+import { Liveliness } from './liveliness';
+import type { LivelinessMember, LivelinessSpot } from './liveliness';
+import { buildNavGrid } from './navgrid';
+import type { NavGrid, ObstacleBox } from './navgrid';
 import { applyStyle, disposeMaterials, dressMaterials, groundGridTexture } from './theme';
 import type { AppliedStyle, FloorLighting, FloorMaterials } from './theme';
 
@@ -46,8 +61,35 @@ const OFFICE_URL = `${import.meta.env.BASE_URL}office/office.glb`;
 const KIT_URL = `${import.meta.env.BASE_URL}office/blocks.glb`;
 /** Camera distance when framing one employee. */
 const FOCUS_DISTANCE = 6.4;
+/**
+ * Camera framing for a vendor terminal.
+ *
+ * Closer and lower than a person, because a terminal is about 1.1 m tall against
+ * a standing employee's ~1.9 m: reusing the person's distance and eye height
+ * would leave the kiosk small and sitting in the bottom third of the frame.
+ */
+const VENDOR_FOCUS_DISTANCE = 4.4;
+const VENDOR_FOCUS_HEIGHT = 0.75;
 /** Camera distance when framing a whole floor: the office is 22 x 16 m. */
 const FLOOR_DISTANCE = 26;
+/** Where the liveliness preference is remembered between visits. */
+const LIVELINESS_KEY = 'dev3d.liveliness';
+
+/**
+ * How attractive each room is as somewhere to stand about.
+ *
+ * A lounge is where people go when they are not working, so it outranks the
+ * rooms named after a job. Anything unrecognised is still somewhere worth
+ * walking to, because a floor can grow a room nobody has thought about yet.
+ */
+const SPOT_WEIGHT: Record<string, number> = {
+  Lounge: 2.4,
+  Lobby: 1.6,
+  DevFloor: 1.3,
+};
+
+/** A place the walkers derived from the floor plan, rather than from an anchor. */
+const DERIVED_SPOT_WEIGHT = 0.5;
 
 
 export interface AnchorDiscovery {
@@ -75,6 +117,17 @@ export interface SceneSync {
   workspaces: WorkspaceSummary[];
   activeWorkspaceId: string;
   selectedId: string | null;
+  /**
+   * The third-party vendors docked on this floor.
+   *
+   * Installation-wide rather than per-organisation: a vendor is configured by the
+   * operator with an environment variable, not by an org chart, so the same bay
+   * appears on every floor. That is deliberate - the alternative would be a
+   * vendor charged to one team's budget, which is a business decision dev3d has
+   * no way to make on an operator's behalf.
+   */
+  vendors: VendorState[];
+  selectedVendorId: string | null;
 }
 
 interface SceneApi {
@@ -84,13 +137,44 @@ interface SceneApi {
    */
   syncScene(input: SceneSync): string[];
   setSelected(employeeId: string | null): void;
+  /** Select a docked vendor terminal, for the same reason and by the same path. */
+  setSelectedVendor(vendorId: string | null): void;
   setReducedMotion(reduced: boolean): void;
+  /** Turns the idle wandering on or off without rebuilding the scene. */
+  setLiveliness(enabled: boolean): void;
   resetView(): void;
   dispose(): void;
 }
 
 function appearanceFor(role: Role | undefined): RoleAppearance {
   return role?.appearance ?? FALLBACK_APPEARANCE;
+}
+
+/**
+ * The parts of a floor a person cannot walk through.
+ *
+ * Everything standing in the band between the ankle and the head is furniture
+ * or architecture, and for both GLBs that means boxes: a desk, a chair, a wall
+ * segment, a planted partition. Doors are *gaps* between wall segments rather
+ * than holes cut in one, so a footprint is an exact description and the grid
+ * built from these is exact with it - which is the whole reason the office can
+ * be walked without anyone authoring a navmesh.
+ *
+ * The band is measured from the floor the geometry stands on, not from the
+ * world, or every floor above the ground would be read as empty space.
+ */
+function obstacleBoxesOf(root: THREE.Object3D, floorY: number): ObstacleBox[] {
+  const boxes: ObstacleBox[] = [];
+  const bounds = new THREE.Box3();
+  root.updateMatrixWorld(true);
+  root.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    bounds.setFromObject(mesh);
+    if (bounds.max.y < floorY + 0.25 || bounds.min.y > floorY + 1.75) return;
+    boxes.push({ minX: bounds.min.x, minZ: bounds.min.z, maxX: bounds.max.x, maxZ: bounds.max.z });
+  });
+  return boxes;
 }
 
 /** Releases every geometry/material under a subtree (ours or the loaded model). */
@@ -118,6 +202,19 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
   const onAnchorsRef = useRef<OfficeCanvasProps['onAnchorsDiscovered']>(onAnchorsDiscovered);
   onAnchorsRef.current = onAnchorsDiscovered;
 
+  /**
+   * Whether idle employees get up and walk about.
+   *
+   * Remembered, because somebody who turned the office still for a screenshot
+   * should not have to turn it off again after a refresh. Reduced motion beats
+   * it: a system that asks for less movement is not asking to be asked twice.
+   */
+  const [livelinessWanted, setLivelinessWanted] = useStoredState(LIVELINESS_KEY, 'on');
+  const livelinessOn = livelinessWanted !== 'off';
+  const livelinessRef = useRef(livelinessOn);
+  livelinessRef.current = livelinessOn;
+  const livelinessActive = livelinessOn && !reducedMotion;
+
   const [phase, setPhase] = useState<ScenePhase>({ kind: 'loading', progress: 0 });
   const [parked, setParked] = useState<string[]>([]);
   /**
@@ -131,6 +228,15 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
 
   const employees = office?.employees ?? null;
   const roles = office?.roles ?? null;
+  /**
+   * The vendor bay.
+   *
+   * Installation-wide, so every floor docks the same terminals. A vendor is
+   * configured by the operator with an environment variable rather than hired by
+   * an organisation, and pretending otherwise would mean charging one team for a
+   * subscription nobody assigned to it.
+   */
+  const vendors = office?.vendorBay.vendors ?? null;
 
   // ------------------------------------------------------------------ the scene
   useEffect(() => {
@@ -141,14 +247,55 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
     let frame = 0;
     let focusTarget: { point: THREE.Vector3; distance: number } | null = null;
     let selectedId: string | null = null;
+    let selectedVendorId: string | null = null;
     let pendingFocus = false;
     let reduced = reducedMotion;
     const avatars = new Map<string, Avatar>();
+    /**
+     * Vendor terminals, in their own map.
+     *
+     * A second map rather than one keyed by id, because the two are reconciled
+     * and disposed against different lists: an employee missing from
+     * `input.employees` is gone, and a vendor missing from `input.vendors` is
+     * gone. Merging them would mean one loop that has to know which list each id
+     * came from - the discriminator this design avoids everywhere else.
+     */
+    const vendorAvatars = new Map<string, Avatar<VendorStatus>>();
     /** Latest props, so a sync requested before the model loads is not lost. */
     const employeesRef: EmployeeState[] = [];
+    const vendorsRef: VendorState[] = [];
     const workspacesRef: WorkspaceSummary[] = [];
     let activeWorkspaceRef = '';
     const rolesRef: Role[] = [];
+
+    /**
+     * The liveliness director: where an idle employee *is*, as opposed to where
+     * their seat is. It owns a body from the moment it is configured, and the
+     * canvas keeps its hands off anybody the director knows about.
+     */
+    const liveliness = new Liveliness();
+    /** The walkable space of the floor on screen, which is not the whole building. */
+    let navGrid: NavGrid | null = null;
+    /** What that grid was built from, so it is rebuilt only when the shape changes. */
+    let navKey = '';
+    /** Statuses as of the last sync: what tells the director who is free. */
+    const statusById = new Map<string, EmployeeStatus>();
+    /** The last roster and places, so a toggle can re-apply without a state push. */
+    let lastMembers: LivelinessMember[] = [];
+    let lastSpots: LivelinessSpot[] = [];
+    let livelinessWanted = livelinessRef.current;
+    const statusOf = (id: string): EmployeeStatus | undefined => statusById.get(id);
+    const livelinessEnabled = (): boolean => livelinessWanted && !reduced;
+
+    /** Hand the director the current floor under the current switch. */
+    const applyLiveliness = (): void => {
+      liveliness.configure({
+        members: lastMembers,
+        spots: lastSpots,
+        nav: navGrid,
+        enabled: livelinessEnabled(),
+      });
+    };
 
     const clock = new THREE.Clock();
     const scene = new THREE.Scene();
@@ -462,6 +609,55 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       };
     }
 
+    /**
+     * The walkable space of a floor, sampled from that floor's own geometry.
+     *
+     * Keyed on the layout and the plate size, so a floor that grew a room is
+     * re-sampled and a floor that was merely re-dressed is not: where a person
+     * can walk depends on where the walls are, never on what colour they are.
+     */
+    function ensureNav(id: string, entry: Floor | null): NavGrid | null {
+      const key = entry ? `${id}|${entry.layoutKey}|${entry.slabSize}` : 'none';
+      if (key === navKey) return navGrid;
+      navGrid = entry ? buildNavGrid(obstacleBoxesOf(entry.group, entry.offset)) : null;
+      navKey = key;
+      return navGrid;
+    }
+
+    /**
+     * Where an idle person may go and stand.
+     *
+     * The room anchors the model carries are the authored answer - a lounge, a
+     * lobby, the middle of the dev floor. On top of those, the grid offers a few
+     * points of its own for every region somebody actually occupies, which is
+     * what gives a room nobody anchored - a sealed office, a module a floor grew
+     * last week - somewhere to pace without anyone having to describe it. Those
+     * derived points are weighted low, so the office still has a lounge and a
+     * lobby rather than nine interchangeable corners.
+     */
+    function spotsFor(anchors: OfficeAnchors, grid: NavGrid, regions: Set<number>): LivelinessSpot[] {
+      const spots: LivelinessSpot[] = [];
+      for (const name of anchors.rooms) {
+        const point = anchors.roomPosition(name);
+        if (!point) continue;
+        const label = roomLabel(name);
+        spots.push({ id: name, x: point.x, z: point.z, weight: SPOT_WEIGHT[label] ?? 1.1 });
+      }
+      for (const region of regions) {
+        for (const point of grid.regionSpots(region)) {
+          const near = spots.some((spot) => Math.hypot(spot.x - point.x, spot.z - point.z) < 1.6);
+          if (near) continue;
+          spots.push({
+            id: `derived:${region}:${spots.length}`,
+            x: point.x,
+            z: point.z,
+            weight: DERIVED_SPOT_WEIGHT,
+          });
+        }
+      }
+      return spots;
+    }
+
     /** Clone the model once per organisation, and drop the floors that closed. */
     function buildFloors(workspaces: WorkspaceSummary[]): void {
       if (!template) return;
@@ -663,16 +859,35 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       return null;
     };
 
-    const pickAt = (clientX: number, clientY: number): string | null => {
+    /**
+     * What the pointer is over.
+     *
+     * Tagged rather than a bare id, because an employee and a vendor can share an
+     * id in principle - both are strings the server chose - and the two are
+     * selected through different store calls. Deciding by "which map is it in"
+     * rather than by guessing at the id's shape is what makes that unambiguous.
+     */
+    type Pick = { kind: 'employee' | 'vendor'; id: string };
+
+    const pickAt = (clientX: number, clientY: number): Pick | null => {
       const rect = renderer.domElement.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) return null;
       pointer.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
       raycaster.setFromCamera(pointer, camera);
       const targets: THREE.Object3D[] = [];
       for (const avatar of avatars.values()) targets.push(avatar.group);
+      for (const terminal of vendorAvatars.values()) targets.push(terminal.group);
       const hits = raycaster.intersectObjects(targets, true);
       const first = hits[0];
-      return first ? findAvatarId(first.object) : null;
+      if (!first) return null;
+      const id = findAvatarId(first.object);
+      if (id === null) return null;
+      // Vendors are checked first: the two maps are disjoint by construction, so
+      // the order only decides the answer for an id in neither, and "it is a
+      // vendor" is the cheaper test.
+      if (vendorAvatars.has(id)) return { kind: 'vendor', id };
+      if (avatars.has(id)) return { kind: 'employee', id };
+      return null;
     };
 
     const onPointerDown = (event: PointerEvent): void => {
@@ -685,11 +900,20 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       if (!down) return;
       // Ignore the pointer-up that merely ends an orbit drag.
       if (Math.hypot(event.clientX - down.x, event.clientY - down.y) > 6) return;
-      store.selectEmployee(pickAt(event.clientX, event.clientY));
+      const pick = pickAt(event.clientX, event.clientY);
+      if (pick === null) {
+        // Empty space clears both: the store's setters keep the two slots
+        // mutually exclusive, so clearing one is enough to close the inspector.
+        store.selectEmployee(null);
+        return;
+      }
+      if (pick.kind === 'vendor') store.selectVendor(pick.id);
+      else store.selectEmployee(pick.id);
     };
 
     const onPointerMove = (event: PointerEvent): void => {
-      const id = pickAt(event.clientX, event.clientY);
+      const pick = pickAt(event.clientX, event.clientY);
+      const id = pick === null ? null : `${pick.kind}:${pick.id}`;
       if (id === hoveredId) return;
       hoveredId = id;
       renderer.domElement.style.cursor = id ? 'pointer' : 'grab';
@@ -730,12 +954,15 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       syncScene(input) {
         employeesRef.length = 0;
         employeesRef.push(...input.employees);
+        vendorsRef.length = 0;
+        vendorsRef.push(...input.vendors);
         rolesRef.length = 0;
         rolesRef.push(...input.roles);
         workspacesRef.length = 0;
         workspacesRef.push(...input.workspaces);
         activeWorkspaceRef = input.activeWorkspaceId;
         selectedId = input.selectedId;
+        selectedVendorId = input.selectedVendorId;
 
         buildFloors(input.workspaces);
 
@@ -774,35 +1001,52 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
         const roleById = new Map(input.roles.map((role) => [role.id, role]));
         const parkedIds: string[] = [];
         const present = new Set<string>();
+        /** The roster this floor's director is given, with where each person sits. */
+        const members: LivelinessMember[] = [];
+        const regions = new Set<number>();
         let benchIndex = 0;
+
+        statusById.clear();
 
         for (const employee of input.employees) {
           present.add(employee.id);
           const role = roleById.get(employee.roleId);
           let avatar = avatars.get(employee.id);
-          const created = avatar === undefined;
           if (!avatar) {
             avatar = createAvatar(employee.id, employee.displayName, appearanceFor(role));
             avatars.set(employee.id, avatar);
             officeRoot.add(avatar.group);
           }
 
+          let home: LivelinessMember['home'];
           const seatName = employee.seatId ?? role?.seatId ?? null;
           const seatPosition = seatName ? here.seatPosition(seatName) : null;
           if (seatPosition && seatName) {
-            avatar.group.position.set(seatPosition.x, seatPosition.y, seatPosition.z);
-            const yaw = here.seatFacing(seatName, employee.roomId ?? role?.roomId ?? null);
-            if (created) avatar.group.rotation.y = yaw;
-            avatar.setFacing(yaw);
+            home = {
+              x: seatPosition.x,
+              y: seatPosition.y,
+              z: seatPosition.z,
+              yaw: here.seatFacing(seatName, employee.roomId ?? role?.roomId ?? null),
+            };
           } else {
             const bench = here.hotDeskPosition(benchIndex);
             benchIndex += 1;
-            avatar.group.position.copy(bench);
-            if (created) avatar.group.rotation.y = 0;
-            avatar.setFacing(0);
             parkedIds.push(employee.id);
+            home = { x: bench.x, y: bench.y, z: bench.z, yaw: 0 };
           }
 
+          // Once the director knows somebody it owns where they *stand*, and
+          // this loop only describes where they sit. Re-placing a body that is
+          // mid-errand would teleport it home for a frame on every unrelated
+          // state push, which is exactly the flicker this avoids.
+          if (liveliness.motionFor(employee.id) === null) {
+            avatar.group.position.set(home.x, home.y, home.z);
+            avatar.group.rotation.y = home.yaw;
+            avatar.setFacing(home.yaw);
+          }
+
+          members.push({ id: employee.id, name: employee.displayName, home });
+          statusById.set(employee.id, employee.status);
           avatar.setStatus(employee.status);
           avatar.setSelected(employee.id === selectedId);
         }
@@ -813,11 +1057,67 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
           avatars.delete(id);
         }
 
+        // ------------------------------------------------------------- vendors
+        //
+        // Kept entirely out of the liveliness roster below. A terminal is bolted
+        // to the floor of a room: it does not walk, does not stand about, is never
+        // handed a bubble, and must not be counted as a body that other people
+        // walk around. That is why it is not pushed into `members` - the director
+        // would then own its position, and it would start wandering to the lounge.
+        const vendorsHere = new Set<string>();
+        for (let index = 0; index < input.vendors.length; index += 1) {
+          const vendor = input.vendors[index];
+          if (vendor === undefined) continue;
+          vendorsHere.add(vendor.id);
+
+          let terminal = vendorAvatars.get(vendor.id);
+          if (!terminal) {
+            terminal = createVendorAvatar(vendor.id, vendor.label, {
+              color: vendor.color ?? defaultVendorColor(index),
+              operator: vendor.operator,
+              engagements: vendor.engagements,
+            });
+            vendorAvatars.set(vendor.id, terminal);
+            officeRoot.add(terminal.group);
+          }
+
+          const dock = here.vendorBayPosition(index);
+          const yaw = here.vendorBayFacing();
+          terminal.group.position.set(dock.x, dock.y, dock.z);
+          terminal.group.rotation.y = yaw;
+          terminal.setFacing(yaw);
+          terminal.setStatus(vendor.status);
+          terminal.setSelected(vendor.id === selectedVendorId);
+        }
+
+        for (const [id, terminal] of [...vendorAvatars.entries()]) {
+          if (vendorsHere.has(id)) continue;
+          terminal.dispose();
+          vendorAvatars.delete(id);
+        }
+
+        // What the idle can do here: the walkable grid for this floor's shape,
+        // and the places on it worth walking to.
+        const floorEntry = floors.get(activeFloorId) ?? floors.values().next().value ?? null;
+        const grid = ensureNav(activeFloorId, floorEntry);
+        if (grid) {
+          for (const member of members) {
+            const snapped = grid.resolve(member.home.x, member.home.z);
+            const region = snapped ? grid.regionAt(snapped.x, snapped.z) : -1;
+            if (region >= 0) regions.add(region);
+          }
+        }
+        lastMembers = members;
+        lastSpots = grid ? spotsFor(here, grid, regions) : [];
+        applyLiveliness();
+
         // Frame a selection that was made before its avatar existed.
         if (pendingFocus && selectedId) {
+          const motion = liveliness.motionFor(selectedId);
           const target = avatars.get(selectedId);
           if (target) {
-            focusTarget = { point: target.group.position.clone(), distance: FOCUS_DISTANCE };
+            const point = motion ? new THREE.Vector3(motion.x, motion.y, motion.z) : target.group.position.clone();
+            focusTarget = { point, distance: FOCUS_DISTANCE };
             pendingFocus = false;
           }
         }
@@ -834,8 +1134,37 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
           pendingFocus = false;
         }
       },
+      /**
+       * The vendor equivalent.
+       *
+       * A separate method rather than a tagged single call, because the two
+       * selections live in separate maps and the store keeps them mutually
+       * exclusive: when a vendor is selected `selection.employeeId` is already
+       * null, so `setSelected(null)` has cleared every employee ring by the time
+       * this runs.
+       */
+      setSelectedVendor(vendorId) {
+        selectedVendorId = vendorId;
+        pendingFocus = vendorId !== null;
+        for (const [id, terminal] of vendorAvatars) terminal.setSelected(id === vendorId);
+        const target = vendorId ? vendorAvatars.get(vendorId) : null;
+        if (target) {
+          // A terminal is short, so framing it wants a lower eye line and a
+          // closer stop than a person: aiming at a standing head height would
+          // leave it sitting in the bottom third of the frame.
+          const point = target.group.position.clone();
+          point.y += VENDOR_FOCUS_HEIGHT;
+          focusTarget = { point, distance: VENDOR_FOCUS_DISTANCE };
+          pendingFocus = false;
+        }
+      },
       setReducedMotion(next) {
         reduced = next;
+        applyLiveliness();
+      },
+      setLiveliness(enabled) {
+        livelinessWanted = enabled;
+        applyLiveliness();
       },
       resetView() {
         focusTarget = null;
@@ -844,8 +1173,11 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
         controls.update();
       },
       dispose() {
+        liveliness.reset();
         for (const avatar of avatars.values()) avatar.dispose();
         avatars.clear();
+        for (const terminal of vendorAvatars.values()) terminal.dispose();
+        vendorAvatars.clear();
       },
     };
     apiRef.current = api;
@@ -909,6 +1241,8 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
             workspaces: workspacesRef,
             activeWorkspaceId: activeWorkspaceRef,
             selectedId,
+            vendors: vendorsRef,
+            selectedVendorId,
           }),
         );
       },
@@ -932,6 +1266,15 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       const dt = Math.min(0.1, clock.getDelta());
       const elapsed = clock.elapsedTime;
 
+      liveliness.update(dt, statusOf);
+
+      // Somebody selected while they are walking is worth following: the camera
+      // eases to where they actually are, not to where they were when clicked.
+      if (focusTarget && selectedId) {
+        const motion = liveliness.motionFor(selectedId);
+        if (motion && motion.mode === 'walking') focusTarget.point.set(motion.x, motion.y, motion.z);
+      }
+
       if (focusTarget) {
         const desired = focusTarget.point.clone().add(new THREE.Vector3(0, 0.95, 0));
         const k = 1 - Math.exp(-5 * dt);
@@ -947,7 +1290,11 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
         if (controls.target.distanceTo(desired) < 0.03) focusTarget = null;
       }
 
-      for (const avatar of avatars.values()) avatar.update(dt, elapsed, reduced);
+      for (const avatar of avatars.values()) avatar.update(dt, elapsed, reduced, liveliness.motionFor(avatar.id));
+      // Vendors are updated without a motion: a terminal is not in the director's
+      // roster, so it has no `LivelinessMotion` and holds the dock position the
+      // sync gave it.
+      for (const terminal of vendorAvatars.values()) terminal.update(dt, elapsed, reduced, null);
       controls.update();
       renderer.render(scene, camera);
     };
@@ -993,17 +1340,37 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
         workspaces: office?.workspaces ?? [],
         activeWorkspaceId: office?.activeWorkspaceId ?? '',
         selectedId: selection.employeeId,
+        vendors: vendors ?? [],
+        selectedVendorId: selection.vendorId,
       }),
     );
-  }, [employees, roles, office?.workspaces, office?.activeWorkspaceId, selection.employeeId, phase.kind, kitReady]);
+  }, [
+    employees,
+    roles,
+    vendors,
+    office?.workspaces,
+    office?.activeWorkspaceId,
+    selection.employeeId,
+    selection.vendorId,
+    phase.kind,
+    kitReady,
+  ]);
 
   useEffect(() => {
     apiRef.current?.setSelected(selection.employeeId);
   }, [selection.employeeId]);
 
   useEffect(() => {
+    apiRef.current?.setSelectedVendor(selection.vendorId);
+  }, [selection.vendorId]);
+
+  useEffect(() => {
     apiRef.current?.setReducedMotion(reducedMotion);
   }, [reducedMotion]);
+
+  useEffect(() => {
+    apiRef.current?.setLiveliness(livelinessOn);
+  }, [livelinessOn]);
 
   const statusCounts = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -1014,6 +1381,32 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
   const selected = useMemo(
     () => (employees ?? []).find((employee) => employee.id === selection.employeeId) ?? null,
     [employees, selection.employeeId],
+  );
+
+  const selectedVendor = useMemo(
+    () => (vendors ?? []).find((vendor) => vendor.id === selection.vendorId) ?? null,
+    [vendors, selection.vendorId],
+  );
+
+  /** How many terminals the bay is holding, for the dock line. */
+  const vendorCount = vendors?.length ?? 0;
+
+  /**
+   * Where the bay is, derived from the floor's own layout rather than from the
+   * scene.
+   *
+   * `anchors.ts` prefers a grown rack room and falls back to reception, and the
+   * server already records exactly which modules a floor has grown - so the two
+   * agree by construction instead of by the HUD asking the renderer. Asking the
+   * scene would also leave the label blank until the GLB finished loading, which
+   * is precisely when an operator is most likely to be looking for it.
+   */
+  const bayLabel = useMemo(
+    () =>
+      (office?.floor.layout.blocks ?? []).some((block) => block.kind === 'server4')
+        ? 'the server room'
+        : 'reception',
+    [office?.floor.layout.blocks],
   );
 
   /** The floor on screen, so the viewport names the organisation it is showing. */
@@ -1029,6 +1422,7 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
 
   const handleReset = useCallback(() => apiRef.current?.resetView(), []);
   const handleClearSelection = useCallback(() => store.selectEmployee(null), [store]);
+  const handleClearVendorSelection = useCallback(() => store.selectVendor(null), [store]);
 
   return (
     <div className="office-shell">
@@ -1065,6 +1459,22 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
             </span>
           )}
           <StylePanel />
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={() => setLivelinessWanted(livelinessOn ? 'off' : 'on')}
+            disabled={reducedMotion}
+            aria-pressed={livelinessActive}
+            title={
+              reducedMotion
+                ? 'Your system asks for reduced motion, so the office stays still'
+                : livelinessActive
+                  ? 'Idle employees are up and about — switch off for a still office'
+                  : 'Idle employees stay at their desks'
+            }
+          >
+            Liveliness {livelinessActive ? 'on' : 'off'}
+          </button>
           <button type="button" className="btn btn-ghost btn-sm" onClick={handleReset}>
             Reset view
           </button>
@@ -1082,6 +1492,56 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
             <button type="button" className="btn btn-ghost btn-sm" onClick={handleClearSelection}>
               Clear
             </button>
+          </div>
+        )}
+
+        {/*
+          The selected vendor's HUD, and a different shape from an employee's on
+          purpose: no title, no seat, no room to hot-desk in. Instead the vendor's
+          operator, what it is doing, and - always - whether the read-only promise
+          is *enforced* or merely *asked for*. That last one is the single fact an
+          operator needs when looking at a machine that is editing their project
+          directory on somebody else's behalf.
+        */}
+        {selectedVendor && (
+          <div className="office-hud office-hud-selected">
+            <span
+              className="dot"
+              style={{ background: VENDOR_STATUS_COLOR[selectedVendor.status] }}
+              aria-hidden="true"
+            />
+            <span className="strong">{selectedVendor.label}</span>
+            <span className="dim">{selectedVendor.operator}</span>
+            <span className={`status status-${selectedVendor.status}`}>
+              {VENDOR_STATUS_LABEL[selectedVendor.status]}
+            </span>
+            <span className="mono dim">
+              {selectedVendor.capabilities.readOnlyEnforcement === 'sandbox'
+                ? 'read-only, sandboxed'
+                : selectedVendor.capabilities.readOnlyEnforcement === 'client'
+                  ? 'read-only, mediated'
+                  : 'read-only, requested'}
+            </span>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={handleClearVendorSelection}>
+              Clear
+            </button>
+          </div>
+        )}
+
+        {/*
+          Where the bay is, and only while something is docked in it. Shown as
+          its own line because the answer changes with the building: a floor that
+          grew a rack room docks them there, one that did not leaves them in
+          reception, and an operator looking for Codex deserves to be told which.
+        */}
+        {vendorCount > 0 && (
+          <div className="office-hud office-hud-warn" role="status">
+            <span className="dot" style={{ background: VENDOR_STATUS_COLOR.docked }} aria-hidden="true" />
+            <span>
+              <span className="strong">{vendorCount}</span> third-party vendor{vendorCount === 1 ? '' : 's'} docked in{' '}
+              {bayLabel}
+            </span>
+            <span className="mono dim">{vendors?.map((vendor) => vendor.label).join(', ') ?? ''}</span>
           </div>
         )}
 

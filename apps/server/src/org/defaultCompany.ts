@@ -75,12 +75,40 @@ export const TOOL_IDS = [
   'git',
   'web_search',
   'web_fetch',
+  'recall',
 ] as const;
 
 export type ToolId = (typeof TOOL_IDS)[number];
 
-/** Read-only reconnaissance, safe for anyone. */
-const READ_TOOLS: ToolId[] = ['think', 'todo_write', 'list_dir', 'read_file', 'glob', 'grep', 'git'];
+/**
+ * Reading what the office already wrote down.
+ *
+ * Deliberately its own grant rather than folded into `READ_TOOLS`, so an operator
+ * can see memory access as the distinct capability it is. It is read-only, so it
+ * is safe to hold widely - but "who can read the company's accumulated memory" is
+ * a question worth being able to answer on its own.
+ */
+const MEMORY_TOOLS: ToolId[] = ['recall'];
+
+/**
+ * Read-only reconnaissance, safe for anyone.
+ *
+ * Memory sits here rather than in its own tier because recalling what the office
+ * already established is reconnaissance, and an employee who can read the
+ * workspace but not the notes about it is being set up to repeat a mistake
+ * somebody already wrote down. `MEMORY_TOOLS` is spread in rather than inlined so
+ * the capability stays nameable when an operator asks who holds it.
+ */
+const READ_TOOLS: ToolId[] = [
+  'think',
+  'todo_write',
+  'list_dir',
+  'read_file',
+  'glob',
+  'grep',
+  'git',
+  ...MEMORY_TOOLS,
+];
 /** Read plus the ability to write documents (specs, plans, reports). */
 const DOC_TOOLS: ToolId[] = [...READ_TOOLS, 'write_file', 'web_search', 'web_fetch'];
 /** A developer: reads, writes, edits and executes inside the workspace. */

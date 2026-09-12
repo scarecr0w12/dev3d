@@ -11,7 +11,7 @@
 import type { ChatMessage, DiscoveredModel, ToolCallRequest, UsageRecord } from '@dev3d/core';
 import type { ProviderConfig } from '../config.ts';
 import { isProviderConfigured } from '../config.ts';
-import type { ChatRequest, ChatResult, LlmProvider, LlmToolSchema } from './types.ts';
+import type { ChatRequest, ChatResult, EmbedRequest, LlmProvider, LlmToolSchema } from './types.ts';
 import { computeCost } from './pricing.ts';
 import { parseModelList } from './modelList.ts';
 
@@ -229,6 +229,50 @@ export function createOpenAICompatProvider(cfg: ProviderConfig): LlmProvider {
         throw new Error(`HTTP ${resp.status} from ${cfg.id}/models: ${detail.slice(0, 200)}`);
       }
       return parseModelList(await resp.json());
+    },
+
+    /**
+     * `POST /embeddings`.
+     *
+     * OpenAI's shape, which OpenRouter and every local runtime's compatibility
+     * layer also speak. The result is sorted by `index` before being returned,
+     * because the wire format does not promise the order it was asked in and an
+     * embedding attached to the wrong fact is a corruption that would never
+     * surface as an error.
+     */
+    async embed(req: EmbedRequest): Promise<number[][]> {
+      const resp = await fetch(`${baseUrl}/embeddings`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ model: req.model, input: req.texts }),
+        ...(req.signal ? { signal: req.signal } : {}),
+      });
+      if (!resp.ok) {
+        const detail = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status} from ${cfg.id}/embeddings: ${detail.slice(0, 200)}`);
+      }
+      const body = (await resp.json()) as {
+        data?: Array<{ index?: number; embedding?: number[] }>;
+      };
+      const rows = body.data ?? [];
+      if (rows.length !== req.texts.length) {
+        throw new Error(
+          `${cfg.id} returned ${rows.length} embedding(s) for ${req.texts.length} input(s).`,
+        );
+      }
+      const ordered: number[][] = new Array(req.texts.length);
+      for (let i = 0; i < rows.length; i += 1) {
+        const row = rows[i];
+        const vector = row?.embedding;
+        if (!Array.isArray(vector) || vector.length === 0) {
+          throw new Error(`${cfg.id} returned an unusable embedding at position ${i}.`);
+        }
+        ordered[row?.index ?? i] = vector;
+      }
+      if (ordered.some((v) => !Array.isArray(v))) {
+        throw new Error(`${cfg.id} returned embeddings with inconsistent indexes.`);
+      }
+      return ordered;
     },
 
     async chat(req: ChatRequest): Promise<ChatResult> {

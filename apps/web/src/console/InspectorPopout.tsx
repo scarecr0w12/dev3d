@@ -21,6 +21,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import { useApprovals, useOffice, useSelection, useStore } from '../app/StoreContext';
 import { EmployeePanel } from './EmployeePanel';
+import { VendorPanel } from './VendorsPanel';
 import { EmployeeSwitcher } from './EmployeeSwitcher';
 import { RunSwitcher } from './RunSwitcher';
 import { RunTranscript } from './RunTranscript';
@@ -157,7 +158,14 @@ export function InspectorPopout({
             <>
               <EmployeeSwitcher />
               <div className="popout-detail">
-                <EmployeePanel />
+                {/*
+                  A vendor and an employee both answer "what did I just click",
+                  and the Agent tab is that answer. They share the tab rather than
+                  getting one each because they share the *slot*: the store keeps
+                  at most one of the two selected, so exactly one of these panels
+                  can ever have something to say.
+                */}
+                {selection.vendorId !== null ? <VendorPanel /> : <EmployeePanel />}
                 <PluginPanels placement="inspector" className="plugin-panels-popout" />
               </div>
             </>

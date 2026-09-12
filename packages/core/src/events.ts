@@ -13,6 +13,8 @@ import type { McpState, PluginSystemState } from './plugin.ts';
 import type { Approval, Artifact, DirectMessage, Pipeline, Run, StageRun, TurnRecord } from './run.ts';
 import type { FloorLayout, OfficeBlockKind } from './block.ts';
 import type { OfficeStyle } from './style.ts';
+import type { MemoryFact, MemoryFactInput, MemoryState } from './memory.ts';
+import type { VendorBay } from './vendor.ts';
 
 export interface ProviderStatus {
   id: string;
@@ -187,6 +189,29 @@ export interface OfficeState {
    * which capabilities exist without asking a second question.
    */
   mcp: McpState;
+  /**
+   * What the office remembers between runs.
+   *
+   * Carried in the state rather than fetched on demand for the same reason the
+   * MCP tool list is: a fact an employee can recall is a capability, and the
+   * console should be able to show what the office believes without asking a
+   * second question. It is bounded by the store, not by the protocol.
+   */
+  memory: MemoryState;
+  /**
+   * The third-party vendors this office has engaged.
+   *
+   * Carried here rather than fetched on demand for the same reason the MCP
+   * server list and the memory index are: a vendor an employee can hand work to
+   * is a *capability*, and the console should be able to say who is on site
+   * without asking a second question. The 3D office reads it too - this is what
+   * puts a terminal in the vendor bay rather than leaving the floor looking as
+   * though the work came from nowhere.
+   *
+   * Deliberately a separate list from `employees`. See `vendor.ts` for why a
+   * vendor is not given an `EmployeeState`.
+   */
+  vendorBay: VendorBay;
   /** Server build info, shown in the office footer. */
   version: string;
   startedAt: number;
@@ -261,6 +286,26 @@ export type ServerEvent =
     }
   | { type: 'budget.updated'; runId: string; limitUsd: number; spentUsd: number; at: number }
   | { type: 'routing.decision'; runId: string; turnId: string; route: RouteDecision; at: number }
+  /**
+   * A fact was written down.
+   *
+   * `superseded` is present when the write was a correction rather than an
+   * addition, and carries the fact it replaced. Both halves of a supersession
+   * travel in this one event because they are one operation: a console that saw
+   * only the new fact would show two active facts contradicting each other until
+   * its next full sync.
+   */
+  | { type: 'memory.created'; fact: MemoryFact; superseded: MemoryFact | null; at: number }
+  /**
+   * A fact stopped being true, without a replacement.
+   *
+   * Retraction rather than deletion: the row remains and stays retrievable by
+   * asking what was believed before, which is the whole reason the office keeps
+   * validity intervals instead of overwriting rows.
+   */
+  | { type: 'memory.retracted'; fact: MemoryFact; at: number }
+  /** The memory state, resent whole when it changes shape rather than by delta. */
+  | { type: 'memory.updated'; state: MemoryState; at: number }
   | { type: 'usage'; employeeId: string; lifetime: EmployeeUsage; at: number }
   | { type: 'log'; level: 'debug' | 'info' | 'warn' | 'error'; scope: string; message: string; at: number }
   | { type: 'error'; message: string; runId?: string; at: number };
@@ -394,6 +439,18 @@ export type ClientCommand =
   /** Register a marketplace to browse. */
   | { type: 'addPluginSource'; label: string; url: string }
   | { type: 'removePluginSource'; sourceId: string }
+
+  // ------------------------------------------------------------------- memory
+  /**
+   * Write a fact down, or correct one.
+   *
+   * `supersedes` on the input is what makes this a correction: the server creates
+   * the new fact and invalidates the named one in a single operation, so a
+   * correction can never be applied as half a change.
+   */
+  | { type: 'rememberFact'; fact: MemoryFactInput }
+  /** Retract a fact. It stays on record; it stops being retrieved. */
+  | { type: 'retractFact'; factId: string }
 
   /** Open a run's full transcript. */
   | { type: 'loadRun'; runId: string }

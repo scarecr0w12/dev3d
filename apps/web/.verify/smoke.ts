@@ -22,6 +22,7 @@ import type {
   Department,
   DirectMessage,
   EmployeeState,
+  MemoryFact,
   ModelSpec,
   OfficeState,
   PluginRecord,
@@ -36,6 +37,11 @@ import { toEmployeeState } from '@dev3d/core';
 import { OfficeStore } from '../src/app/store.ts';
 import { paneCeiling } from '../src/app/paneGeometry.ts';
 import { FLOOR_STEP, floorOffset, floorVisibility, resolveFloorId } from '../src/office/floors.ts';
+import { Liveliness, MAX_BUBBLE_CHARS, SMALL_TALK_OPENERS, SMALL_TALK_REPLIES } from '../src/office/liveliness.ts';
+import type { LivelinessMember, LivelinessSpot } from '../src/office/liveliness.ts';
+import { buildNavGrid } from '../src/office/navgrid.ts';
+import type { ObstacleBox } from '../src/office/navgrid.ts';
+import { createAvatar } from '../src/office/avatar.ts';
 import { STYLE_ROLES, applyStyle, disposeMaterials, dressMaterials, roleForMaterial } from '../src/office/theme.ts';
 import { DEFAULT_STYLE_PRESET, STYLE_PRESETS, STYLE_PRESET_ORDER } from '@dev3d/core';
 import * as THREE from 'three';
@@ -270,6 +276,15 @@ function officeState(roles: Role[], runs: Run[], employees?: EmployeeState[]): O
       grantRoles: [],
       servers: [],
     },
+    memory: {
+      facts: [],
+      counts: { installation: 0, workspace: 0, role: 0 },
+      searchable: true,
+      semantic: false,
+      vectorCount: 0,
+      vectorCoverage: 0,
+    },
+    vendorBay: { enabled: false, configPath: null, grantRoles: [], requireCanDelegate: true, vendors: [] },
     pipelines: [
       {
         id: 'product-build',
@@ -580,6 +595,102 @@ check('plugins.updated carries the install gate', store.state?.plugins.allowInst
 check('plugins.updated left the floor alone', store.state?.roles.length === beforeForeign && store.state?.runs.length === 1);
 check('plugins.updated reported the change in the feed', store.feed.some((item) => item.text.includes('plugins updated · 0 loaded · 1 installed')));
 
+// Memory. Writing and correcting are separate frames, and a correction must
+// arrive as one: the new fact and the fact it replaced are applied together, so
+// the console can never hold two active facts contradicting each other.
+const oldFact: MemoryFact = {
+  id: 'fact_old',
+  scope: 'workspace',
+  scopeId: 'default',
+  kind: 'convention',
+  text: 'Tests run with --test-isolation=none.',
+  origin: 'operator',
+  tags: ['testing'],
+  source: null,
+  confidence: 0.6,
+  createdAt: 100,
+  updatedAt: 100,
+  validFrom: 100,
+  invalidFrom: null,
+  supersededBy: null,
+  supersedes: null,
+  readCount: 0,
+  lastReadAt: null,
+};
+const newFact: MemoryFact = {
+  ...oldFact,
+  id: 'fact_new',
+  text: 'Tests run with --test-isolation=none on Node 24.',
+  supersedes: 'fact_old',
+};
+const supersededFact: MemoryFact = { ...oldFact, invalidFrom: 300, supersededBy: 'fact_new', updatedAt: 300 };
+
+feed({ type: 'memory.created', fact: oldFact, superseded: null, at: 2900 });
+check('memory.created added the fact', store.getMemory().facts.length === 1);
+check('memory.created counted it against its scope', store.getMemory().counts.workspace === 1, store.getMemory().counts);
+check('memory.created reported it in the feed', store.feed.some((item) => item.kind === 'memory' && item.text.startsWith('remembered')));
+
+feed({ type: 'memory.created', fact: newFact, superseded: supersededFact, at: 3000 });
+check(
+  'a correction leaves exactly one current belief',
+  store.getMemory().facts.filter((fact) => fact.invalidFrom === null && fact.supersededBy === null).length === 1,
+  store.getMemory().facts.length,
+);
+check('the replacement is the current one', store.getMemory().facts.some((fact) => fact.id === 'fact_new'));
+check('the original is kept, marked superseded', store.getMemory().facts.find((fact) => fact.id === 'fact_old')?.supersededBy === 'fact_new');
+check('a superseded fact is no longer counted as current', store.getMemory().counts.workspace === 1, store.getMemory().counts);
+check('the correction was reported as a correction', store.feed.some((item) => item.text.startsWith('corrected')));
+
+feed({ type: 'memory.retracted', fact: { ...newFact, invalidFrom: 3100 }, at: 3100 });
+check('a retracted fact stops being current', store.getMemory().facts.find((fact) => fact.id === 'fact_new')?.invalidFrom === 3100);
+check('retraction empties the current count', store.getMemory().counts.workspace === 0, store.getMemory().counts);
+check('retraction was reported', store.feed.some((item) => item.text.startsWith('retracted')));
+
+feed({
+  type: 'memory.updated',
+  state: {
+    facts: [oldFact],
+    counts: { installation: 0, workspace: 1, role: 0 },
+    searchable: false,
+    semantic: true,
+    vectorCount: 4,
+    vectorCoverage: 3,
+  },
+  at: 3200,
+});
+check('memory.updated replaced the whole slice', store.getMemory().facts.length === 1 && store.getMemory().counts.workspace === 1);
+check('memory.updated carries whether search ranks', store.getMemory().searchable === false);
+// Semantic recall is a capability the console must not infer: only the server
+// knows whether the index loaded and how much of the store has been embedded.
+check('memory.updated carries whether semantic ranking is in force', store.getMemory().semantic === true);
+check('memory.updated carries the embedding coverage', store.getMemory().vectorCount === 4, store.getMemory().vectorCount);
+// And a subsequent frame without those fields must not silently keep the old ones.
+feed({
+  type: 'memory.updated',
+  state: { facts: [], counts: { installation: 0, workspace: 0, role: 0 }, searchable: true, semantic: false, vectorCount: 0, vectorCoverage: 0 },
+  at: 3250,
+});
+check('a later memory.updated clears semantic when the server says so', store.getMemory().semantic === false);
+
+// A full snapshot is also a memory resync, which is how a console that missed
+// every memory frame while it was away becomes correct again in one step.
+feed({
+  type: 'office.updated',
+  state: {
+    ...officeState([roleA], []),
+    memory: {
+      facts: [oldFact, newFact],
+      counts: { installation: 0, workspace: 2, role: 0 },
+      searchable: true,
+      semantic: true,
+      vectorCount: 2,
+      vectorCoverage: 2,
+    },
+  },
+  at: 3300,
+});
+check('a full snapshot reseeds memory', store.getMemory().facts.length === 2);
+check('a full snapshot carries the ranked-search flag', store.getMemory().searchable === true);
 // ---------------------------------------------------------------- phase 3
 feed(
   { type: 'office.updated', state: officeState([roleA, roleB, roleC], []), at: 2600 },
@@ -826,6 +937,382 @@ disposeMaterials(styledFloor.materials);
 check('releasing a floor keeps a sibling floor intact',
   otherFloor.materials.wall.color.getHexString() === 'e9e6df',
   otherFloor.materials.wall.color.getHexString());
+
+// ------------------------------------------------------------ walking around
+//
+// Liveliness is two pieces of pure logic - a grid sampled from obstacle boxes,
+// and the director that decides who gets up - and neither needs a WebGL context
+// to be wrong. What follows pins the properties the office actually leans on: a
+// route never leaves the floor, a wall is a wall, and nobody who is working
+// leaves their desk.
+
+/**
+ * An 18 x 12 room with a desk in it, a door in the south wall, and a small
+ * annexe beyond the door. With the door shut the annexe is sealed, which is the
+ * case a real floor hits whenever it grows a room the plan has not caught up
+ * with - and the case that must not be walked through.
+ */
+function roomBoxes(openDoor: boolean): ObstacleBox[] {
+  return [
+    { minX: -9, maxX: 9, minZ: -6, maxZ: -5.8 }, // north wall
+    { minX: -9, maxX: -8.8, minZ: -6, maxZ: 6 }, // west wall
+    { minX: 8.8, maxX: 9, minZ: -6, maxZ: 6 }, // east wall
+    ...(openDoor
+      ? [
+          { minX: -9, maxX: -0.7, minZ: 5.8, maxZ: 6 },
+          { minX: 0.7, maxX: 9, minZ: 5.8, maxZ: 6 },
+        ]
+      : [{ minX: -9, maxX: 9, minZ: 5.8, maxZ: 6 }]),
+    // the annexe, reachable only through that door
+    { minX: -3, maxX: 3, minZ: 9, maxZ: 9.2 },
+    { minX: -3, maxX: -2.8, minZ: 6, maxZ: 9 },
+    { minX: 2.8, maxX: 3, minZ: 6, maxZ: 9 },
+    // two desks to walk around
+    { minX: -3.5, maxX: -1.5, minZ: 1.6, maxZ: 2.4 },
+    { minX: 1.5, maxX: 3.5, minZ: 1.6, maxZ: 2.4 },
+  ];
+}
+
+const openRoom = buildNavGrid(roomBoxes(true), { cell: 0.25, radius: 0.3 });
+const shutRoom = buildNavGrid(roomBoxes(false), { cell: 0.25, radius: 0.3 });
+
+check('a room is mostly walkable', openRoom.walkableCells > 1000, openRoom.walkableCells);
+check('the wall beside the door is solid', openRoom.isWalkable(4, 5.9) === false);
+check('and the doorway itself is not', openRoom.isWalkable(0, 5.9) === true);
+check('the annexe beyond the door is not', openRoom.isWalkable(0, 7) === true);
+
+const throughDoor = openRoom.path({ x: 0, z: 0 }, { x: 0, z: 8 });
+check('a route reaches the room on the other side of a door', throughDoor !== null && throughDoor.length > 0);
+check(
+  'the route ends where it was asked to',
+  throughDoor !== null && Math.hypot((throughDoor[throughDoor.length - 1]?.z ?? 0) - 8, 0) < 0.5,
+  throughDoor?.[throughDoor.length - 1],
+);
+
+// The strongest statement available without re-walking the path by hand: it
+// exists, and every point on it is on the floor. The only way through is the
+// doorway, so a route that exists went through the doorway.
+let offFloor = 0;
+let longestGap = 0;
+for (const [index, point] of (throughDoor ?? []).entries()) {
+  if (!openRoom.isWalkable(point.x, point.z)) offFloor += 1;
+  const previous = throughDoor?.[index - 1];
+  if (previous) longestGap = Math.max(longestGap, Math.hypot(point.x - previous.x, point.z - previous.z));
+}
+check('every waypoint of a route is on walkable floor', offFloor === 0, offFloor);
+check('a route is pulled taut rather than stepped cell by cell', longestGap > 1, longestGap);
+
+check('a sealed room cannot be reached', shutRoom.path({ x: 0, z: 0 }, { x: 0, z: 8 }) === null);
+check(
+  'and it is a different region, so nobody is sent looking',
+  shutRoom.regionAt(0, 0) !== shutRoom.regionAt(0, 8),
+);
+
+// Bounds are the built extent by default. A margin here is how a walker ends up
+// strolling around the outside of the building.
+check('the walkable extent is exactly what the geometry covers', openRoom.bounds.minX === -9 && openRoom.bounds.maxX === 9, openRoom.bounds);
+check('nothing beyond the built extent is walkable', openRoom.isWalkable(0, 20) === false && openRoom.isWalkable(20, 0) === false);
+check('an empty floor yields a grid that answers every question safely', (() => {
+  const barren = buildNavGrid([]);
+  return barren.walkableCells === 0 && barren.path({ x: 0, z: 0 }, { x: 1, z: 1 }) === null && barren.resolve(0, 0) === null;
+})());
+
+// A destination inside a desk is snapped to the floor beside it; one in the
+// middle of nowhere is refused rather than guessed at.
+const onDesk = openRoom.resolve(-2.5, 2);
+check('a blocked destination is snapped to walkable floor', onDesk !== null && openRoom.isWalkable(onDesk.x, onDesk.z), onDesk);
+check('a destination outside the building is refused', openRoom.resolve(0, 40) === null);
+check('a walkable destination is left alone', (() => {
+  const here = openRoom.resolve(0, 0);
+  return here !== null && Math.abs(here.x) <= 0.2 && Math.abs(here.z) <= 0.2;
+})());
+
+// ------------------------------------------------------------------- the floor
+
+const SPOTS: LivelinessSpot[] = [
+  { id: 'north', x: 0, z: -4, weight: 1 },
+  { id: 'east', x: 7, z: 3, weight: 1 },
+  { id: 'annexe', x: 0, z: 8, weight: 2 },
+];
+
+const SEATS: ReadonlyArray<[number, number, number]> = [
+  [-6, 3, Math.PI],
+  [-2, 3, Math.PI],
+  [2, 3, Math.PI],
+  [6, 3, Math.PI],
+  [-4, -3, 0],
+  [4, -3, 0],
+];
+
+function floor(): LivelinessMember[] {
+  return SEATS.map(([x, z, yaw], index) => ({
+    id: `emp-${index}`,
+    name: `Emp ${index}`,
+    home: { x, y: 0, z, yaw },
+  }));
+}
+
+/** What every body looked like on one frame, for the determinism check. */
+function trace(seed: number, seconds: number): string {
+  const director = new Liveliness({ seed, maxWanderers: 3 });
+  const members = floor();
+  director.configure({ members, spots: SPOTS, nav: openRoom, enabled: true });
+  const parts: string[] = [];
+  for (let step = 0; step < seconds * 30; step += 1) {
+    director.update(1 / 30, () => 'idle');
+    for (const member of members) {
+      const motion = director.motionFor(member.id);
+      parts.push(motion ? `${motion.mode}@${motion.x.toFixed(2)},${motion.z.toFixed(2)}` : '-');
+    }
+  }
+  return parts.join('|');
+}
+
+check('the same seed replays the same office', trace(5, 45) === trace(5, 45));
+check('a different seed is a different office', trace(5, 45) !== trace(6, 45));
+
+// A working office is a still office: the whole point of the layer is that a
+// status colour still tells you where to look.
+{
+  const director = new Liveliness({ seed: 7, maxWanderers: 2 });
+  const members = floor();
+  director.configure({ members, spots: SPOTS, nav: openRoom, enabled: true });
+  let strayed = 0;
+  for (let step = 0; step < 30 * 120; step += 1) {
+    director.update(1 / 30, () => 'working');
+    for (const member of members) {
+      const motion = director.motionFor(member.id);
+      if (!motion) continue;
+      if (motion.mode !== 'seated') strayed += 1;
+      if (Math.hypot(motion.x - member.home.x, motion.z - member.home.z) > 0.05) strayed += 1;
+    }
+  }
+  check('nobody who is working ever leaves their desk', strayed === 0, strayed);
+  check('and a working office has no conversations in it', director.conversations === 0);
+}
+
+// An idle office is a lived-in one.
+{
+  const director = new Liveliness({ seed: 7, maxWanderers: 2 });
+  const members = floor();
+  director.configure({ members, spots: SPOTS, nav: openRoom, enabled: true });
+  const away = new Set<string>();
+  const said = new Set<string>();
+  let peakAway = 0;
+  let peakUp = 0;
+  let chats = 0;
+  let walkedOff = 0;
+  let laidOut = 0;
+  for (let step = 0; step < 30 * 300; step += 1) {
+    director.update(1 / 30, () => 'idle');
+    peakAway = Math.max(peakAway, director.wandering);
+    chats = Math.max(chats, director.conversations);
+    let onFeet = 0;
+    for (const member of members) {
+      const motion = director.motionFor(member.id);
+      if (!motion) continue;
+      if (motion.mode !== 'seated') onFeet += 1;
+      if (!openRoom.isWalkable(motion.x, motion.z)) walkedOff += 1;
+      if (motion.bubble) {
+        said.add(motion.bubble);
+        if (motion.bubble.length > MAX_BUBBLE_CHARS) laidOut += 1;
+      }
+      if (Math.hypot(motion.x - member.home.x, motion.z - member.home.z) > 0.5) away.add(member.id);
+    }
+    peakUp = Math.max(peakUp, onFeet);
+  }
+  check('idle employees get up and go somewhere', away.size >= 3, [...away].join(','));
+  check('most of the floor is at its desk at any moment', peakAway <= 2, peakAway);
+  // The cap counts people away from their desk; a conversation also stands the
+  // person being talked to, so the room holds at most twice the cap on its feet.
+  check('and the room never fills with standing people', peakUp <= 4, peakUp);
+  check('nobody ever walks off the floor', walkedOff === 0, walkedOff);
+  check('colleagues end up talking to each other', chats > 0, chats);
+  check('a conversation is said out loud', said.size > 0, said.size);
+  check('and no line overflows the bubble it is drawn in', laidOut === 0, laidOut);
+}
+
+// Work arriving mid-stroll is the case that matters most.
+{
+  const director = new Liveliness({ seed: 11, maxWanderers: 4 });
+  const members = floor();
+  director.configure({ members, spots: SPOTS, nav: openRoom, enabled: true });
+  let subject: LivelinessMember | null = null;
+  let caught: { x: number; z: number } | null = null;
+  for (let step = 0; step < 30 * 300 && subject === null; step += 1) {
+    director.update(1 / 30, () => 'idle');
+    for (const member of members) {
+      const motion = director.motionFor(member.id);
+      if (motion && motion.mode === 'walking' && Math.hypot(motion.x - member.home.x, motion.z - member.home.z) > 1.5) {
+        subject = member;
+        caught = { x: motion.x, z: motion.z };
+        break;
+      }
+    }
+  }
+  check('somebody was caught away from their desk', subject !== null, caught);
+
+  if (subject) {
+    const walker = subject;
+    let seatedAfter = -1;
+    for (let step = 0; step < 30 * 30; step += 1) {
+      director.update(1 / 30, (id) => (id === walker.id ? 'working' : 'idle'));
+      const motion = director.motionFor(walker.id);
+      if (motion && motion.mode === 'seated' && Math.hypot(motion.x - walker.home.x, motion.z - walker.home.z) < 0.01) {
+        seatedAfter = step / 30;
+        break;
+      }
+    }
+    check('work brings them straight back to their desk', seatedAfter >= 0 && seatedAfter < 25, seatedAfter);
+  }
+
+  // Switching the layer off has to be immediate and complete: reduced motion
+  // means a still office, not an office that finishes its walk first.
+  director.configure({ members, spots: SPOTS, nav: openRoom, enabled: false });
+  const seated = members.every((member) => {
+    const motion = director.motionFor(member.id);
+    return (
+      motion !== null &&
+      motion.mode === 'seated' &&
+      Math.abs(motion.x - member.home.x) < 0.001 &&
+      Math.abs(motion.z - member.home.z) < 0.001
+    );
+  });
+  check('switching liveliness off seats everybody at once', seated);
+  check('and leaves nobody mid-conversation', director.conversations === 0 && director.wandering === 0);
+}
+
+// A real seat is inside its chair. The walkable grid says so — a chair is an
+// obstacle — which means a body at its desk is standing in blocked space and has
+// to be able to walk *out* of it. Getting this wrong is invisible in a test whose
+// seats stand on open floor, and total in the office: every walker steps into the
+// edge of its own chair, gets nowhere, and gives up.
+{
+  const chairBoxes: ObstacleBox[] = [...roomBoxes(true), { minX: -6.9, maxX: -5.1, minZ: 2.5, maxZ: 3.5 }];
+  const chairRoom = buildNavGrid(chairBoxes, { cell: 0.25, radius: 0.3 });
+  check('a seat inside a chair is not walkable floor', chairRoom.isWalkable(-6, 3) === false);
+
+  const director = new Liveliness({ seed: 7, maxWanderers: 2 });
+  const members = floor();
+  const first = members[0];
+  director.configure({ members, spots: SPOTS, nav: chairRoom, enabled: true });
+  let escaped = false;
+  for (let step = 0; step < 30 * 300 && !escaped; step += 1) {
+    director.update(1 / 30, () => 'idle');
+    const motion = director.motionFor('emp-0');
+    if (motion && first && Math.hypot(motion.x - first.home.x, motion.z - first.home.z) > 1) escaped = true;
+  }
+  check('and its occupant gets up and walks out of it anyway', escaped);
+}
+
+// A seat that moves takes its person with it, which is what sending somebody to
+// the meeting room looks like from here.
+{
+  const director = new Liveliness({ seed: 3, maxWanderers: 4 });
+  const members = floor();
+  director.configure({ members, spots: SPOTS, nav: openRoom, enabled: true });
+  for (let step = 0; step < 30 * 60; step += 1) director.update(1 / 30, () => 'idle');
+  const moved = members.map((member, index) =>
+    index === 0 ? { ...member, home: { x: 6, y: 0, z: -4, yaw: 0 } } : member,
+  );
+  director.configure({ members: moved, spots: SPOTS, nav: openRoom, enabled: true });
+  const motion = director.motionFor('emp-0');
+  check(
+    'a person whose seat moved is standing at the new one',
+    motion !== null && Math.abs(motion.x - 6) < 0.001 && Math.abs(motion.z + 4) < 0.001,
+    motion,
+  );
+}
+
+// Every line has to survive a bubble 448 pixels wide without being clipped, and
+// a name long enough to matter must not be what breaks it.
+{
+  const speaker = { id: 'a', name: 'Bartholomew' };
+  const listener = { id: 'b', name: 'Konstantinos' };
+  const lines = [
+    ...SMALL_TALK_OPENERS.map((line) => line(speaker, listener)),
+    ...SMALL_TALK_REPLIES.map((line) => line(speaker, listener)),
+  ];
+  const overlong = lines.filter((line) => line.length > MAX_BUBBLE_CHARS);
+  check('no line of office small talk overflows its bubble', overlong.length === 0, overlong);
+  check('and none of them is empty', lines.every((line) => line.trim().length > 0));
+}
+
+// ------------------------------------------------------------------ the poses
+//
+// The avatar layer is the one piece of this that a screenshot usually has to
+// judge, and a screenshot cannot say *why* a figure is the height it is. So the
+// pose is asserted directly: the director's motion goes in, the scene graph
+// comes out, and the arithmetic in between - standing up, walking on legs,
+// showing a line, sitting back down - is checked rather than eyeballed.
+//
+// What this does not prove is that any of it is drawn correctly, which is what
+// the screenshot tooling is for. It proves the pose is the one that was asked
+// for, and that it goes back to the desk afterwards.
+
+/** The two methods the avatar's canvas drawing actually uses. */
+function stubCanvas(width: number, height: number): HTMLCanvasElement {
+  const context = new Proxy(
+    {},
+    {
+      get: (_target, key) => {
+        if (key === 'measureText') return (text: string) => ({ width: String(text).length * 14 });
+        return () => undefined;
+      },
+      set: () => true,
+    },
+  );
+  return { width, height, getContext: () => context } as unknown as HTMLCanvasElement;
+}
+
+const scope = globalThis as { document?: { createElement: (tag: string) => HTMLCanvasElement } };
+const previousDocument = scope.document;
+scope.document = { createElement: () => stubCanvas(1, 1) };
+
+const testAvatar = createAvatar('harness-1', 'Nadia', { bodyColor: '#38bdf8', accentColor: '#075985', height: 1 });
+const avatarBody = testAvatar.group.getObjectByName('Body');
+const avatarLeg = testAvatar.group.getObjectByName('LegR');
+const avatarSeat = testAvatar.group.getObjectByName('SeatedLegs');
+const avatarBubble = testAvatar.group.getObjectByName('Bubble') as THREE.Sprite | undefined;
+
+const walkPose = { x: 2, y: 0, z: 3, yaw: 0.5, mode: 'walking' as const, speed: 1.1, phase: 0.4, bubble: 'coffee?' };
+for (let frame = 0; frame < 40; frame += 1) testAvatar.update(1 / 30, frame / 30, false, walkPose);
+
+check(
+  'a walking body is drawn where the director asked for it',
+  Math.abs(testAvatar.group.position.x - 2) < 0.001 && Math.abs(testAvatar.group.position.z - 3) < 0.001,
+  testAvatar.group.position.toArray(),
+);
+check('and it rises from its chair onto its legs', (avatarBody?.position.y ?? 0) > 0.4, avatarBody?.position.y);
+check('the legs are shown and the seat is not', avatarLeg?.visible === true && avatarSeat?.visible === false);
+check(
+  'the line it is saying is on screen',
+  avatarBubble?.visible === true && (avatarBubble.material as THREE.SpriteMaterial).opacity > 0.5,
+);
+
+// Somewhere else entirely: a body that sits down is placed by the director in
+// every mode, including this one. Placing only the bodies on their feet leaves an
+// employee sent to the meeting room standing at the desk they left, which is a
+// bug that looks like nothing at all until somebody is moved.
+const sitPose = { ...walkPose, x: -4, z: -1, mode: 'seated' as const, speed: 0, bubble: null };
+for (let frame = 0; frame < 150; frame += 1) testAvatar.update(1 / 30, frame / 30, false, sitPose);
+
+check(
+  'a seated body is still put where the director says it is',
+  Math.abs(testAvatar.group.position.x + 4) < 0.001 && Math.abs(testAvatar.group.position.z + 1) < 0.001,
+  testAvatar.group.position.toArray(),
+);
+check('and it settles back down at its desk', (avatarBody?.position.y ?? 1) < 0.05, avatarBody?.position.y);
+check('the legs are put away and the seat is back', avatarLeg?.visible === false && avatarSeat?.visible === true);
+check('and the bubble has faded off the screen', avatarBubble?.visible === false);
+check('the pose survives being handed no motion at all', (() => {
+  testAvatar.update(1 / 30, 1, false, null);
+  return avatarBody?.position.y !== undefined;
+})());
+
+testAvatar.dispose();
+if (previousDocument === undefined) delete scope.document;
+else scope.document = previousDocument;
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) {

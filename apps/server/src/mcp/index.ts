@@ -4,8 +4,13 @@
  * dev3d speaks MCP as a *client*: it connects to servers other people publish
  * and exposes their tools to employees, under names that cannot collide with the
  * built-in tools. The protocol is implemented directly on Node built-ins — see
- * `jsonrpc.ts` for why — and the two transports are `stdio` (a server run as a
- * child process) and Streamable HTTP.
+ * `../rpc/jsonrpc.ts` for why — and the two transports are `stdio` (a server run
+ * as a child process) and Streamable HTTP.
+ *
+ * The JSON-RPC envelope and the stdio transport are shared with the Agent Client
+ * Protocol (`../rpc/`), because both are JSON-RPC 2.0 over the same wire and the
+ * part worth owning — framing, timeouts, the stderr ring, the kill sequence — is
+ * the same problem twice.
  *
  * Entry points:
  *   - `loadMcpConfig`   read `DEV3D_MCP_SERVERS` and `mcp.json`
@@ -26,7 +31,7 @@ export {
   type McpToolInfo,
   type McpTransport,
 } from './client.ts';
-export { StdioTransport, type StdioTransportOptions } from './stdio.ts';
+export { StdioTransport, type StdioTransportOptions } from '../rpc/stdio.ts';
 export {
   McpManager,
   parsePublishedToolName,
@@ -52,4 +57,4 @@ export {
   type JsonRpcId,
   type JsonRpcRequest,
   type JsonRpcResponse,
-} from './jsonrpc.ts';
+} from '../rpc/jsonrpc.ts';

@@ -268,6 +268,11 @@ async function runOneTurn(
     writtenPaths,
     turnIndex: purposeIndex,
     signal: ctx.signal,
+    // The memory index is resolved inside the turn, because it is the only place
+    // that knows both the employee and the workspace at once. These are the empty
+    // defaults it fills in; nothing here may depend on them being populated.
+    memoryFacts: [],
+    memoryQuery: `${ctx.run.brief}\n${purpose}`.trim(),
   });
   ctx.stage.turnIds.push(turn.id);
   absorb(knowledge, turn, role.displayName);

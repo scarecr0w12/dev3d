@@ -44,6 +44,21 @@ export interface OfficeAnchors {
   seatFacing(seatName: string | null | undefined, roomName: string | null | undefined): number;
   /** Where an employee with no seat stands: a row of bench desks by the dev floor. */
   hotDeskPosition(index: number): THREE.Vector3;
+  /**
+   * Where a third-party vendor's terminal stands.
+   *
+   * A vendor is not given a `Seat_*`: those belong to the org chart, and a
+   * vendor has no place on it. It docks instead, in a room the floor either grew
+   * for the purpose or already had. See the implementation for the ordering and
+   * why it is that order.
+   */
+  vendorBayPosition(index: number): THREE.Vector3;
+  /** The yaw a docked terminal faces, so a row faces into its room. */
+  vendorBayFacing(): number;
+  /** Where the bay is, in words, for the HUD and the console. */
+  vendorBayLabel(): string;
+  /** True when this floor has a grown rack room for the bay to sit in. */
+  hasServerRoom(): boolean;
   describe(): string;
 }
 
@@ -177,6 +192,44 @@ export function indexAnchors(root: THREE.Object3D): OfficeAnchors {
     return new THREE.Vector3(0, 0, 0);
   };
 
+  /**
+   * A room anchor looked up by its *bare* name, ignoring any instance prefix.
+   *
+   * Needed because the two rooms a vendor bay can use are reached differently.
+   * `Anchor_Room_Lobby` is in the core and has no prefix, but a rack room is a
+   * grown module and therefore arrives as `B1::Anchor_Room_SERVER4`. Looking
+   * that up by exact name would work on one floor and silently fail on the next,
+   * depending on which module instance happened to be built first.
+   */
+  const roomByBareName = (bare: string): THREE.Object3D | null => {
+    for (const [name, object] of rooms) {
+      if (bareName(name) === bare) return object;
+    }
+    return null;
+  };
+
+  /**
+   * The rack room, when the floor has grown one.
+   *
+   * **Why the bay prefers it, and what happens when there is none.** A vendor is
+   * external compute that the office has plugged in, and `server4` is the only
+   * module in the kit whose furniture (`racks`) implies machinery rather than
+   * people - so it is where a bank of terminals belongs, and it is the one room
+   * whose single seat means housing them there never competes with the roster.
+   *
+   * Not every floor has one: modules are grown on demand, least-used-first, so a
+   * small team may never build a server room at all. Falling back to the core's
+   * **reception** is the right degradation rather than a compromise - a
+   * contractor with nowhere to work waits in the lobby - and it is why this is a
+   * preference order rather than a required anchor. A floor with neither (a
+   * hand-edited model, or a kit that failed to load) still gets a bay at the
+   * bench origin, because a vendor the office is paying for must be visible
+   * somewhere rather than silently at the world origin.
+   */
+  const serverRoom = (): THREE.Vector3 | null => worldPosition(roomByBareName('Anchor_Room_SERVER4'));
+  /** The core's reception: where a vendor waits when there is no rack room. */
+  const lobby = (): THREE.Vector3 | null => worldPosition(roomByBareName('Anchor_Room_Lobby'));
+
   return {
     seats: [...seats.keys()].sort(),
     rooms: [...rooms.keys()].sort(),
@@ -219,6 +272,32 @@ export function indexAnchors(root: THREE.Object3D): OfficeAnchors {
       // Two rows of four, just off the dev floor anchor, so bench staff are
       // clearly in the office but visibly not at a named seat.
       return new THREE.Vector3(origin.x - 1.9 + column * 1.25, origin.y, origin.z + 1.7 + row * 1.2);
+    },
+    hasServerRoom: () => serverRoom() !== null,
+    vendorBayPosition(index) {
+      const origin = serverRoom() ?? lobby() ?? benchOrigin();
+      const column = ((index % 3) + 3) % 3;
+      const row = Math.max(0, Math.floor(index / 3));
+      // Three to a row, offset from the room's own anchor along +Z and then
+      // stacked backwards. Deliberately a *different* row shape from the
+      // hot-desk bench: four abreast with wider spacing reads as desks for
+      // people, and three slightly tighter reads as a bank of machines.
+      return new THREE.Vector3(origin.x - 1.5 + column * 1.5, origin.y, origin.z + 1.4 + row * 1.5);
+    },
+    vendorBayFacing() {
+      const origin = serverRoom() ?? lobby() ?? benchOrigin();
+      const first = this.vendorBayPosition(0);
+      // Face back toward the room's anchor, so a row of terminals addresses the
+      // space it is in rather than staring at a wall.
+      const dx = origin.x - first.x;
+      const dz = origin.z - first.z;
+      if (Math.abs(dx) < 0.0001 && Math.abs(dz) < 0.0001) return 0;
+      return Math.atan2(dx, dz);
+    },
+    vendorBayLabel() {
+      if (serverRoom() !== null) return 'the server room';
+      if (lobby() !== null) return 'reception';
+      return 'the bench';
     },
     describe() {
       return `${seats.size} seats · ${rooms.size} rooms · ${desks.size} desks · ${meshes} meshes`;

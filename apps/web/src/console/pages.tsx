@@ -14,6 +14,7 @@ import { useOffice } from '../app/StoreContext';
 import { ActivityFeed } from './ActivityFeed';
 import { ApprovalsPanel } from './ApprovalsPanel';
 import { ArtifactsPanel } from './ArtifactsPanel';
+import { MemoryPanel } from './MemoryPanel';
 import { OrgChart } from './OrgChart';
 import { PluginsPanels } from './plugins/PluginsPanels';
 import { PluginPanels } from './plugins/PluginPanels';
@@ -23,6 +24,7 @@ import { RunTranscript } from './RunTranscript';
 import { SettingsPanel } from './SettingsPanel';
 import { SkillsPanel } from './SkillsPanel';
 import { Telemetry } from './Telemetry';
+import { VendorsBayPanel } from './VendorsPanel';
 import { Badge } from './ui';
 
 /** Two independently scrolling columns, which is what a dense page wants. */
@@ -122,6 +124,37 @@ export function SkillsPage() {
   return (
     <Single>
       <SkillsPanel />
+    </Single>
+  );
+}
+
+/**
+ * Memory gets a page of its own rather than a panel on another one.
+ *
+ * Writing a fact down is an editorial act about the whole office - it changes what
+ * every employee is told - so it deserves room to read what is already there before
+ * adding to it. The ledger tab in particular needs the width.
+ */
+export function MemoryPage() {
+  return (
+    <Single>
+      <MemoryPanel />
+    </Single>
+  );
+}
+
+/**
+ * Vendors: the third-party harnesses this office has engaged.
+ *
+ * A page rather than a section of Settings, because a vendor is a *roster* - the
+ * same kind of thing the Org tab is - and because the capability table that says
+ * whether read-only is enforced or merely requested needs width to be read rather
+ * than skimmed.
+ */
+export function VendorsPage() {
+  return (
+    <Single>
+      <VendorsBayPanel />
     </Single>
   );
 }

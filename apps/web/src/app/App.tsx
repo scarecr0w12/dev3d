@@ -37,7 +37,7 @@ import type { InspectorTab } from '../console/InspectorPopout';
 import { PageSheet } from '../console/PageSheet';
 import { PlanPage } from '../console/PlanPage';
 import { StatusPopout } from '../console/StatusPopout';
-import { ActivityPage, OpsPage, OrgPage, PluginsPage, ProjectsPage, RunsPage, SettingsPage, SkillsPage } from '../console/pages';
+import { ActivityPage, MemoryPage, OpsPage, OrgPage, PluginsPage, ProjectsPage, RunsPage, SettingsPage, SkillsPage, VendorsPage } from '../console/pages';
 import { SubmitBar } from '../console/SubmitBar';
 import { Badge, Tabs } from '../console/ui';
 import { api } from './api';
@@ -65,6 +65,8 @@ type PrimaryTab =
   | 'activity'
   | 'ops'
   | 'skills'
+  | 'memory'
+  | 'vendors'
   | 'plugins'
   | 'settings';
 
@@ -77,6 +79,11 @@ const PRIMARY_TABS: ReadonlyArray<{ id: PrimaryTab; label: string }> = [
   { id: 'activity', label: 'Activity' },
   { id: 'ops', label: 'Routing & cost' },
   { id: 'skills', label: 'Skills' },
+  { id: 'memory', label: 'Memory' },
+  // Beside Memory rather than inside Settings: a vendor is a roster of external
+  // capability, not a preference, and the office's other rosters - people,
+  // skills, plugins - are all top-level tabs.
+  { id: 'vendors', label: 'Vendors' },
   { id: 'plugins', label: 'Plugins' },
   { id: 'settings', label: 'Settings' },
 ];
@@ -95,6 +102,15 @@ const SHEET_COPY: Record<Exclude<PrimaryTab, 'office'>, { title: string; subtitl
   activity: { title: 'Activity', subtitle: 'every event the orchestrator has pushed, newest first' },
   ops: { title: 'Routing & cost', subtitle: 'models, prices, providers and what each employee has spent' },
   skills: { title: 'Skills', subtitle: 'the capability catalogue employees draw on per turn' },
+  memory: {
+    title: 'Memory',
+    subtitle: 'what the office has written down, what employees can recall, and what it used to believe',
+  },
+  vendors: {
+    title: 'Vendors',
+    subtitle:
+      'the third-party agent harnesses this office may engage — off-site processes, on somebody else\u2019s subscription, not on the payroll',
+  },
   plugins: {
     title: 'Plugins',
     subtitle: 'what extends this office — installed plugins, their permissions and settings, and where else they can come from',
@@ -285,26 +301,32 @@ function Console() {
     };
   }, [store]);
 
-  // Selecting something should show it. An avatar opens the agent view, a run
-  // opens the run view, and either way the inspector comes forward.
+  // Selecting something should show it. An avatar opens the agent view, a
+  // terminal opens the same view for a vendor, a run opens the run view, and
+  // either way the inspector comes forward.
   useEffect(() => {
-    if (selection.employeeId !== null || selection.runId !== null) setRightOpen(true);
-  }, [selection.employeeId, selection.runId]);
+    if (selection.employeeId !== null || selection.vendorId !== null || selection.runId !== null) setRightOpen(true);
+  }, [selection.employeeId, selection.vendorId, selection.runId]);
 
-  const previous = useRef<{ employeeId: string | null; runId: string | null }>({
+  const previous = useRef<{ employeeId: string | null; vendorId: string | null; runId: string | null }>({
     employeeId: selection.employeeId,
+    vendorId: selection.vendorId,
     runId: selection.runId,
   });
   useEffect(() => {
     const employeeChanged = selection.employeeId !== previous.current.employeeId;
+    const vendorChanged = selection.vendorId !== previous.current.vendorId;
     const runChanged = selection.runId !== previous.current.runId;
-    previous.current = { employeeId: selection.employeeId, runId: selection.runId };
-    if (employeeChanged && selection.employeeId !== null) setInspector('agent');
+    previous.current = { employeeId: selection.employeeId, vendorId: selection.vendorId, runId: selection.runId };
+    // A vendor and an employee both land on the Agent tab, because that tab is
+    // "what did I click" and the store keeps at most one of the two selected.
+    if ((employeeChanged && selection.employeeId !== null) || (vendorChanged && selection.vendorId !== null)) {
+      setInspector('agent');
+    }
     // A run wins if both moved in the same render: selecting a run is the more
     // specific intent, and it is the load the user is waiting to watch.
     if (runChanged && selection.runId !== null) setInspector('run');
-  }, [selection.employeeId, selection.runId]);
-
+  }, [selection.employeeId, selection.vendorId, selection.runId]);
   // Escape returns to the office from any page.
   useEffect(() => {
     if (!sheetOpen) return;
@@ -389,6 +411,8 @@ function Console() {
             {tab === 'activity' && <ActivityPage />}
             {tab === 'ops' && <OpsPage />}
             {tab === 'skills' && <SkillsPage />}
+            {tab === 'memory' && <MemoryPage />}
+            {tab === 'vendors' && <VendorsPage />}
             {tab === 'plugins' && <PluginsPage />}
             {tab === 'settings' && <SettingsPage />}
           </PageSheet>

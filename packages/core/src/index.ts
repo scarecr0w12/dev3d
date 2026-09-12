@@ -14,3 +14,5 @@ export * from './events.ts';
 export * from './plugin.ts';
 export * from './block.ts';
 export * from './style.ts';
+export * from './memory.ts';
+export * from './vendor.ts';

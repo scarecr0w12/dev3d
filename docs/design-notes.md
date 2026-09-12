@@ -473,6 +473,108 @@ while keeping all of it would grow without bound.
 
 ---
 
+## Third-party vendors
+
+MCP connects dev3d to other *tools*. A **vendor** connects it to other *agents* —
+Codex, DeepSeek Harness, Hermes, and anything else an operator can name a command
+for — and the difference between those two words is the whole design.
+
+### Why a vendor is not an employee
+
+The tempting shortcut is to give a vendor an `EmployeeState` and a `roleId`:
+every console surface already reads `office.employees`, so it would render,
+animate, be clickable and join the roster for free. It was rejected because an
+`EmployeeState` is *staff*, and routing a machine through that list puts it in the
+headcount, the spend leaderboard, the org chart, the quick-jump index and the
+approval `nameOf` maps — every one a place where "a process somebody else
+operates" would read as "somebody who works here".
+
+So vendors are a second, parallel list (`OfficeState.vendorBay`) with their own
+status vocabulary. `VendorStatus` is deliberately not more keys in
+`EmployeeStatus`: the console's status tables are `Record<EmployeeStatus, …>`, and
+those refusing a `VendorStatus` key at compile time is the type system catching
+the drift this decision exists to prevent. In the 3D office a vendor is a
+**rented terminal** — a plinth, a screen and a beacon, docked in the rack room or
+in reception — while staff remain the only humanoids on the floor. See
+[external-agents.md](external-agents.md#7-the-office-metaphor-a-vendor-is-a-machine-not-a-colleague).
+
+### What dev3d cannot promise
+
+An MCP tool is adapted into an ordinary `Tool`, so it inherits the `resolveInWorkspace`
+choke point, the per-role grant and the approval gate — it is confined by the same
+machinery a built-in is. **An external agent cannot be adapted that way.** It is a
+process with its own idea of what is safe, and it writes with its own hands.
+
+The first release answers that by only ever sending **read-only** work. The honest
+part is that read-only is not one thing, and collapsing it into a boolean would
+have had to misdescribe the middle case. `VendorCapabilities.readOnlyEnforcement`
+is therefore three-valued:
+
+| Level | Who makes it true | What it does *not* cover |
+|---|---|---|
+| `sandbox` | the harness, via an OS sandbox dev3d asked for (`codex exec -s read-only`) | nothing — it holds for the whole process |
+| `client` | **dev3d**, over ACP: writes refused, reads confined, every tool call put to a human | the agent is still a local process, so it constrains what it does *through dev3d* |
+| `requested` | nobody; the task text asks | everything |
+
+The middle level only exists because of the Agent Client Protocol, and it is the
+one worth understanding. ACP lets the **client** answer for the agent: when the
+agent wants a file it asks dev3d, and dev3d reads it through `resolveInWorkspace`
+— the same choke point every built-in tool goes through — so an escape attempt
+fails at the office rather than being reported by the vendor. Writes are refused
+outright and never advertised. And `session/request_permission` puts each tool
+call to a human, so an external agent ends up gated by the approval callout a
+`run_shell` already uses.
+
+It is still not a sandbox, and the field says so: the agent is a local process and
+nothing stops it using its own syscalls. What the level buys is that an operator
+can tell "I am trusting an OS sandbox" from "dev3d is refusing things on my
+behalf" from "nothing is enforcing this but the harness's good behaviour" — and
+only the last of those is unbounded, which is why only the last of those asks for
+approval up front.
+
+### The controls that actually exist
+
+The run budget cannot bound a vendor. A harness bills its own subscription, so it
+reports no cost, `spentUsd` does not move, and the spend ceiling is inert. There is
+also no mid-turn budget check to fall back on — the tool loop tests
+`req.signal.aborted` and nothing else (`turn.ts:418-422`), which is a pre-existing
+hole rather than one this feature opens.
+
+So the controls are a **per-vendor wall-clock timeout**, hard-killed (`SIGKILL`)
+on expiry and on cancellation, and **serialisation** — a second delegation to the
+same vendor is refused while the first is running, because a harness is one
+machine with one quota behind it. A caller may lower the timeout and never raise
+it: the ceiling is what an operator decided this harness may consume, and a model
+choosing its own timeout would be able to overrule that.
+
+### One wire, two protocols
+
+MCP and ACP are both JSON-RPC 2.0 over newline-delimited stdio. The framing, the
+stderr ring, the start handshake, the kill sequence and the injectable `spawnFn`
+seam are the same problem twice, so they live once in `apps/server/src/rpc/` and
+both protocols use them: `McpTransport` is now an alias of the shared
+`JsonRpcTransport`. The child-process seam is shared too, which is why one test
+double (`vendors/testing.ts`) fakes both transports.
+
+### The seam that makes it testable
+
+`vendors/testing.ts` is the reference implementation of the spawn seam — the same
+trade `llm/mock.ts` makes. That is not ceremony: this environment blocks child
+processes with piped stdio, which is why four other tests skip. Every vendor test
+runs everywhere, including the ones about a harness that hangs, one that cannot
+start, and one that prints past the output cap. The ACP tests go further and inject
+the *transport* rather than a process, so the protocol logic is exercised with no
+child at all.
+
+Two decisions inside the transports are security boundaries rather than details.
+The prompt is **data**: on `argv` it is appended as a single element, on `stdin` it
+is written to a pipe, and `shell: false` means there is no interpreter between the
+office and the process — so a task containing `; rm -rf /` is one argument and not
+three. And on the ACP wire, `writeTextFile` is advertised as false and refused if
+attempted anyway.
+
+---
+
 ## Plugins
 
 A plugin is how the office gains a model, a skill, a routing rule, a tool, a role
@@ -861,6 +963,50 @@ first pod's. Seat, desk and room lookup all understand the prefix, which is what
 lets an employee be placed at a generated desk and described as being in a
 generated room.
 
+### Where people can walk is sampled, not authored
+
+There is no navmesh in this repository and no hand-placed path nodes. Walkable
+space is sampled from the geometry that is actually loaded: every mesh standing
+between the ankle and the head becomes an obstacle box, and the floor around them
+goes onto a 20 cm grid. Two properties of the assets make that exact rather than
+approximate — everything in that band is a box, and a doorway is a *gap between
+two wall segments* rather than a hole cut out of one — so a footprint describes a
+wall completely, and the grid that comes out of it is right about where the doors
+are without anyone having described a door.
+
+Three consequences are worth having. A floor that grows a module is walkable the
+moment it is drawn, because a module is more boxes. A sealed room is sealed here
+too, so an errand into one is refused rather than walked through a wall: the three
+back offices and the glass meeting room are enclosed, and their occupants pace in
+their own rooms instead of commuting through masonry. And the walkable extent is
+the extent of the *geometry*, not of the plate drawn under it — a plate is
+deliberately a little larger than its walls, and sampling it finds a strip outside
+the building that connects to the inside through the growth doorways. That strip
+is one omitted bound away from being a route out of the west door and back in
+through the east one.
+
+### Only idle people move
+
+The run engine is the authority on what an employee is *doing*; this layer is the
+authority on where their body is while they do it, and the only status it acts on
+is `idle`. A working, thinking, blocked or offline employee never leaves their
+chair, so "at a desk" keeps meaning "on the clock" and a status colour never lies
+about where to look. Work arriving mid-stroll is the case that matters most, and
+it is answered by walking them back rather than snapping them: they are visibly on
+their way, their new status is already showing, and they sit down and start.
+
+Three smaller decisions fall out of the same idea. **At most a quarter of the
+floor is away from its desk at once**, or thirteen people migrate together and the
+office reads as abandoned. That cap counts people by *where they are* rather than
+by what they are doing, because somebody who has been talked to is standing at
+their own desk and never left it — counting them would let a busy room drift past
+the cap one conversation at a time. And a conversation is a **place**: whoever
+wants a word walks to the colleague's desk, stands at one shoulder, and the pair
+hold the exchange to the end, so no third party wanders into the middle of it.
+What they say arrives one short line at a time, because a bubble is a caption for
+a gesture: two colleagues comparing notes about a flaky test reads as an office,
+and a paragraph of dialogue reads as a bug.
+
 ---
 
 ## The run engine
@@ -930,6 +1076,195 @@ employee from claiming work it did not do.
 The line now states the scope — you are accountable for the people who report to
 you, the pipeline assigns their stages — and points at the thing that does work:
 say what you need done, and the plan picks it up.
+
+---
+
+## The memory system
+
+### Why there is no extraction step
+
+The single most consistent finding across the memory literature is that these
+systems fail on the **write** path, not the read path. Benchmarks that decompose
+the pipeline find hallucinations and omissions originating in extraction and
+updating, then propagating downstream to question answering; one of them excluded
+retrieval from its hallucination evaluation entirely, on the grounds that
+retrieval rarely introduces generative error. The same literature reports write
+costs running five to fifty times retrieval costs.
+
+So the write path here contains no model at all. `MemoryFact` has an `origin` field
+whose members are `operator` and `operator-verified` — there is deliberately no
+`extracted-by-model`, so adding one later would be a visible change to the type
+rather than a quiet widening of what already exists. A fact exists because a person
+wrote it down, which is the one write path that cannot hallucinate.
+
+The cost of that decision is honest and recorded in the README's known gaps: the
+office does not remember anything nobody thought to record.
+
+### Supersession instead of overwriting
+
+A correction is expressed by naming the fact being replaced (`supersedes` on the
+input), and the service performs both halves as one operation: create the
+replacement, then invalidate the original. The original keeps its text and gains
+`invalidFrom` and `supersededBy`.
+
+Three details are load-bearing:
+
+1. **The replacement is written first.** If the invalidation were to fail, the
+   failure that matters is a fact still current with nothing replacing it — so the
+   replacement must exist on disk before anything is marked invalid.
+2. **Both halves travel in one event.** A console that saw only the addition would
+   hold two active, contradicting facts until its next full sync, which is exactly
+   the contradiction the correction was made to resolve.
+3. **A correction cannot move a fact's scope.** The replacement inherits the
+   original's scope or the write is refused. Otherwise "correcting" a floor's note
+   would be a quiet way to promote it to installation-wide guidance.
+
+`invalidFrom` and `supersededBy` mean different things and are not interchangeable:
+one says the fact stopped being true, the other says something replaced it. A
+retraction sets only the first, which is why `isActive` checks both.
+
+### Nothing is deleted for being old
+
+There is no decay, no TTL, no sweep, and the store exposes no delete — so age-based
+forgetting is not merely unimplemented, there is no call that could perform it. The
+argument is that a low decay score measures *recency of access*, not behavioural
+importance: the fact nobody has needed in six months is the one that matters the
+moment it comes up again, and deleting it on that basis produces permanent amnesia
+about a pattern that was expensive to learn.
+
+`readCount` and `lastReadAt` are tracked, but they are inputs to ranking and a
+signal for the operator, never a trigger for removal.
+
+### Why the index is small and the tool is a tool
+
+Every employee's prompt carries at most eight facts and a count of how many more
+are on record. The detail arrives through `recall`.
+
+That split comes from two findings that pull in opposite directions. A controlled
+study of repository context files found that always-injected context raised
+inference cost by over 20% with no improvement in task success, because agents
+faithfully follow instructions whether or not they bear on the task. But work on
+model-decided retrieval found the opposite failure: with the search tool available
+and warranted, one measurement got 46.67% of the recall it should have, because the
+model simply did not call it — a failure that is silent and total.
+
+An index plus a tool is neither. The employee is told that memory exists and what
+shape it takes, so there is something to ask about, and asking is an ordinary tool
+call rather than a judgement about whether to look. The prompt says how many facts
+it is *not* showing, because an employee told "here are eight facts" when there are
+forty will assume it has seen everything and stop looking.
+
+### Full-text search, and why not vectors
+
+FTS5 is compiled into Node's own SQLite, so ranking costs no dependency and no
+service. Measured on this machine over 20,000 items, FTS5 answered in 0.03 ms from
+5.1 MB where a brute-force `sqlite-vec` scan over 384-dimensional vectors took
+29.8 ms from 30.5 MB — roughly three orders of magnitude faster and six times
+smaller, because sqlite-vec has no ANN index and its own benchmarks state that only
+exhaustive scans are tested.
+
+Lexical is also the right shape for the queries this workload generates: file paths,
+function names, error strings, symbol names. Those are rare, high-information tokens
+with nothing to paraphrase, which is the regime where BM25 is strongest.
+
+Two consequences are handled rather than ignored:
+
+- **The query has to be sanitised.** FTS5's query language has operators, so a raw
+  user string is not safe to interpolate — `foo OR` is a syntax error and an
+  unbalanced quote throws. `toFtsQuery` quotes every run of word characters and
+  ANDs them, splitting `customer_id` the same way the tokeniser does. A query with
+  no searchable terms at all returns `null`, and the caller **lists** rather than
+  reporting no matches: answering `!!!` with an empty result would be a lie about a
+  store that is not empty.
+- **A store without FTS5 still works.** The index is created separately and its
+  failure is tolerated, because FTS5 is a compile-time option. `searchable` travels
+  on the state and the Memory page says the results are unranked — an office with
+  unranked memory is worse than one with ranked memory and much better than one
+  that will not start.
+
+### Semantic re-ranking, and why vectors never select
+
+`DEV3D_MEMORY_VECTORS=true` loads `sqlite-vec` and `DEV3D_MEMORY_EMBEDDING` names
+where text becomes vectors. Both are needed: the index cannot vectorise a query,
+and an embedder with no index has nowhere to put a vector. With either missing,
+recall stays lexical and the office says so rather than claiming a capability.
+
+Two traps are worth recording because both fail silently rather than loudly:
+
+- **Extension loading must be enabled at construction** —
+  `new DatabaseSync(path, { allowExtension: true })`. Calling
+  `enableLoadExtension(true)` afterwards throws, and `'loadExtension' in db`
+  returns `true` the whole time, so feature detection by presence lies. That is
+  why the option is threaded through `openStore` instead of being done lazily.
+- **`vec0` primary keys must bind as `BigInt`.** A plain JS number throws
+  `Only integers are allows for primary key values`, at runtime, from a call that
+  looks correct.
+
+The design decision that matters is the order of operations: **full text selects
+the candidates and the vectors only reorder them.** A vector-first path would have
+had to reproduce the scope filter, the activity filter and the containment rule
+against a table that carries none of them — and every one of those is a rule that
+fails silently when it is wrong. Selecting lexically keeps all three on the code
+path that already enforces them, which is why switching semantic search on cannot
+widen what a search may return.
+
+Three consequences follow, and each is tested rather than asserted:
+
+- **A fact with no vector keeps its lexical position.** An unmeasured fact is not
+  a dissimilar one, and scoring a null as a worst-case distance would bury a fact
+  merely for being new.
+- **A failing embedder degrades to the lexical answer**, not to none and not to an
+  error. A ranking refinement that cannot be computed is a refinement that did not
+  happen.
+- **A vector of the wrong width is refused, not truncated.** The index is 768 wide;
+  a 384-dimension vector packed into those columns would produce distances that are
+  numbers and mean nothing. This is the wrong-model case, and it is the one where
+  a plausible-looking silence would be worst.
+
+Embeddings are backfilled lazily — a few per search, plus `POST /api/memory/embed`
+for an explicit batch — because embedding is a metered call and a store with a
+thousand historical facts must not turn one search into a thousand requests. A
+partial backfill is harmless by construction: an unembedded fact is still fully
+recallable, just not re-ranked.
+
+**Two counts travel on the state, and they answer different questions.**
+`vectorCount` is how much embedding work exists in the index at all, active facts
+and superseded ones alike — so it is bounded by the whole record rather than by the
+active set, and it reaches `ledger.total` only once everything has been embedded.
+`vectorCoverage` is how many facts the office *currently believes* have a vector,
+which is the number the page shows against `facts.length`.
+
+Reporting one number for both produced a fraction with a numerator larger than its
+denominator, and the fix was a second field rather than arithmetic in the console:
+`total` includes inactive facts that were never embedded, so subtracting inactive
+from `vectorCount` is simply wrong, and a UI left to derive it would eventually
+show something that does not divide. A superseded fact keeps its vector on
+purpose - discarding it would mean paying to re-embed a fact that becomes current
+again.
+
+### Scope, and where it is enforced
+
+A fact belongs to the installation, one workspace, or one role, and `scopesFor`
+builds the set a caller may read. The store's search takes those scopes as a
+**required** argument with no default, so forgetting to scope a search is a compile
+error rather than a leak — and an empty scope set is answered as a refusal to search
+rather than an invitation to return everything.
+
+The engine never names a scope itself. `ToolContext.recall` is a callback the
+runtime builds with the run's workspace and role already bound, so the `recall` tool
+cannot widen its own reach. That mirrors `onPlanChange`: the tool layer does not
+know about stores or scopes, which is what lets it be tested with a bare context
+object.
+
+### Reads are counted, and that is not yet the whole loop
+
+`readCount` is the first half of the only honest signal available — whether a fact
+was worth keeping — and this office is in the unusual position of having the second
+half, because runs really do succeed or fail. Attaching a run's outcome to the facts
+it was shown would let memory be scored the way model quality already is, with
+confidence weighting, smoothing towards a prior, and an operator correction as the
+loudest opinion. That is the next step, and it is recorded as a gap rather than
+half-built.
 
 ---
 

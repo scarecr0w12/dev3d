@@ -416,6 +416,17 @@ button {
   background: rgba(74, 222, 128, 0.06);
 }
 
+/*
+ * Informational, not a warning. Used for statements of fact an operator needs but
+ * that are nobody's fault - "this vendor bills its own subscription, so the run
+ * budget does not bound it". Distinct from `alert-warn` because a panel that
+ * shouts at something ordinary teaches people to ignore the colour.
+ */
+.alert-info {
+  border-left-color: var(--accent);
+  background: rgba(56, 189, 248, 0.06);
+}
+
 /* ------------------------------------------------------------------ controls */
 
 .btn {
@@ -1269,6 +1280,100 @@ textarea {
   border-top: 1px solid var(--border);
 }
 
+/* ================================================================ memory ==== */
+/* What the office remembers. The form sits above the list because writing a fact
+   down is the deliberate act on this page - recall happens in a prompt, and
+   reading the record is what an operator does when something turns out wrong. */
+
+.memory-form {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+  background: #0d1117;
+}
+
+.memory-text {
+  width: 100%;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.45;
+}
+
+.memory-form-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.memory-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.memory-field-grow {
+  flex: 1 1 150px;
+}
+
+.memory-correcting {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  background: var(--warn-soft);
+}
+
+.memory-summary {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  line-height: 1.5;
+}
+
+.fact-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.fact {
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+/* A fact that stopped being true stays legible but stops competing for
+   attention with the ones that are current. Dimmed, never hidden. */
+.fact-inactive {
+  opacity: 0.62;
+}
+
+.fact-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.fact-text {
+  margin-top: 4px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.fact-foot {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 5px;
+}
+
 @media (max-width: 720px) {
   .office-style-body {
     width: min(92vw, 380px);
@@ -1522,6 +1627,68 @@ textarea {
   gap: 8px;
   margin-top: 8px;
   flex-wrap: wrap;
+}
+
+/* ------------------------------------------------------------- vendor panel */
+
+.vendor-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.vendor-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+/*
+ * A vendor row is a button so it is keyboard-reachable and clickable, exactly as
+ * an org-chart row is. `grid` rather than `flex` because the trailing detail
+ * column has to absorb whatever width is left without pushing the status column
+ * out of alignment between rows.
+ */
+.vendor-row {
+  display: grid;
+  grid-template-columns: 10px minmax(80px, auto) auto 1fr;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 9px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.vendor-list > li:last-child .vendor-row {
+  border-bottom: 0;
+}
+
+.vendor-row:hover {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.vendor-row-selected {
+  background: rgba(56, 189, 248, 0.1);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* The trailing column: what it is doing, why it is down, or its tally. */
+.vendor-row-tail {
+  justify-self: end;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ----------------------------------------------------------- employee panel */

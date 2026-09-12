@@ -24,6 +24,8 @@ import type {
   ClientOfficeStore,
   DirectMessage,
   EmployeeState,
+  MemoryFact,
+  MemoryState,
   OfficeState,
   OrgChart,
   Run,
@@ -76,6 +78,16 @@ export interface FeedItem {
 
 export interface SelectionState {
   employeeId: string | null;
+  /**
+   * The selected third-party vendor, when one is.
+   *
+   * A second slot rather than a tagged union, with the invariant that at most one
+   * of `employeeId` / `vendorId` is ever set: they answer the same question -
+   * "what is the operator looking at" - and the inspector has one answer. The
+   * invariant is enforced by the two setters clearing each other rather than by
+   * hoping every caller remembers.
+   */
+  vendorId: string | null;
   runId: string | null;
 }
 
@@ -121,6 +133,7 @@ export type Slice =
   | 'skills'
   | 'messages'
   | 'plans'
+  | 'memory'
   | 'notices';
 
 // --------------------------------------------------------------------- limits
@@ -146,6 +159,37 @@ function upsertById<T extends { id: string }>(list: readonly T[], item: T): T[] 
 
 function findById<T extends { id: string }>(list: readonly T[], id: string): T | undefined {
   return list.find((entry) => entry.id === id);
+}
+
+/**
+ * Recompute the memory counts from the facts actually held.
+ *
+ * Derived rather than incremented, because an increment that runs twice, or not
+ * at all, produces a number that disagrees with the list beside it - and the
+ * operator has no way to tell which of the two is lying. Recomputing from the
+ * list makes the summary line true by construction.
+ */
+function recountMemory(facts: readonly MemoryFact[], previous: MemoryState): MemoryState {
+  const counts = { installation: 0, workspace: 0, role: 0 };
+  for (const fact of facts) {
+    // A superseded or retracted fact stays in the list - the ledger is the
+    // server's to serve - but it is not a current belief, so it is not counted.
+    if (fact.invalidFrom === null && fact.supersededBy === null) counts[fact.scope] += 1;
+  }
+  // `searchable` is the server's to state: only it knows whether the store has a
+  // ranked index, and guessing would let the page promise ranked recall it does
+  // not have.
+  // `searchable`, `semantic` and `vectorCount` are the server's to state: only it
+  // knows whether the index loaded and how much of the store has been embedded,
+  // and a console that guessed would promise a capability it cannot see.
+  return {
+    facts: facts.slice(),
+    counts,
+    searchable: previous.searchable,
+    semantic: previous.semantic,
+    vectorCount: previous.vectorCount,
+    vectorCoverage: previous.vectorCoverage,
+  };
 }
 
 function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
@@ -264,12 +308,28 @@ export class OfficeStore implements ClientOfficeStore {
   private reasoningByTurn: Record<string, string> = {};
   private feedItems: FeedItem[] = [];
   private approvalList: Approval[] = [];
-  private sel: SelectionState = { employeeId: null, runId: null };
+  private sel: SelectionState = { employeeId: null, vendorId: null, runId: null };
   private artifactsByRun: Record<string, Artifact[]> = {};
   private turnsByRun: TurnIndex = {};
   private skillsState: SkillsState = { skills: null, loading: false, error: null };
   private messagesByEmployee: Record<string, DirectMessage[]> = {};
   private planReplyQueue: PlanReply[] = [];
+  /**
+   * Memory as the console last saw it.
+   *
+   * Kept as its own slice rather than read out of `officeState` so the Memory
+   * page re-renders on a fact changing without waking every panel that reads the
+   * office. Seeded from `hello`, then advanced by `memory.created`,
+   * `memory.retracted` and `memory.updated`.
+   */
+  private memoryState: MemoryState = {
+    facts: [],
+    counts: { installation: 0, workspace: 0, role: 0 },
+    searchable: false,
+    semantic: false,
+    vectorCount: 0,
+    vectorCoverage: 0,
+  };
   private noticeList: Notice[] = [];
 
   private readonly listeners: Record<Slice, Set<() => void>> = {
@@ -285,6 +345,7 @@ export class OfficeStore implements ClientOfficeStore {
     skills: new Set(),
     messages: new Set(),
     plans: new Set(),
+    memory: new Set(),
     notices: new Set(),
   };
 
@@ -340,6 +401,11 @@ export class OfficeStore implements ClientOfficeStore {
     return this.planReplyQueue;
   }
 
+  /** What the office remembers, as of the last frame that touched it. */
+  get memory(): MemoryState {
+    return this.memoryState;
+  }
+
   // -------------------------------------------------------- bound subscription
 
   subscribeConnection = (listener: () => void): (() => void) => this.subscribe('connection', listener);
@@ -354,6 +420,7 @@ export class OfficeStore implements ClientOfficeStore {
   subscribeSkills = (listener: () => void): (() => void) => this.subscribe('skills', listener);
   subscribeMessages = (listener: () => void): (() => void) => this.subscribe('messages', listener);
   subscribePlans = (listener: () => void): (() => void) => this.subscribe('plans', listener);
+  subscribeMemory = (listener: () => void): (() => void) => this.subscribe('memory', listener);
   subscribeNotices = (listener: () => void): (() => void) => this.subscribe('notices', listener);
 
   getConnection = (): ConnectionState => this.connection;
@@ -368,6 +435,7 @@ export class OfficeStore implements ClientOfficeStore {
   getSkills = (): SkillsState => this.skillsState;
   getMessages = (): Record<string, DirectMessage[]> => this.messagesByEmployee;
   getPlans = (): PlanReply[] => this.planReplyQueue;
+  getMemory = (): MemoryState => this.memoryState;
   getNotices = (): Notice[] => this.noticeList;
 
   // ------------------------------------------------------------------ plumbing
@@ -432,8 +500,23 @@ export class OfficeStore implements ClientOfficeStore {
 
   /** Bound so panels can pass it straight to `onClick`/`onSelect` props. */
   selectEmployee = (employeeId: string | null): void => {
-    if (this.sel.employeeId === employeeId) return;
-    this.sel = { ...this.sel, employeeId };
+    if (this.sel.employeeId === employeeId && this.sel.vendorId === null) return;
+    // Selecting a person deselects a machine: the inspector shows one thing, and
+    // an employee and a vendor are both "the thing being looked at".
+    this.sel = { ...this.sel, employeeId, vendorId: null };
+    this.emit('selection');
+  };
+
+  /**
+   * Select a third-party vendor's terminal.
+   *
+   * `null` clears the vendor slot without touching the employee slot, which is
+   * what the canvas wants when told "no vendor is selected" while the operator
+   * still has a person open.
+   */
+  selectVendor = (vendorId: string | null): void => {
+    if (this.sel.vendorId === vendorId) return;
+    this.sel = { ...this.sel, vendorId, employeeId: vendorId === null ? this.sel.employeeId : null };
     this.emit('selection');
   };
 
@@ -640,6 +723,15 @@ export class OfficeStore implements ClientOfficeStore {
       case 'routing.decision':
         this.handleRouting(event.runId, event.turnId, event.route, event.at);
         break;
+      case 'memory.created':
+        this.handleMemoryCreated(event.fact, event.superseded, event.at);
+        break;
+      case 'memory.retracted':
+        this.handleMemoryRetracted(event.fact, event.at);
+        break;
+      case 'memory.updated':
+        this.handleMemoryUpdated(event.state, event.at);
+        break;
       case 'usage':
         this.handleUsage(event.employeeId, event.lifetime);
         break;
@@ -772,6 +864,48 @@ export class OfficeStore implements ClientOfficeStore {
       text: `plugins updated · ${loaded} loaded · ${plugins.records.length} installed${
         errored > 0 ? ` · ${errored} errored` : ''
       }`,
+      at,
+    });
+  }
+
+  /**
+   * A fact was written down, or one was corrected.
+   *
+   * The new fact and the fact it replaced arrive in the same frame and are
+   * applied together. Applying only the addition would leave two facts active and
+   * contradicting each other until the next full sync - and the operator would be
+   * looking at exactly the contradiction the correction was made to resolve.
+   */
+  private handleMemoryCreated(fact: MemoryFact, superseded: MemoryFact | null, at: number): void {
+    const facts = upsertById(this.memoryState.facts, fact);
+    const next = superseded === null ? facts : upsertById(facts, superseded);
+    this.memoryState = recountMemory(next, this.memoryState);
+    this.emit('memory');
+    if (superseded === null) {
+      this.pushFeed({ kind: 'memory', text: `remembered · ${truncate(fact.text, 160)}`, at });
+    } else {
+      this.pushFeed({
+        kind: 'memory',
+        text: `corrected · ${truncate(superseded.text, 80)} → ${truncate(fact.text, 120)}`,
+        at,
+      });
+    }
+  }
+
+  /** A fact stopped being true, with nothing replacing it. It stays on record. */
+  private handleMemoryRetracted(fact: MemoryFact, at: number): void {
+    this.memoryState = recountMemory(upsertById(this.memoryState.facts, fact), this.memoryState);
+    this.emit('memory');
+    this.pushFeed({ kind: 'memory', text: `retracted · ${truncate(fact.text, 160)}`, at });
+  }
+
+  /** The server's own memory state, replaced wholesale. */
+  private handleMemoryUpdated(state: MemoryState, at: number): void {
+    this.memoryState = state;
+    this.emit('memory');
+    this.pushFeed({
+      kind: 'memory',
+      text: `memory updated · ${state.facts.length} active fact(s)`,
       at,
     });
   }
@@ -1089,14 +1223,27 @@ export class OfficeStore implements ClientOfficeStore {
   private adoptState(state: OfficeState): void {
     const previousEmployee = this.sel.employeeId;
     const keepEmployee = previousEmployee && state.employees.some((employee) => employee.id === previousEmployee) ? previousEmployee : null;
+    // A vendor removed from the config must not stay selected, or the inspector
+    // would show a panel for something the server no longer knows about and every
+    // field in it would read as blank rather than as gone.
+    const previousVendor = this.sel.vendorId;
+    const keepVendor =
+      previousVendor && state.vendorBay.vendors.some((vendor) => vendor.id === previousVendor) ? previousVendor : null;
     const previousRun = this.sel.runId;
     const keepRun =
       previousRun && state.runs.some((run) => run.id === previousRun)
         ? previousRun
         : state.activeRunIds.find((id) => state.runs.some((run) => run.id === id)) ?? newestRunId(state.runs);
     this.officeState = state;
-    this.sel = { employeeId: keepEmployee, runId: keepRun };
-    this.emit('office', 'selection');
+    // Both slots survive a state push, but only one may be filled - the same
+    // invariant the setters keep, restated here because a full replace does not
+    // go through them.
+    this.sel = { employeeId: keepVendor === null ? keepEmployee : null, vendorId: keepVendor, runId: keepRun };
+    // Memory rides along in the office snapshot, so a full state replace is also
+    // a memory resync. Taking it here is what makes a reconnecting console - which
+    // missed every `memory.created` while it was away - correct again in one step.
+    this.memoryState = state.memory;
+    this.emit('office', 'selection', 'memory');
   }
 
   private setOffice(state: OfficeState): void {

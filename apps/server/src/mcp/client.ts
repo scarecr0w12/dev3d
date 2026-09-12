@@ -17,30 +17,18 @@ import {
   request,
   type JsonRpcId,
   type JsonRpcResponse,
-} from './jsonrpc.ts';
+} from '../rpc/jsonrpc.ts';
+import type { JsonRpcTransport } from '../rpc/transport.ts';
 
 /**
- * What a transport must provide.
+ * What an MCP transport must provide.
  *
- * `send` is fire-and-forget: responses arrive through `onMessage`, which the
- * client registers once. That shape is deliberate — a transport that returned a
- * promise per message would have to match responses to requests itself, which is
- * the client's job.
+ * An alias rather than a second declaration: the contract is protocol-agnostic
+ * and the Agent Client Protocol needs exactly the same one, so it lives in
+ * `rpc/` and this name is kept because "the transport MCP talks to" is what
+ * every call site means by it.
  */
-export interface McpTransport {
-  /** Human-readable name for logs and error messages, e.g. `stdio:npx foo`. */
-  readonly label: string;
-  /** Start the transport. Resolves once it can carry messages. */
-  start(): Promise<void>;
-  /** Send one message. */
-  send(message: unknown): void;
-  /** Register the handler that receives every inbound message. */
-  onMessage(handler: (raw: unknown) => void): void;
-  /** Register a handler for transport-level failure. */
-  onError(handler: (error: Error) => void): void;
-  /** Stop the transport and release whatever it holds. Must be idempotent. */
-  close(): Promise<void>;
-}
+export type McpTransport = JsonRpcTransport;
 
 /** A tool as the server describes it in `tools/list`. */
 export interface McpToolInfo {

@@ -1,0 +1,96 @@
+{
+  "$comment": [
+    "Third-party agent harnesses for the dev3d office.",
+    "",
+    "Where MCP gives dev3d other *tools*, a vendor is another *agent*: Codex,",
+    "DeepSeek Harness, Hermes, OpenClaw, or anything else that takes a prompt and",
+    "produces an answer. An employee hands it a self-contained task and gets a",
+    "written answer back, and each vendor is docked in the 3D office as a rented",
+    "terminal.",
+    "",
+    "One line in DEV3D_VENDORS is usually enough: DEV3D_VENDORS=\"codex;dsh;hermes\".",
+    "This file is for anything that needs more than a preset - a different binary,",
+    "extra arguments, a longer timeout, or a vendor with no preset at all. It wins",
+    "on an id collision with DEV3D_VENDORS, because it is the richer source.",
+    "",
+    "A malformed entry is skipped with a reason rather than taking the list down,",
+    "so one typo costs you that vendor and not the bay.",
+    "",
+    "TWO TRANSPORTS. `command` runs the harness once with a prompt and reads its",
+    "stdout. `acp` speaks the Agent Client Protocol over stdio, which is what",
+    "reaches a whole registry of agents with one implementation and is the only",
+    "transport the office can mediate.",
+    "",
+    "READ-ONLY IS THREE-LEVEL, and the capability declarations below say which you",
+    "have. They are not marketing: the middle one is dev3d's own code refusing",
+    "things on your behalf, and the last one is a request nothing enforces.",
+    "",
+    "  readOnlyEnforcement: \"sandbox\"    the harness confines itself with an",
+    "                                    OS-level sandbox the office asked for.",
+    "                                    Holds for everything the process does.",
+    "  readOnlyEnforcement: \"client\"     dev3d mediates over ACP: writes refused,",
+    "                                    reads confined to the run's workspace,",
+    "                                    every reported tool call put to a human.",
+    "                                    Constrains what it does through dev3d,",
+    "                                    not what it does to the machine.",
+    "  readOnlyEnforcement: \"requested\"  the task text asks and nothing enforces",
+    "                                    it. Each delegation is held for human",
+    "                                    approval before it starts.",
+    "",
+    "Enabled vendors are probed at boot with `--version` (in the background; the",
+    "office does not wait). A `probeArgs` of [] means do not check and assume it",
+    "is present. Re-check from the Vendors page after installing a harness.",
+    "",
+    "Which roles may delegate is DEV3D_VENDOR_GRANT_ROLES (default: the roles",
+    "marked canDelegate on the org chart), and DEV3D_VENDOR_REQUIRE_CAN_DELEGATE",
+    "keeps that second gate on. Delegating starts a third-party process against a",
+    "project directory, so both gates are deliberate and both default closed."
+  ],
+  "vendors": [
+    {
+      "id": "codex",
+      "preset": "codex",
+      "description": "OpenAI Codex in one-shot exec mode. The only preset that enforces read-only itself, because -s read-only is a real sandbox mode.",
+      "enabled": true
+    },
+    {
+      "id": "dsh",
+      "preset": "dsh",
+      "description": "DeepSeek Harness in headless mode. Read-only is requested, not enforced. Slower to first output than Codex, because it mounts a profile and boots an agent.",
+      "timeoutMs": 900000,
+      "enabled": true
+    },
+    {
+      "id": "hermes",
+      "preset": "hermes",
+      "description": "Nous Research Hermes. Reads ~/.hermes/config.yaml for its own provider and key; run `hermes config set` first, or every delegation will fail with an auth error.",
+      "enabled": true
+    },
+    {
+      "id": "openclaw",
+      "preset": "openclaw",
+      "description": "OpenClaw, driven over the Agent Client Protocol. `openclaw acp` bridges to a running OpenClaw Gateway over WebSocket, so start the Gateway first. Read-only is enforced by dev3d: writes are refused and reads are confined by the office.",
+      "enabled": true
+    },
+    {
+      "id": "local-agent",
+      "description": "An example of a vendor with no preset. The office appends the task as the last argument, runs it in the run's workspace, and reads stdout as the answer. Copy it and change the command.",
+      "transport": "command",
+      "command": "node",
+      "args": ["/opt/agents/run.mjs", "--quiet", "--no-write"],
+      "promptTransport": "argv",
+      "outputFormat": "text",
+      "probeArgs": [],
+      "timeoutMs": 300000,
+      "authNote": "Authenticates with a token in /etc/local-agent/token.",
+      "color": "#c084fc",
+      "capabilities": {
+        "readOnlyEnforcement": "requested",
+        "reportsFiles": false,
+        "streams": false,
+        "reportsCost": false
+      },
+      "enabled": false
+    }
+  ]
+}
