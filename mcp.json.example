@@ -1,0 +1,48 @@
+{
+  "$comment": [
+    "MCP servers for the dev3d office.",
+    "",
+    "Copy this file to `mcp.json` (or point DEV3D_MCP_CONFIG at it) and edit the",
+    "servers you want. Nothing here is enabled until a server is listed, so an",
+    "absent mcp.json means no MCP at all.",
+    "",
+    "Every server's tools are published to employees as mcp__<id>__<tool>, so the",
+    "`id` you choose is part of the name a role is granted. Two servers may both",
+    "offer a tool called `search` without colliding.",
+    "",
+    "Which roles may call these tools is DEV3D_MCP_GRANT_ROLES (default: the roles",
+    "that already hold run_shell). A remote server can be a filesystem, a database",
+    "or a deployment system, so tools are granted deliberately and never inherited."
+  ],
+  "servers": [
+    {
+      "id": "fs",
+      "description": "Read and write files through the reference filesystem server.",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "enabled": false
+    },
+    {
+      "id": "git",
+      "description": "Repository history and diffs, over MCP.",
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "."],
+      "enabled": false
+    },
+    {
+      "id": "memory",
+      "description": "A knowledge graph the office can write notes into.",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "enabled": false
+    },
+    {
+      "id": "remote",
+      "description": "A hosted MCP server over Streamable HTTP. Headers are sent verbatim: no ${VAR} interpolation happens here, so keep a secret in a file this repository ignores, or set DEV3D_MCP_SERVERS for a local server instead.",
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "authorization": "Bearer paste-your-token-here" },
+      "enabled": false
+    }
+  ]
+}

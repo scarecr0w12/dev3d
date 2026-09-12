@@ -17,7 +17,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
-import type { ClientCommand, QualityOpinion, ServerEvent, SkillSummary } from '@dev3d/core';
+import type { ClientCommand, McpServerStatus, QualityOpinion, ServerEvent, SkillSummary } from '@dev3d/core';
 import { toSkillSummary } from '@dev3d/core';
 import { loadConfig, detectConfigDrift } from './config.ts';
 import type { ProviderConfig } from './config.ts';
@@ -29,6 +29,7 @@ import { createPooledService } from './llm/pooled.ts';
 import { createBenchmarkService } from './llm/benchmarks.ts';
 import { createHealthService } from './llm/health.ts';
 import { createPluginHost, type PluginHost } from './plugins/host.ts';
+import { loadMcpConfig, McpManager } from './mcp/index.ts';
 import { createRuntime, type LogFn, type Runtime } from './server/runtime.ts';
 import { loadSkills, loadSkillsWithReport } from './skills/loader.ts';
 import { openStore } from './store/store.ts';
@@ -137,6 +138,9 @@ async function main(): Promise<void> {
   // Two holders break the cycle without either owning the other.
   let pluginHostRef: PluginHost | null = null;
   let runtimeRef: Runtime | null = null;
+  // Held so shutdown can close every MCP connection rather than leaving child
+  // processes behind.
+  let mcpRef: McpManager | null = null;
 
   /** How many recent turns the learned layer reads. Bounded, and generous. */
   const LEARNED_TURN_WINDOW = 2_000;
@@ -306,6 +310,38 @@ async function main(): Promise<void> {
   const tools = createToolRegistry();
   for (const tool of createDefaultTools()) tools.register(tool);
 
+  /**
+   * MCP servers, if any are configured.
+   *
+   * Built before the runtime so the runtime can ask which MCP tools exist. The
+   * connections themselves are made in the background: a server that is slow,
+   * down or missing must not delay the office opening, so nothing here is
+   * awaited except the config read.
+   */
+  const mcpConfig = config.mcpEnabled
+    ? loadMcpConfig(process.env, config.repoRoot)
+    : { servers: [], problems: [], file: null };
+  for (const problem of mcpConfig.problems) {
+    log('warn', 'mcp', problem);
+  }
+  const mcp = new McpManager({
+    registry: tools,
+    log: (level, scope, message) => log(level, scope, message),
+    clientName: 'dev3d',
+    clientVersion: config.version,
+  });
+  mcpRef = mcp;
+  if (mcpConfig.servers.length > 0) {
+    log(
+      'info',
+      'mcp',
+      `${mcpConfig.servers.length} server(s) configured${mcpConfig.file === null ? '' : ` from ${mcpConfig.file}`}; connecting in the background`,
+    );
+    void mcp.start(mcpConfig.servers).catch((e: unknown) => {
+      log('error', 'mcp', `start failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  }
+
   const runtime = createRuntime({
     config,
     store,
@@ -315,6 +351,10 @@ async function main(): Promise<void> {
     // The runtime filters a tool grant against this, so an unknown name is
     // dropped at the door instead of becoming a grant that never resolves.
     toolNames: () => tools.names(),
+    // Handed over separately so a remote tool is granted deliberately: see
+    // `mcpGrantRoles` in config.ts.
+    mcpToolNames: () => mcp.toolNames(),
+    mcpStatus: () => mcp.status() as McpServerStatus[],
   });
   runtimeRef = runtime;
 
@@ -1470,13 +1510,21 @@ async function main(): Promise<void> {
     for (const ws of clients) ws.close(1001, 'server shutting down');
     wss.close();
     server.close(() => {
-      runtime.close();
-      store.close();
-      log('info', 'boot', 'stopped');
-      process.exit(0);
+      void (async () => {
+        // Close MCP connections before exiting, or every stdio server that was
+        // spawned would outlive the office as an orphan.
+        await mcpRef?.close().catch((e: unknown) => {
+          log('warn', 'mcp', `shutdown: ${e instanceof Error ? e.message : String(e)}`);
+        });
+        runtime.close();
+        store.close();
+        log('info', 'boot', 'stopped');
+        process.exit(0);
+      })();
     });
-    // Do not let a wedged socket keep the process alive forever.
-    setTimeout(() => process.exit(0), 3_000).unref();
+    // Do not let a wedged socket - or a server that will not exit - keep the
+    // process alive forever.
+    setTimeout(() => process.exit(0), 4_000).unref();
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));

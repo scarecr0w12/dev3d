@@ -500,6 +500,7 @@ function toolContext(workspaceRoot: string): ToolContext {
   return {
     workspaceRoot,
     writtenPaths: new Set<string>(),
+    plan: [],
     requestApproval: async () => true,
     autoApproveShell: true,
     log: () => {},

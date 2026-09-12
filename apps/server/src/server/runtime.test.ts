@@ -20,7 +20,7 @@ import { resolveStyle } from '@dev3d/core';
 import { createProviderRegistry } from '../llm/registry.ts';
 import { defaultWorkspace } from '../org/defaultCompany.ts';
 import { openStore } from '../store/store.ts';
-import { createRuntime, migrateOffice, type Runtime } from './runtime.ts';
+import { createRuntime, mcpGrantedForRole, migrateOffice, type Runtime } from './runtime.ts';
 
 interface Harness {
   runtime: Runtime;
@@ -367,4 +367,59 @@ test('setting a style on a floor that does not exist is refused, not silently ig
   } finally {
     h.cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------
+// MCP grants
+//
+// A connected MCP server can be somebody else's filesystem, database or
+// deployment system. Deciding who may call it is therefore a security decision,
+// and it gets tested as one: directly, on the rule, rather than inferred from a
+// server that happened to connect.
+// ---------------------------------------------------------------------------
+
+const dev = { id: 'frontend-dev-1', allowedTools: ['read_file', 'run_shell'] };
+const ceo = { id: 'ceo', allowedTools: ['read_file', 'write_file'] };
+
+test('by default the MCP tools go to the roles that already hold run_shell', () => {
+  const config = { mcpGrantRoles: ['shell-roles'], mcpGrantToShellRoles: true };
+  assert.equal(mcpGrantedForRole(dev, config), true);
+  assert.equal(
+    mcpGrantedForRole(ceo, config),
+    false,
+    'a role that cannot run a command should not inherit a remote server',
+  );
+});
+
+test('an explicit role list grants only those roles', () => {
+  const config = { mcpGrantRoles: ['ceo'], mcpGrantToShellRoles: false };
+  assert.equal(mcpGrantedForRole(ceo, config), true);
+  assert.equal(mcpGrantedForRole(dev, config), false, 'run_shell is not a free pass when a list is given');
+});
+
+test('"*" grants every role', () => {
+  const config = { mcpGrantRoles: ['*'], mcpGrantToShellRoles: false };
+  assert.equal(mcpGrantedForRole(ceo, config), true);
+  assert.equal(mcpGrantedForRole(dev, config), true);
+});
+
+test('an empty list grants nobody, which is the default-deny case', () => {
+  const config = { mcpGrantRoles: [], mcpGrantToShellRoles: false };
+  assert.equal(mcpGrantedForRole(ceo, config), false);
+  assert.equal(mcpGrantedForRole(dev, config), false);
+});
+
+test('a role with neither run_shell nor a named grant gets nothing', () => {
+  const qa = { id: 'qa-lead', allowedTools: ['read_file'] };
+  const config = { mcpGrantRoles: ['shell-roles'], mcpGrantToShellRoles: true };
+  assert.equal(mcpGrantedForRole(qa, config), false);
+});
+
+test('the shipped config grants MCP to the roles holding run_shell', () => {
+  // Guards the default itself: if `mcpGrantToShellRoles` ever stops being what
+  // DEV3D_MCP_GRANT_ROLES defaults to, this fails.
+  const config = loadConfig();
+  assert.equal(config.mcpGrantToShellRoles, true);
+  const role = { id: 'frontend-dev-1', allowedTools: ['run_shell'] };
+  assert.equal(mcpGrantedForRole(role, config), true);
 });

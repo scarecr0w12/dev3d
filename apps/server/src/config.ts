@@ -166,6 +166,30 @@ export interface ServerConfig {
    * all. Off by default: installing runs someone else's code in this process.
    */
   allowPluginInstall: boolean;
+  /**
+   * Whether to connect to the MCP servers named by `DEV3D_MCP_SERVERS` and
+   * `mcp.json` at all.
+   *
+   * On by default, but it does nothing until a server is configured: with no
+   * servers named, nothing is spawned and nothing is fetched.
+   */
+  mcpEnabled: boolean;
+  /** Path to the MCP server config file, or null when none was named. */
+  mcpConfigPath: string | null;
+  /**
+   * Role ids that may call MCP tools.
+   *
+   * `'*'` means every role; `'shell-roles'` (the default) means every role that
+   * already holds the `run_shell` tool, which is the closest built-in equivalent
+   * in reach; an empty list means nobody.
+   *
+   * A remote server's tools are more powerful than any built-in — they can be a
+   * filesystem, a database, a browser — so they are granted deliberately rather
+   * than inherited from the fact that a server happens to be connected.
+   */
+  mcpGrantRoles: string[];
+  /** True when `mcpGrantRoles` means "whoever already has run_shell". */
+  mcpGrantToShellRoles: boolean;
   /** Resolved mode: `live` only when a provider is actually configured. */
   llmMode: LlmMode;
   /** What the operator asked for, before resolving `auto`. */
@@ -292,8 +316,11 @@ function buildProviders(): ProviderConfig[] {
       keyEnvVar: 'OPENROUTER_API_KEY',
       hint: 'Set OPENROUTER_API_KEY to reach many vendors through one route.',
       extraHeaders: {
-        'HTTP-Referer': 'https://github.com/dev3d',
-        'X-Title': 'dev3d office',
+        // OpenRouter uses these for attribution on its leaderboards. The default
+        // names this project rather than a path that does not resolve, and both
+        // are overridable so a fork can attribute itself.
+        'HTTP-Referer': str('DEV3D_OPENROUTER_REFERER', 'https://github.com/scarecr0w12/dev3d'),
+        'X-Title': str('DEV3D_OPENROUTER_TITLE', 'dev3d office'),
       },
     },
     {
@@ -386,6 +413,27 @@ export function loadConfig(): ServerConfig {
     pluginsDir: abs('DEV3D_PLUGINS_DIR', './plugins'),
     pluginInstallDir: abs('DEV3D_PLUGIN_INSTALL_DIR', './data/plugins'),
     allowPluginInstall: str('DEV3D_ALLOW_PLUGIN_INSTALL', 'false').toLowerCase() === 'true',
+    mcpEnabled: str('DEV3D_MCP', 'true').toLowerCase() !== 'false',
+    mcpConfigPath: (() => {
+      // An empty value disables the file entirely, which is how a deployment
+      // that configures servers through DEV3D_MCP_SERVERS alone avoids reading
+      // a file it does not own.
+      const raw = process.env['DEV3D_MCP_CONFIG'];
+      if (raw === '') return null;
+      return abs('DEV3D_MCP_CONFIG', './mcp.json');
+    })(),
+    ...(() => {
+      // Read once, then decide: `mcpGrantRoles` is the parsed list and the
+      // companion boolean says whether it means "whoever has run_shell".
+      const raw = str('DEV3D_MCP_GRANT_ROLES', 'shell-roles').trim();
+      const lower = raw.toLowerCase();
+      const shellRoles = lower === 'shell-roles' || raw === 'run_shell';
+      const roles = raw === '*' ? ['*'] : lower === 'none' ? [] : shellRoles ? ['shell-roles'] : raw
+        .split(/[,\s]+/)
+        .map((part) => part.trim())
+        .filter((part) => part !== '');
+      return { mcpGrantRoles: roles, mcpGrantToShellRoles: shellRoles };
+    })(),
     modelDiscovery: str('DEV3D_MODEL_DISCOVERY', 'true').toLowerCase() !== 'false',
     discoveryTtlMs: Math.max(0, num('DEV3D_MODEL_DISCOVERY_TTL_MS', 6 * 60 * 60 * 1000)),
     discoveryCachePath: (() => {

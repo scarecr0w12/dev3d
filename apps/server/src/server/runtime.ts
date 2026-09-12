@@ -47,6 +47,7 @@ import type {
   WorkspaceSummary,
   PluginPersistedState,
   PluginSystemState,
+  McpServerStatus,
 } from '@dev3d/core';
 import {
   DEFAULT_STYLE_PRESET,
@@ -353,6 +354,30 @@ export function migrateOffice(raw: unknown, config: ServerConfig): Office {
 // runtime
 // ---------------------------------------------------------------------------
 
+/**
+ * Which roles may call MCP tools.
+ *
+ * Exported and pure so the rule can be tested on its own, rather than inferred
+ * from a full runtime: this decides whether an employee can reach somebody
+ * else's filesystem, database or deployment system, so it is the one part of the
+ * MCP integration worth pinning down directly.
+ *
+ * Default-deny. A remote MCP server is more powerful than any built-in tool, so
+ * its tools are handed out deliberately rather than inherited by everyone who can
+ * read a file. By default they go to the roles that already hold `run_shell` —
+ * the closest built-in equivalent in reach — so connecting a server widens
+ * nobody's reach beyond what they already had.
+ */
+export function mcpGrantedForRole(
+  role: Pick<Role, 'id' | 'allowedTools'>,
+  config: Pick<ServerConfig, 'mcpGrantRoles' | 'mcpGrantToShellRoles'>,
+): boolean {
+  if (config.mcpGrantToShellRoles) return role.allowedTools.includes('run_shell');
+  const grants = config.mcpGrantRoles;
+  if (grants.length === 0) return false;
+  return grants.includes('*') || grants.includes(role.id);
+}
+
 export function createRuntime(opts: {
   config: ServerConfig;
   store: Store;
@@ -366,6 +391,15 @@ export function createRuntime(opts: {
    * has no registry at all.
    */
   toolNames?: () => string[];
+  /**
+   * The MCP tools currently published, so they can be granted to roles.
+   *
+   * Separate from `toolNames` because a remote tool is not automatically a
+   * grant: it has to be handed to a role deliberately. See `mcpGrantRoles`.
+   */
+  mcpToolNames?: () => string[];
+  /** MCP server status for the console. */
+  mcpStatus?: () => McpServerStatus[];
 }): Runtime {
   const { config, store, registry, log } = opts;
 
@@ -913,13 +947,33 @@ export function createRuntime(opts: {
     };
   }
 
+  /**
+   * The role as the engine should see it, with the published MCP tools added to
+   * its grant when it is allowed them.
+   *
+   * Returns the role untouched in the common case, so nothing downstream sees a
+   * different object than the one the org chart holds.
+   */
+  function withMcpGrants(role: Role | undefined): Role | undefined {
+    if (role === undefined) return undefined;
+    if (!mcpGrantedForRole(role, config)) return role;
+    const mcpTools = opts.mcpToolNames?.() ?? [];
+    if (mcpTools.length === 0) return role;
+    const missing = mcpTools.filter((name) => !role.allowedTools.includes(name));
+    if (missing.length === 0) return role;
+    return { ...role, allowedTools: [...role.allowedTools, ...missing] };
+  }
+
   const orgAccess: OrgAccess = {
     chart: (workspaceId) => {
       const workspace = workspaceById(workspaceId) ?? office.workspaces[0];
       if (!workspace) return { company: defaultCompany(), departments: [], roles: [], pipelineIds: [], updatedAt: Date.now() };
       return workspace.org;
     },
-    role: (roleId, workspaceId) => workspaceById(workspaceId)?.org.roles.find((role) => role.id === roleId),
+    // MCP tools are added at the point of use rather than written into the org
+    // chart, because a server can come and go while the office is running: the
+    // chart is the operator's document, and the tools are the network's.
+    role: (roleId, workspaceId) => withMcpGrants(workspaceById(workspaceId)?.org.roles.find((role) => role.id === roleId)),
     workspace: (workspaceId) => workspaceById(workspaceId),
     workspaces: () => office.workspaces,
   };
@@ -990,6 +1044,12 @@ export function createRuntime(opts: {
         allowInstall: config.allowPluginInstall,
         records: [],
         sources: [],
+      },
+      mcp: {
+        enabled: config.mcpEnabled,
+        configPath: config.mcpConfigPath,
+        grantRoles: [...config.mcpGrantRoles],
+        servers: opts.mcpStatus?.() ?? [],
       },
       workspaces: summaries(),
       company: structuredClone(workspace?.org.company ?? defaultCompany()),
