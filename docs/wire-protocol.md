@@ -64,6 +64,7 @@ nothing to persist.
 | `POST /api/models/discover` | Ask providers what they serve |
 | `POST /api/models/benchmarks` | Refresh pooled quality; returns coverage |
 | `POST /api/models/health` | Sample upstream endpoint uptime |
+| `POST /api/mcp/refresh` | Re-read the MCP server config and reconnect; answers with the resulting status |
 
 A malformed body is a `400` with a message, never a `500`.
 

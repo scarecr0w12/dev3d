@@ -199,6 +199,12 @@ const grepTool: Tool = {
         description: `Lines of context to show around each match, 0-${MAX_CONTEXT} (default 0).`,
       },
       ignoreCase: { type: 'boolean', description: 'Case-insensitive matching (default false).' },
+      filesOnly: {
+        type: 'boolean',
+        description:
+          'Return just the paths that contain a match, one per line, instead of the matching ' +
+          'lines. Use this to find which files mention something.',
+      },
       limit: { type: 'number', description: `Maximum matches to return (default ${MAX_GREP_MATCHES}).` },
     },
     required: ['pattern'],
@@ -287,6 +293,20 @@ const grepTool: Tool = {
         };
       }
 
+      const files = new Set(matches.map((m) => m.rel));
+      if (args.filesOnly === true) {
+        // A file list answers "which files mention this?" without the noise of
+        // every matching line, which is the question behind most refactors.
+        const listed = [...files].sort();
+        const suffix = truncated ? `\n(truncated at ${limit} matches; narrow the pattern, path or include)` : '';
+        return {
+          ok: true,
+          content: listed.join('\n') + suffix,
+          preview: `${listed.length} file(s) match ${args.pattern}`,
+          affectsPaths: [],
+        };
+      }
+
       // With context, hits are rendered as separated blocks; without it, the
       // usual `file:line: text` is far denser and easier to scan.
       const body =
@@ -294,11 +314,10 @@ const grepTool: Tool = {
           ? matches.map((m) => m.block.join('\n')).join('\n--\n')
           : matches.map((m) => `${m.rel}:${m.line}: ${m.text}`).join('\n');
       const suffix = truncated ? `\n(truncated at ${limit} matches; narrow the pattern, path or include)` : '';
-      const files = new Set(matches.map((m) => m.rel)).size;
       return {
         ok: true,
         content: body + suffix,
-        preview: `${matches.length} match(es) in ${files} file(s)`,
+        preview: `${matches.length} match(es) in ${files.size} file(s)`,
         affectsPaths: [],
       };
     } catch (e) {

@@ -863,6 +863,76 @@ generated room.
 
 ---
 
+## The run engine
+
+### Every declared control is enforced
+
+`Role.maxTurnsPerStage` was declared on the shared contract, populated for all
+thirteen shipped roles with individually tuned values, copied through `toRole`, and
+read by nothing at all. An operator could open the org chart, see a per-employee
+limit, change it, and change nothing.
+
+It is now enforced at the single point every stage mode passes through, which is
+what makes it true of `single`, `parallel`, `debate` and `review-loop` alike. The
+count is per role per stage, so a debate's rounds and a review loop's iterations
+draw on the same allowance rather than resetting each time round.
+
+Two properties make the cap safe to turn on:
+
+- **The shipped values let the shipped pipelines finish.** Debate defaults to two
+  rounds and review-loop to two iterations, and the CEO — who opens and rules on
+  both — carries a cap of two. Lowering a cap below what a stage needs truncates
+  that stage deliberately; a test runs the real pipelines and asserts no shipped
+  role is ever refused, so a future change that breaks that is caught.
+- **A refusal is loud.** Skipping a role silently would be indistinguishable from
+  an employee choosing not to speak, so it emits a warning naming the role, the
+  cap and the stage, and says which knob to turn.
+
+### What counts as a finished turn
+
+A turn could exhaust its tool-round-trip budget, or be cut off by the model's
+output limit, and still record itself as `done` with an `error` set. The stage
+failure rules read `stage.error` and empty turns, never `turn.error`, so an
+unconverged turn was invisible everywhere except its own record — the run reported
+success while an employee had been stopped mid-task.
+
+Both cases now settle as `failed`, with the text it did produce kept. Reporting it
+as finished hid the difference between converging and being cut off, and that
+difference is the one an operator needs.
+
+### An unresolved review is a failure, not a summary
+
+A review-loop that ends with the chair objecting — because there is no producer
+outside the stage to send the work back to, or because the iteration cap was
+reached — used to return the objection text as the stage's summary. The next stage
+then received a rejection and read it as the decision to build on, which is the
+worst possible way for a failed review to behave.
+
+It is now recorded two ways: the summary carries an `UNRESOLVED REVIEW` marker, and
+the outcome sets the stage's error so the existing failure path applies — the run
+stops there unless the stage is `optional`, and the reason is in the log.
+
+Gating on this made a second problem visible: the objection heuristic matched
+`⚠` and the phrase "must not crash", so the scripted provider's *approving* review
+matched it. Reading advice as a refusal is the opposite error and just as costly,
+so the heuristic is now restricted to language that actually withholds approval
+("not acceptable", "blocking", "changes required", `❌`) and a test pins both
+directions — including that "Risk" and "Suggestion" are advice.
+
+### Roles say what they can do
+
+The prompt told a role with reports that it "may delegate". Nothing in the engine
+can hand work to a report: assignment is the pipeline's `roleIds` and the producers
+a run has already recorded, and an employee can change neither. That is a promise
+the model cannot keep, and the same house rules the prompt carries forbid an
+employee from claiming work it did not do.
+
+The line now states the scope — you are accountable for the people who report to
+you, the pipeline assigns their stages — and points at the thing that does work:
+say what you need done, and the plan picks it up.
+
+---
+
 ## Persistence
 
 `node:sqlite` is built into Node 24, so dev3d has a real database with zero

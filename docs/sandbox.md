@@ -67,7 +67,7 @@ It needs a piped child process, so under a sandbox that blocks one it reports
 itself as **skipped, with that reason**, rather than failing. It still runs, and
 still has to pass, anywhere child processes are allowed.
 
-That is why the suite reads `402 tests — 399 pass, 3 skipped`.
+That is why the suite reads `415 tests — 411 pass, 4 skipped`.
 
 ## Headless Chrome
 

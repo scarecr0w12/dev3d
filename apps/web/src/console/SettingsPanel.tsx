@@ -894,6 +894,29 @@ export function SettingsPanel() {
 function McpSettings() {
   const office = useOffice();
   const state = office?.mcp;
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  /**
+   * Re-read the server file and reconnect.
+   *
+   * The server broadcasts the resulting state, so nothing here has to patch the
+   * store: the console re-renders from the event like it does for every other
+   * change.
+   */
+  const refresh = useCallback(async () => {
+    setBusy(true);
+    setNote(null);
+    const result = await api.refreshMcp();
+    setBusy(false);
+    if (!result.ok) {
+      setNote(result.error ?? 'The refresh failed.');
+      return;
+    }
+    const servers = result.data?.servers?.length ?? 0;
+    setNote(servers === 0 ? 'Refreshed: no servers are configured.' : `Refreshed ${servers} server(s).`);
+  }, []);
+
   if (!state) return <Empty title="No MCP state" hint="Waiting for the orchestrator." />;
 
   if (!state.enabled) {
@@ -940,9 +963,21 @@ function McpSettings() {
         </div>
       </div>
 
+      <div className="mcp-actions">
+        <button type="button" className="btn btn-sm" onClick={() => void refresh()} disabled={busy}>
+          {busy ? 'Refreshing…' : 'Reload servers'}
+        </button>
+        <span className="dim small">
+          Re-reads <span className="mono">mcp.json</span> and reconnects, so an edit takes effect without
+          restarting the orchestrator.
+        </span>
+      </div>
+
       <div className="dim small">
         Config file: <span className="mono">{state.configPath ?? '(none — DEV3D_MCP_SERVERS only)'}</span>
       </div>
+
+      {note ? <div className="dim small">{note}</div> : null}
 
       {state.servers.length === 0 ? (
         <Empty

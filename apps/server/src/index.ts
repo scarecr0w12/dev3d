@@ -983,6 +983,38 @@ async function main(): Promise<void> {
       // guess what an attempt changed, and a provider that could not be reached
       // is a 200 carrying the reason rather than an error: the request
       // succeeded, and "I could not ask" is the answer.
+      /**
+       * Re-read the MCP configuration and reconnect.
+       *
+       * Servers are configured in a file, and editing that file used to require a
+       * restart before anything noticed. This is the operator asking, in the same
+       * spirit as the marketplace only updating when asked: a new server is picked
+       * up, a removed one is disconnected and its tools withdrawn, and the ones
+       * that were already connected are left alone.
+       */
+      if (path === '/api/mcp/refresh' && req.method === 'POST') {
+        if (mcpRef === null) {
+          sendJson(res, 503, { error: 'MCP is not running in this process.' });
+          return;
+        }
+        const fresh = config.mcpEnabled
+          ? loadMcpConfig(process.env, config.repoRoot)
+          : { servers: [], problems: [], file: null };
+        for (const problem of fresh.problems) log('warn', 'mcp', problem);
+        await mcpRef.refresh(fresh.servers);
+        const status = mcpRef.status();
+        log(
+          'info',
+          'mcp',
+          `refresh: ${status.filter((s) => s.state === 'ready').length}/${status.length} server(s) ready`,
+        );
+        // The console shows server state and tool counts, so a refresh has to
+        // reach it — the same full-state event every other change uses.
+        broadcast({ type: 'office.updated', state: runtime.state(), at: Date.now() });
+        sendJson(res, 200, { servers: status, problems: fresh.problems, file: fresh.file });
+        return;
+      }
+
       if (path === '/api/models/discover' && req.method === 'POST') {
         const body = await readJson<{ providerId?: unknown; force?: unknown }>(req, res);
         if (body === null) return;

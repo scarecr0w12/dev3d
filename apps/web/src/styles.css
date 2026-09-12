@@ -4626,6 +4626,14 @@ body.is-resizing {
     background: rgba(255, 255, 255, 0.015);
   }
 
+  .mcp-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: 12px 0 4px;
+  }
+
   .mcp-server .mcp-head {
     display: flex;
     align-items: center;

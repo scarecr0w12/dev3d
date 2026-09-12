@@ -210,6 +210,17 @@ export const api = {
       body: JSON.stringify(limit === undefined ? {} : { limit }),
     }),
   /**
+   * Re-reads the MCP server configuration and reconnects.
+   *
+   * Servers live in a file, so this is how an edit takes effect without
+   * restarting the orchestrator. The server answers with the resulting status,
+   * and also broadcasts the new state so every console updates.
+   */
+  refreshMcp: () =>
+    request<{ servers: unknown[]; problems: string[]; file: string | null }>('/api/mcp/refresh', 60_000, {
+      method: 'POST',
+    }),
+  /**
    * Fallback path for a direct chat when the socket is not open. Normally the
    * `chat` command goes over the WebSocket and the reply arrives as a
    * `direct.message` event.

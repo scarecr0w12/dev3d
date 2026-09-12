@@ -259,6 +259,37 @@ test('grep reports no matches as success', async () => {
   }
 });
 
+test('grep filesOnly returns paths, one per line, deduplicated', async () => {
+  const root = makeTempWorkspace();
+  try {
+    seed(root);
+    // alpha.ts has one NEEDLE; guide.md has one. Deliberately repeated inside a
+    // file to prove the path is listed once.
+    writeFileSync(join(root, 'src', 'alpha.ts'), 'export const alpha = 1;\n// NEEDLE here\n// NEEDLE again\n');
+    const res = await find('grep').run({ pattern: 'NEEDLE', filesOnly: true }, makeContext(root));
+    assert.equal(res.ok, true);
+    const lines = res.content.split('\n').filter((l) => l !== '');
+    assert.deepEqual(lines.sort(), ['docs/guide.md', 'src/alpha.ts']);
+    // The matching lines themselves must not be included in this mode.
+    assert.doesNotMatch(res.content, /NEEDLE here/);
+    assert.match(res.preview, /2 file\(s\) match/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('grep filesOnly says so when nothing matches', async () => {
+  const root = makeTempWorkspace();
+  try {
+    seed(root);
+    const res = await find('grep').run({ pattern: 'absent', filesOnly: true }, makeContext(root));
+    assert.equal(res.ok, true);
+    assert.match(res.content, /No matches for/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('grep bounds its result count', async () => {
   const root = makeTempWorkspace();
   try {

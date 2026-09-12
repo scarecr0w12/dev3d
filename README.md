@@ -180,10 +180,26 @@ Knowledge accumulates across the run: stage summaries, artifacts, written files 
 who wrote them are threaded forward, so a reviewer sees the real files and a report
 sees the decision the workshop reached.
 
+**Each role carries a per-stage turn cap** (`maxTurnsPerStage`, editable in the org
+chart). A role that reaches it is skipped for the rest of that stage, and the skip
+is logged by name — so a debate or a review loop is bounded per employee as well as
+by the stage's own rounds, and a truncated deliberation says so rather than looking
+like an employee that chose not to speak. The shipped values let every shipped
+pipeline finish without ever reaching them.
+
+A turn that **runs out of room** — the tool-round-trip budget, or the model's output
+limit — is recorded as failed rather than done, keeping whatever it produced.
+Reporting it as finished hid the difference between converging and being cut off.
+
 ### Failure policy
 
 - A stage that produces nothing halts the run, unless the stage is `optional`.
 - An optional stage that fails is recorded and the run continues.
+- **A review that ends with its objections unresolved fails its stage.** The chair's
+  rejection is recorded with an `UNRESOLVED REVIEW` marker as the stage's error, so
+  the failure path applies and the reason is visible. It previously became the stage
+  summary verbatim, which meant the next stage read a failed review as the decision
+  to build on.
 - Exceeding the budget always halts the run.
 - A tool that fails returns `ok: false` with an actionable message instead of
   throwing, so the employee can correct course rather than dying.
@@ -285,6 +301,7 @@ GET    /api/providers          → status, including how each model list was obt
 POST   /api/models/discover    { providerId?, force? }
 POST   /api/models/benchmarks  → refresh pooled quality; returns coverage
 POST   /api/models/health      { limit? }  → sample endpoint uptime
+POST   /api/mcp/refresh        → re-read the MCP config and reconnect
 ```
 
 Prices in the curated table are **estimates for routing and display, not billing
@@ -303,13 +320,13 @@ Fourteen built-in tools:
 | `list_dir` | A directory as a small tree. |
 | `read_file` | A UTF-8 file with line numbers, paged. |
 | `glob` | Find files by path pattern, newest first (`**/*.test.ts`). |
-| `grep` | Search file contents by regex, with context lines and include/exclude filters. |
+| `grep` | Search file contents by regex, with context lines, include/exclude filters, and a `filesOnly` mode that lists the files instead of the lines. |
 | `search_files` | A one-directory regex search, kept for compatibility with existing skills. |
 | `write_file` | Create or overwrite a file, making parent directories. |
 | `edit_file` | Replace one exact literal string in a file. |
 | `apply_patch` | Several exact-text edits across files, applied atomically. |
-| `run_shell` | Run a command in the workspace. The only approval-gated tool. |
-| `git` | Read-only repository inspection: status, diff, log, show, blame and more. |
+| `run_shell` | Run a command in the workspace. Approval-gated. |
+| `git` | Inspect the repository without asking (`status`, `diff`, `log`, `show`, `blame`, …), and save work with approval (`add`, `commit`, `checkout -b`, `stash push`, `cherry-pick`, `tag`). |
 | `web_search` | Search the web. |
 | `web_fetch` | Fetch one URL and return its text. |
 
@@ -319,11 +336,14 @@ Fourteen built-in tools:
 - The root it resolves against is **the workspace of the run being served**, not a
   single global directory, so two projects can be worked on at once and neither can
   see the other's files.
-- `run_shell` is the only tool that goes through a human approval round trip, and
-  the only one that can be switched off safety-wise — see
-  `DEV3D_AUTO_APPROVE_SHELL`. `git` is deliberately outside that gate because it
-  cannot write: its subcommands and arguments are allow-listed, and anything that
-  could change the repository is refused by name.
+- **Saving work is gated; looking is not.** `run_shell` and the writing half of
+  `git` go through a human approval round trip, and both can be switched off
+  safety-wise — see `DEV3D_AUTO_APPROVE_SHELL`. `git` splits by what a command can
+  do: `status`, `diff`, `log` and their kin never ask, while `add`, `commit`,
+  `checkout -b`, `stash push` and `cherry-pick` do. Commands that destroy work or
+  skip the hooks a project installed (`--hard`, `--force`, `--no-verify`, `clean`)
+  are refused outright on either path, and only `checkout -b` is allowed from
+  `checkout`, because switching branches can discard uncommitted changes.
 - Grants are enforced per employee: the org chart decides who may hold a tool, and
   anything else is refused with a message the model can act on.
 
@@ -386,7 +406,11 @@ server widens nobody's reach beyond what they already had.
 **A server that is down is not a failure of the office.** Connections are made in
 the background after the HTTP listener is open, a failed server is recorded with
 its reason and the last thing it printed on stderr, and the others keep working.
-Settings → **MCP** shows every configured server, its state and its tool count.
+Settings → **MCP** shows every configured server, its state and its tool count, and
+has a **Reload servers** button that re-reads the config and reconnects — so editing
+`mcp.json` takes effect without restarting the orchestrator. A server that was
+removed is disconnected and its tools withdrawn; the ones already connected are left
+alone.
 
 ---
 
