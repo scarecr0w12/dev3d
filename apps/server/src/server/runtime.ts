@@ -382,6 +382,15 @@ export function createRuntime(opts: {
    */
   const assets: OfficeAssetKit = loadOfficeKit(resolve(config.repoRoot, 'apps/web/public/office'));
   const EMPTY_LAYOUT: FloorLayout = { blocks: [] };
+  /**
+   * The block kinds the loaded kit actually has, for pruning and reporting.
+   *
+   * Declared here, beside the kit it describes, rather than next to the
+   * functions that use it: `reconcileFloors` runs during boot and calls
+   * `pruneUnknownModules`, so a `const` declared further down the same scope
+   * would still be in its temporal dead zone when the office starts up.
+   */
+  const kitKinds = new Set((assets.kit?.blocks ?? []).map((block) => block.id));
   if (assets.kit === null) {
     log('warn', 'office', `no block kit: ${assets.problem ?? 'unknown reason'}. Floors will not grow.`);
   } else {
@@ -615,9 +624,6 @@ export function createRuntime(opts: {
     }
     return { ok: true, overrides };
   }
-
-  /** The block kinds the loaded kit actually has, for pruning and reporting. */
-  const kitKinds = new Set((assets.kit?.blocks ?? []).map((block) => block.id));
 
   /**
    * Drop modules whose kind no longer exists in the kit.
