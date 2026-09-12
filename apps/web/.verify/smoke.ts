@@ -149,6 +149,7 @@ function run(id: string, status: Run['status']): Run {
     endedAt: null,
     stages: [stage(id, `${id}-s1`, 'pending')],
     budget: { limitUsd: 5, spentUsd: 0 },
+    plan: [],
     workspaceId: 'default',
     workspacePath: '/workspace',
     objective: null,
@@ -263,6 +264,12 @@ function officeState(roles: Role[], runs: Run[], employees?: EmployeeState[]): O
       ],
     },
     employees: employees ?? roles.map((role) => toEmployeeState(role, 'default')),
+    mcp: {
+      enabled: false,
+      configPath: null,
+      grantRoles: [],
+      servers: [],
+    },
     pipelines: [
       {
         id: 'product-build',

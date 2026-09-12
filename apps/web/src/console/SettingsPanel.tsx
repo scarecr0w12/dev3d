@@ -23,7 +23,7 @@ import { formatInt, formatUsd } from '../app/format';
 import { useOffice, useSkills, useStore } from '../app/StoreContext';
 import { Badge, Empty, Loading, Panel, Tabs, cx } from './ui';
 
-type SettingsTab = 'general' | 'models' | 'skills' | 'budget' | 'safety';
+type SettingsTab = 'general' | 'models' | 'skills' | 'budget' | 'safety' | 'mcp';
 
 const POSTURES: readonly RoutingPosture[] = ['cheap', 'balanced', 'quality'];
 const TIERS: readonly ModelTier[] = ['nano', 'small', 'standard', 'strong', 'max'];
@@ -432,6 +432,7 @@ function ModelOverrideEditor({
 
   const inValue = price(priceIn);
   const outValue = price(priceOut);
+
   /**
    * Quality is a 0..1 score, so a value outside that is a typo rather than a
    * strong opinion. A blank field means "no correction", which is not the same
@@ -852,6 +853,7 @@ export function SettingsPanel() {
           { id: 'skills', label: 'Skills' },
           { id: 'budget', label: 'Budget' },
           { id: 'safety', label: 'Safety' },
+          { id: 'mcp', label: 'MCP' },
         ]}
         active={tab}
         onChange={setTab}
@@ -874,8 +876,127 @@ export function SettingsPanel() {
           {tab === 'skills' && <SkillSettings />}
           {tab === 'budget' && <BudgetSettings />}
           {tab === 'safety' && <SafetySettings />}
+          {tab === 'mcp' && <McpSettings />}
         </>
       )}
     </Panel>
+  );
+}
+
+/**
+ * MCP servers.
+ *
+ * Read-only on purpose: servers are configured in a file, because a server is a
+ * command line or a URL with arguments, and a form that builds one would be a
+ * worse editor than a text file. What the console owes an operator here is the
+ * answer to "is it working, and if not why" — which is what this shows.
+ */
+function McpSettings() {
+  const office = useOffice();
+  const state = office?.mcp;
+  if (!state) return <Empty title="No MCP state" hint="Waiting for the orchestrator." />;
+
+  if (!state.enabled) {
+    return (
+      <div className="settings-section">
+        <div className="dim small">
+          MCP is switched off (<span className="mono">DEV3D_MCP=false</span>). No server is connected and no
+          remote tool is offered to anyone.
+        </div>
+      </div>
+    );
+  }
+
+  const granted =
+    state.grantRoles.length === 0
+      ? 'nobody'
+      : state.grantRoles.includes('*')
+        ? 'every role'
+        : state.grantRoles.length === 1 && state.grantRoles[0] === 'shell-roles'
+          ? 'every role that already holds run_shell'
+          : state.grantRoles.join(', ');
+
+  return (
+    <div className="settings-section">
+      <div className="dim small">
+        dev3d is an MCP <span className="strong">client</span>. Each server's tools are offered to employees as{' '}
+        <span className="mono">mcp__&lt;server&gt;__&lt;tool&gt;</span>, so they can never collide with a built-in.
+      </div>
+
+      <div className="metrics-grid">
+        <div className="metric">
+          <div className="metric-label">Servers</div>
+          <div className="metric-value mono">{formatInt(state.servers.length)}</div>
+        </div>
+        <div className="metric">
+          <div className="metric-label">Tools published</div>
+          <div className="metric-value mono">
+            {formatInt(state.servers.reduce((total, server) => total + server.toolCount, 0))}
+          </div>
+        </div>
+        <div className="metric">
+          <div className="metric-label">Granted to</div>
+          <div className="metric-value small">{granted}</div>
+        </div>
+      </div>
+
+      <div className="dim small">
+        Config file: <span className="mono">{state.configPath ?? '(none — DEV3D_MCP_SERVERS only)'}</span>
+      </div>
+
+      {state.servers.length === 0 ? (
+        <Empty
+          title="No MCP servers configured"
+          hint="Add servers to mcp.json, or name one in DEV3D_MCP_SERVERS, and restart the orchestrator."
+        />
+      ) : (
+        <div className="mcp-list">
+          {state.servers.map((server) => (
+            <div key={server.id} className="mcp-server">
+              <div className="mcp-head">
+                <span className="strong mono">{server.id}</span>
+                <Badge
+                  tone={
+                    server.state === 'ready'
+                      ? 'ok'
+                      : server.state === 'failed'
+                        ? 'danger'
+                        : server.state === 'connecting'
+                          ? 'warn'
+                          : 'info'
+                  }
+                  title={server.error ?? undefined}
+                >
+                  {server.state}
+                </Badge>
+                <span className="dim small">
+                  {server.state === 'ready'
+                    ? `${formatInt(server.toolCount)} tool(s)${server.serverName ? ` · ${server.serverName} ${server.serverVersion ?? ''}` : ''}`
+                    : ''}
+                </span>
+              </div>
+              <div className="dim small mono mcp-transport">{server.transport}</div>
+              {server.error ? (
+                <div className="alert alert-danger small" role="alert">
+                  {server.error}
+                </div>
+              ) : null}
+              {server.notes.length > 0 ? (
+                <details className="mcp-notes">
+                  <summary className="dim small">Recent output</summary>
+                  <pre className="mono small">{server.notes.join('\n')}</pre>
+                </details>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="dim small">
+        Tools are granted by <span className="mono">DEV3D_MCP_GRANT_ROLES</span>. A remote server can be a
+        filesystem or a deployment system, so its tools are granted deliberately and never inherited from the
+        fact that a server is connected.
+      </div>
+    </div>
   );
 }

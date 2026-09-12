@@ -4603,3 +4603,61 @@ body.is-resizing {
     animation: none;
   }
 }
+
+/* ----------------------------------------------------------------------------
+   MCP servers (Settings -> MCP)
+   A connection list rather than a table: each server carries a state, a
+   transport, and on failure the reason and the last thing it printed. The state
+   badge is the only colour; everything else is a hairline and dim text, so a
+   healthy list stays quiet and a broken one does not.
+   -------------------------------------------------------------------------- */
+
+.mcp-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 12px 0;
+  }
+
+  .mcp-server {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.015);
+  }
+
+  .mcp-server .mcp-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .mcp-server .mcp-transport {
+    margin-top: 4px;
+    word-break: break-all;
+  }
+
+  .mcp-server .alert {
+    margin-top: 8px;
+  }
+
+  .mcp-notes {
+    margin-top: 8px;
+  }
+
+  .mcp-notes summary {
+    cursor: pointer;
+  }
+
+  .mcp-notes pre {
+    margin: 6px 0 0;
+    padding: 8px;
+    max-height: 180px;
+    overflow: auto;
+    background: #0b0e12;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
