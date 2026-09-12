@@ -50,7 +50,7 @@ interface Harness {
 }
 
 async function makeHarness(
-  opts: { autoApprove?: boolean; softSpendApprovalUsd?: number } = {},
+  opts: { autoApprove?: boolean; softSpendApprovalUsd?: number; rejectReviews?: boolean } = {},
 ): Promise<Harness> {
   const workspace = mkdtempSync(join(tmpdir(), 'dev3d-engine-'));
   const base = loadConfig();
@@ -67,6 +67,38 @@ async function makeHarness(
   };
 
   const registry = createProviderRegistry(config);
+
+  /**
+   * A chair that objects and never relents.
+   *
+   * The scripted provider approves every review, so the "a review ended with an
+   * objection nobody could resolve" path is unreachable through it. This wraps
+   * the registry so the stage's verdict turn comes back as an explicit rejection,
+   * which is what a review-loop looks like when it genuinely fails.
+   */
+  if (opts.rejectReviews === true) {
+    const realChat = registry.chat.bind(registry);
+    registry.chat = async (primary, fallbacks, req) => {
+      const prompt = req.messages.map((m) => m.content).join('\n');
+      if (prompt.includes('Synthesise review pass')) {
+        return {
+          result: {
+            text:
+              '## Review\n\nThis is not acceptable. There is a blocking objection: the change ' +
+              'dereferences a null session and must be fixed. Changes required before approval.',
+            reasoning: null,
+            toolCalls: [],
+            finishReason: 'stop',
+            usage: { tokensIn: 1, tokensOut: 1, costUsd: 0 },
+          },
+          used: primary,
+          attempted: [],
+        };
+      }
+      void fallbacks;
+      return realChat(primary, fallbacks, req);
+    };
+  }
   const skills: Skill[] = await loadSkills(skillsDir);
   const tools = createToolRegistry();
   for (const tool of createDefaultTools()) tools.register(tool);
@@ -154,8 +186,9 @@ async function makeHarness(
     },
     pipelines: (workspaceId) => {
       const ids = orgOf(workspaceId).pipelineIds;
-      const enabled = pipelines.filter((pipeline) => ids.includes(pipeline.id));
-      return enabled.length > 0 ? enabled : pipelines;
+      const all = [...pipelines, ...extraPipelines];
+      const enabled = all.filter((pipeline) => ids.includes(pipeline.id));
+      return enabled.length > 0 ? enabled : all;
     },
     employees,
     sink,
@@ -232,10 +265,24 @@ test('complexity separates hard work from trivial work', () => {
   assert.ok(hard >= 0 && hard <= 1);
 });
 
-test('the review heuristics only approve when nothing was flagged', () => {
+test('the review heuristics separate blocking language from advice', () => {
   assert.equal(reviewApproved('Approved. This is good enough to ship.'), true);
-  assert.equal(reviewApproved('⚠️ Risk — this must be fixed before merge.'), false);
-  assert.equal(reviewRaisedObjections('⚠️ Risk — edge cases crash.'), true);
+
+  // Advice is not a refusal. A review that names a risk and suggests a change is
+  // how a passing review reads; treating that as an objection made every stage of
+  // a system with caveats look unreviewed.
+  const advisory =
+    '## Review\n- **Sound** — scoped clearly.\n- **Risk** — edge cases must not crash.\n' +
+    '- **Suggestion** — add a fallback.';
+  assert.equal(reviewRaisedObjections(advisory), false);
+  assert.equal(reviewRaisedObjections('⚠️ Risk — edge cases crash.'), false);
+
+  // Explicit blocking language is an objection, however it is phrased.
+  assert.equal(reviewRaisedObjections('This is not acceptable. Changes required.'), true);
+  assert.equal(reviewRaisedObjections('❌ Blocking: the null deref is still there.'), true);
+  assert.equal(reviewRaisedObjections('I must fix the session lookup first.'), true);
+
+  // A denial of objections is an approval, not a detection of the word.
   assert.equal(reviewRaisedObjections('Looks good, no objections.'), false);
 });
 
@@ -584,6 +631,187 @@ test('run knowledge accumulates across stages', async () => {
     const artifacts = eventsOfType(h.events, 'artifact.created').map((e) => e.artifact);
     // One stage artifact per completed stage, at minimum.
     assert.ok(artifacts.length >= stageStarts.length - 1, 'each stage should leave an artifact');
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// maxTurnsPerStage
+//
+// The field was declared, populated for all thirteen shipped roles and read by
+// nothing. These are the tests that keep it wired: an operator can see the limit
+// in the org chart, so it has to do something.
+// ---------------------------------------------------------------------------
+
+/** A one-stage pipeline, so a cap is the only thing that can stop a role. */
+function singleStagePipeline(
+  id: string,
+  spec: {
+    roleIds: string[];
+    mode: Pipeline['stages'][number]['mode'];
+    kind?: Pipeline['stages'][number]['kind'];
+    rounds?: number;
+    maxIterations?: number;
+  },
+): Pipeline {
+  const { roleIds, mode, kind, rounds, maxIterations } = spec;
+  return {
+    id,
+    name: id,
+    description: 'test pipeline',
+    stages: [
+      {
+        name: 'Deliberate',
+        kind: kind ?? 'debate',
+        roleIds,
+        mode,
+        ...(rounds !== undefined ? { rounds } : {}),
+        ...(maxIterations !== undefined ? { maxIterations } : {}),
+      },
+    ],
+  };
+}
+
+function withPipeline(h: Harness, pipeline: Pipeline): void {
+  h.workspaces[0]!.org.pipelineIds.push(pipeline.id);
+  // The harness reads `defaultPipelines()` once, so the pipeline is appended to
+  // the enabled set through the org chart's own id list plus the shared array.
+  extraPipelines.push(pipeline);
+}
+
+/** Pipelines added by `withPipeline`, read by the harness's pipeline supplier. */
+const extraPipelines: Pipeline[] = [];
+
+test('a role may not exceed maxTurnsPerStage, and the refusal is logged', async () => {
+  const h = await makeHarness();
+  try {
+    // The CEO ships with a cap of 2; lowering it to 1 makes the second turn of a
+    // two-round debate one the cap has to refuse.
+    const ceo = h.chart.roles.find((role) => role.id === 'ceo');
+    assert.ok(ceo);
+    ceo.maxTurnsPerStage = 1;
+    withPipeline(h, singleStagePipeline('cap-debate', { roleIds: ['ceo'], mode: 'debate', rounds: 2 }));
+
+    const run = h.engine.submit({ brief: 'Decide the approach', pipelineId: 'cap-debate' });
+    const settled = await h.engine.whenSettled(run.id);
+    assert.ok(settled);
+
+    const turns = eventsOfType(h.events, 'turn.finished').map((e) => e.turn);
+    const byCeo = turns.filter((t) => t.roleId === 'ceo');
+    assert.equal(byCeo.length, 1, `the CEO spoke ${byCeo.length} times despite a cap of 1`);
+
+    const warnings = eventsOfType(h.events, 'log').filter(
+      (e) => e.level === 'warn' && e.message.includes('reached its limit'),
+    );
+    assert.ok(warnings.length > 0, 'a refusal must be visible, not silent');
+    assert.match(warnings[0]!.message, /maxTurnsPerStage/);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a stage that asks for more turns than the cap allows still completes', async () => {
+  const h = await makeHarness();
+  try {
+    withPipeline(h, singleStagePipeline('cap-debate-long', { roleIds: ['ceo'], mode: 'debate', rounds: 5 }));
+
+    const run = h.engine.submit({ brief: 'Decide the approach', pipelineId: 'cap-debate-long' });
+    const settled = await h.engine.whenSettled(run.id);
+    assert.ok(settled);
+
+    // Truncating the deliberation is the cap working, not the stage breaking:
+    // a stage must never be left mid-flight because somebody ran out of turns.
+    assert.notEqual(settled.status, 'running');
+    assert.ok(settled.endedAt !== null);
+    const stage = settled.stages[0]!;
+    assert.notEqual(stage.status, 'running', 'the stage must reach a terminal state');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('the shipped caps allow the shipped pipelines to finish', async () => {
+  // A guard on the default values: if someone lowers a cap below what a shipped
+  // pipeline needs, the office silently truncates its own deliberation. This
+  // runs the real pipelines and asserts every role stayed within its cap without
+  // ever being refused.
+  const h = await makeHarness();
+  try {
+    const run = h.engine.submit({ brief: 'Add a dark mode toggle to the settings page' });
+    const settled = await h.engine.whenSettled(run.id);
+    assert.ok(settled);
+
+    const refusals = eventsOfType(h.events, 'log').filter((e) => e.message.includes('reached its limit'));
+    assert.deepEqual(
+      refusals.map((e) => e.message),
+      [],
+      'no shipped role should hit its cap while running a shipped pipeline',
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a review that ends on an objection fails the stage instead of passing it on', async () => {
+  // The chair reviews the work, objects in explicit blocking language, and has no
+  // producer outside the stage to send it back to, so the loop ends with the
+  // objection open. Previously that objection text became the summary, and the
+  // next stage read a rejection as the decision.
+  const h = await makeHarness({ rejectReviews: true });
+  try {
+    withPipeline(
+      h,
+      singleStagePipeline('cap-review', {
+        roleIds: ['qa-lead', 'cto'],
+        mode: 'review-loop',
+        kind: 'review',
+        maxIterations: 1,
+      }),
+    );
+
+    const run = h.engine.submit({ brief: 'Review the parser change', pipelineId: 'cap-review' });
+    const settled = await h.engine.whenSettled(run.id);
+    assert.ok(settled);
+
+    const stage = settled.stages[0]!;
+    assert.equal(stage.error, 'The review ended with objections unresolved; the work was not approved.');
+    assert.equal(stage.status, 'failed', 'an unresolved review must not report as done');
+    assert.equal(settled.status, 'failed', 'a non-optional stage failing must fail the run');
+    assert.match(stage.summary ?? '', /UNRESOLVED REVIEW/);
+    // The objection is still recorded — it is the reason the stage failed.
+    assert.match(stage.summary ?? '', /blocking objection/);
+
+    const warnings = eventsOfType(h.events, 'log').filter((e) => e.message.includes('unresolved objections'));
+    assert.ok(warnings.length > 0, 'the failure should name itself in the log');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('an approving review passes and is not mistaken for an objection', async () => {
+  // The scripted review offers a risk and a suggestion, which is advice rather
+  // than a refusal. It must not be read as one.
+  const h = await makeHarness();
+  try {
+    withPipeline(
+      h,
+      singleStagePipeline('ok-review', {
+        roleIds: ['qa-lead', 'cto'],
+        mode: 'review-loop',
+        kind: 'review',
+        maxIterations: 1,
+      }),
+    );
+
+    const run = h.engine.submit({ brief: 'Review the parser change', pipelineId: 'ok-review' });
+    const settled = await h.engine.whenSettled(run.id);
+    assert.ok(settled);
+
+    const stage = settled.stages[0]!;
+    assert.equal(stage.error, null);
+    assert.equal(stage.status, 'done');
+    assert.doesNotMatch(stage.summary ?? '', /UNRESOLVED REVIEW/);
   } finally {
     h.cleanup();
   }

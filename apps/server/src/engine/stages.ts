@@ -48,10 +48,27 @@ export interface StageOutcome {
   summary: string;
   turns: TurnRecord[];
   artifacts: Artifact[];
+  /**
+   * The stage finished with an objection it could not resolve.
+   *
+   * Only `review-loop` sets it. The run engine turns it into a visible stage
+   * error, because a reviewer's rejection reaching the next stage as its
+   * "product" is how a failed review gets built on as though it passed.
+   */
+  unresolved?: boolean;
 }
 
+/**
+ * Language that names a blocking problem.
+ *
+ * Deliberately narrow. "Risk — …" and "Suggestion — …" are how a review offers
+ * advice, not how it refuses to approve, and treating them as objections made
+ * every passing review of a system with any caveats look like a rejection. The
+ * cost of a miss here is one more revision round; the cost of a false positive is
+ * a stage that reports failure on a review that actually passed, which is worse.
+ */
 const OBJECTION_RE =
-  /(objection|must fix|must be fixed|blocking|blocks release|reject|not acceptable|does not work|doesn't work|❌|⚠)/i;
+  /(objection|must fix|must be fixed|must be addressed|blocking|blocks release|reject|not acceptable|does not work|doesn't work|changes required|request changes|❌)/i;
 const APPROVAL_RE = /(approv|sign[- ]off|ship it|looks good|lgtm|good enough)/i;
 /**
  * Phrases that *deny* an objection. "No objections" is an approval, and a
@@ -153,6 +170,57 @@ function participantsOf(roles: Role[]): Array<{ roleId: string; displayName: str
   return roles.map((r) => ({ roleId: r.id, displayName: r.displayName, title: r.title }));
 }
 
+/**
+ * How many turns each role has already taken in this stage.
+ *
+ * Not on `StageContext`, because a context is shared by every branch of a
+ * parallel stage and two branches must not read each other's half-finished
+ * counts. It is threaded through the mode functions instead, which is also what
+ * keeps the "a stage's people change as the stage runs" rule in one place.
+ */
+type TurnBudget = Map<string, number>;
+
+function newTurnBudget(): TurnBudget {
+  return new Map<string, number>();
+}
+
+/**
+ * May this role take another turn in this stage?
+ *
+ * `Role.maxTurnsPerStage` was declared, populated for all thirteen shipped roles
+ * and read by nothing: an operator could see a per-employee limit in the org
+ * chart that did nothing at all. It is enforced here, at the one place every
+ * stage mode passes through, which is what makes it true of `single`, `parallel`,
+ * `debate` and `review-loop` alike.
+ *
+ * The shipped values are chosen so a stage the org chart asks for completes:
+ * debate defaults to two rounds and review-loop to two iterations, and the CEO
+ * (who chairs both) carries a cap of two.
+ *
+ * Refusing is loud. A silent one would look exactly like an employee choosing not
+ * to speak, and the operator would have no way to tell a working cap from a
+ * broken stage.
+ */
+function mayTakeTurn(deps: EngineDeps, ctx: StageContext, role: Role, budget: TurnBudget): boolean {
+  const taken = budget.get(role.id) ?? 0;
+  if (taken < role.maxTurnsPerStage) return true;
+  deps.sink.emit({
+    type: 'log',
+    level: 'warn',
+    scope: 'engine/stages',
+    message:
+      `${role.displayName} has reached its limit of ${role.maxTurnsPerStage} turn(s) in ` +
+      `"${ctx.stage.spec.name}" and is skipped for the rest of the stage. ` +
+      `Raise maxTurnsPerStage for this role, or the stage's rounds/iterations, to change that.`,
+    at: Date.now(),
+  });
+  return false;
+}
+
+function countTurn(budget: TurnBudget, role: Role): void {
+  budget.set(role.id, (budget.get(role.id) ?? 0) + 1);
+}
+
 /** Fold a finished turn into the run's accumulated knowledge. */
 function absorb(knowledge: RunKnowledge, turn: TurnRecord, speaker: string): void {
   for (const p of turn.wroteFiles) {
@@ -164,6 +232,13 @@ function absorb(knowledge: RunKnowledge, turn: TurnRecord, speaker: string): voi
   void speaker;
 }
 
+/**
+ * Run one turn, or refuse it if the role is at its per-stage limit.
+ *
+ * Returning `null` for a refusal rather than a fabricated empty turn is what lets
+ * each mode decide what an exhausted participant means: a debate carries on with
+ * the others, a single-owner stage ends.
+ */
 async function runOneTurn(
   deps: EngineDeps,
   ctx: StageContext,
@@ -172,9 +247,12 @@ async function runOneTurn(
   purposeIndex: number,
   transcript: StageUtterance[],
   roles: Role[],
+  budget: TurnBudget,
   knowledge: RunKnowledge = ctx.knowledge,
   writtenPaths: Set<string> = ctx.writtenPaths,
-): Promise<TurnRecord> {
+): Promise<TurnRecord | null> {
+  if (!mayTakeTurn(deps, ctx, role, budget)) return null;
+  countTurn(budget, role);
   const turn = await runTurn(deps, {
     run: ctx.run,
     stage: ctx.stage,
@@ -221,14 +299,25 @@ function summarizeTurns(turns: TurnRecord[], max = 6_000): string {
 // modes
 // ---------------------------------------------------------------------------
 
-async function runSingle(deps: EngineDeps, ctx: StageContext, roles: Role[]): Promise<StageOutcome> {
+async function runSingle(
+  deps: EngineDeps,
+  ctx: StageContext,
+  roles: Role[],
+  budget: TurnBudget,
+): Promise<StageOutcome> {
   const owner = roles[0];
   if (!owner) return { summary: '', turns: [], artifacts: [] };
-  const turn = await runOneTurn(deps, ctx, owner, `Carry out "${ctx.stage.spec.name}".`, 0, [], roles);
+  const turn = await runOneTurn(deps, ctx, owner, `Carry out "${ctx.stage.spec.name}".`, 0, [], roles, budget);
+  if (turn === null) return { summary: '', turns: [], artifacts: [] };
   return { summary: clip(turn.text, 6_000) || `(no output) ${turn.error ?? ''}`, turns: [turn], artifacts: [] };
 }
 
-async function runParallel(deps: EngineDeps, ctx: StageContext, roles: Role[]): Promise<StageOutcome> {
+async function runParallel(
+  deps: EngineDeps,
+  ctx: StageContext,
+  roles: Role[],
+  budget: TurnBudget,
+): Promise<StageOutcome> {
   // Each branch gets its own knowledge snapshot so two builders cannot interleave
   // writes into one shared list; the results are merged afterwards in role order.
   const snapshots = roles.map(() => structuredClone(ctx.knowledge) as RunKnowledge);
@@ -241,6 +330,7 @@ async function runParallel(deps: EngineDeps, ctx: StageContext, roles: Role[]): 
       0,
       [],
       roles,
+      budget,
       snapshots[i] ?? ctx.knowledge,
       ctx.writtenPaths,
     ),
@@ -254,7 +344,12 @@ async function runParallel(deps: EngineDeps, ctx: StageContext, roles: Role[]): 
   return { summary: summarizeTurns(kept), turns: kept, artifacts: [] };
 }
 
-async function runDebate(deps: EngineDeps, ctx: StageContext, roles: Role[]): Promise<StageOutcome> {
+async function runDebate(
+  deps: EngineDeps,
+  ctx: StageContext,
+  roles: Role[],
+  budget: TurnBudget,
+): Promise<StageOutcome> {
   const rounds = Math.max(1, ctx.stage.spec.rounds ?? 2);
   const facilitator = roles[0];
   const turns: TurnRecord[] = [];
@@ -277,7 +372,11 @@ async function runDebate(deps: EngineDeps, ctx: StageContext, roles: Role[]): Pr
         round - 1,
         transcript.slice(),
         roles,
+        budget,
       );
+      // A participant at its per-stage limit sits out the remaining rounds; the
+      // debate carries on with whoever is left.
+      if (turn === null) continue;
       turns.push(turn);
       transcript.push(utterance(role, purpose, turn.text));
       deps.sink.emit({
@@ -300,7 +399,10 @@ async function runDebate(deps: EngineDeps, ctx: StageContext, roles: Role[]): Pr
       ctx.stage.spec.kind === 'workshop'
         ? 'Converge the discussion into the decision record this stage must produce.'
         : 'Rule on the disagreement: decide, record the alternatives rejected and why.';
-    const verdict = await runOneTurn(deps, ctx, facilitator, purpose, rounds, transcript.slice(), roles);
+    const verdict = await runOneTurn(deps, ctx, facilitator, purpose, rounds, transcript.slice(), roles, budget);
+    // A facilitator that has spent its turns leaves the debate's own transcript
+    // as the record, rather than a verdict nobody was allowed to give.
+    if (verdict === null) return { summary: summarizeTurns(turns), turns, artifacts: [] };
     turns.push(verdict);
     transcript.push(utterance(facilitator, purpose, verdict.text));
     deps.sink.emit({
@@ -319,12 +421,18 @@ async function runDebate(deps: EngineDeps, ctx: StageContext, roles: Role[]): Pr
   return { summary: summarizeTurns(turns), turns, artifacts: [] };
 }
 
-async function runReviewLoop(deps: EngineDeps, ctx: StageContext, roles: Role[]): Promise<StageOutcome> {
+async function runReviewLoop(
+  deps: EngineDeps,
+  ctx: StageContext,
+  roles: Role[],
+  budget: TurnBudget,
+): Promise<StageOutcome> {
   const maxIterations = Math.max(1, ctx.stage.spec.maxIterations ?? 2);
   const chair = roles[0];
   const reviewers = roles.slice(1);
   const turns: TurnRecord[] = [];
   let verdictText = '';
+  let unresolved = false;
 
   for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
     if (ctx.signal.aborted || ctx.abortReason() !== null) break;
@@ -334,12 +442,12 @@ async function runReviewLoop(deps: EngineDeps, ctx: StageContext, roles: Role[])
     const reviews = await mapWithConcurrency(reviewers, deps.config.maxConcurrency, async (role) => {
       const purpose = `Review pass ${iteration} of ${maxIterations}: judge the files this run actually produced.`;
       const before = ctx.knowledge.filesWritten.length;
-      const turn = await runOneTurn(deps, ctx, role, purpose, iteration - 1, [], roles);
+      const turn = await runOneTurn(deps, ctx, role, purpose, iteration - 1, [], roles, budget);
       return { turn, before };
     });
 
     for (const review of reviews) {
-      if (!review) continue;
+      if (!review || review.turn === null) continue;
       turns.push(review.turn);
       transcript.push({
         speaker: speakerFor(deps, review.turn.roleId, ctx.run.workspaceId),
@@ -351,13 +459,21 @@ async function runReviewLoop(deps: EngineDeps, ctx: StageContext, roles: Role[])
     if (chair && !ctx.signal.aborted) {
       const purpose = `Synthesise review pass ${iteration}: state plainly whether this is approved, or list what must change.`;
       verdictText = '';
-      const verdict = await runOneTurn(deps, ctx, chair, purpose, iteration - 1, transcript.slice(), roles);
+      const verdict = await runOneTurn(deps, ctx, chair, purpose, iteration - 1, transcript.slice(), roles, budget);
+      // A chair out of turns cannot rule, so whatever it said last stands and the
+      // loop stops rather than spinning.
+      if (verdict === null) break;
       turns.push(verdict);
       verdictText = verdict.text;
 
       if (reviewApproved(verdictText) || !reviewRaisedObjections(verdictText)) {
+        // Settled: the last verdict is the decision, not an open objection.
+        unresolved = false;
         break;
       }
+      // The chair objected and there is nowhere left to send it. Recorded as
+      // unresolved below rather than left to read as the stage's conclusion.
+      unresolved = true;
     }
 
     // Someone objected. Send it back to the people who actually wrote the files.
@@ -369,19 +485,32 @@ async function runReviewLoop(deps: EngineDeps, ctx: StageContext, roles: Role[])
     const revisionTranscript = transcript.slice();
     const revisions = await mapWithConcurrency(producers, deps.config.maxConcurrency, async (role) => {
       const purpose = `Revise your work to answer review pass ${iteration}. Change the files, do not just agree.`;
-      return runOneTurn(deps, ctx, role, purpose, iteration, revisionTranscript, roles);
+      return runOneTurn(deps, ctx, role, purpose, iteration, revisionTranscript, roles, budget);
     });
     for (const revision of revisions) {
       if (!revision) continue;
       turns.push(revision);
     }
+    // The revision is the answer to that objection, so it is no longer open.
+    unresolved = false;
   }
 
-  return {
-    summary: clip(verdictText, 6_000) || summarizeTurns(turns),
-    turns,
-    artifacts: [],
-  };
+  /**
+   * An objection that outlived the loop is the one thing the next stage must not
+   * mistake for a decision. It was previously clipped into the summary verbatim,
+   * so a downstream builder read a rejection as the stage's product — the
+   * objection travelled onward as though it were the conclusion.
+   */
+  const summary = unresolved
+    ? clip(`UNRESOLVED REVIEW — the work was not approved and the loop ended before it was.\n\n${verdictText}`, 6_000)
+    : clip(verdictText, 6_000) || summarizeTurns(turns);
+
+  const outcome: StageOutcome = { summary: summary || summarizeTurns(turns), turns, artifacts: [] };
+  // Set unconditionally rather than spread in when true: an optional field left
+  // absent and one deliberately false are indistinguishable to the caller, and
+  // this flag is read as a decision rather than a hint.
+  outcome.unresolved = unresolved;
+  return outcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -402,19 +531,22 @@ export async function executeStage(deps: EngineDeps, ctx: StageContext): Promise
   }
 
   let outcome: StageOutcome;
+  // One budget for the whole stage, so a role's per-stage limit counts turns
+  // across every round and iteration rather than resetting each time round.
+  const budget = newTurnBudget();
   switch (ctx.stage.spec.mode) {
     case 'parallel':
-      outcome = await runParallel(deps, ctx, roles);
+      outcome = await runParallel(deps, ctx, roles, budget);
       break;
     case 'debate':
-      outcome = await runDebate(deps, ctx, roles);
+      outcome = await runDebate(deps, ctx, roles, budget);
       break;
     case 'review-loop':
-      outcome = await runReviewLoop(deps, ctx, roles);
+      outcome = await runReviewLoop(deps, ctx, roles, budget);
       break;
     case 'single':
     default:
-      outcome = await runSingle(deps, ctx, roles);
+      outcome = await runSingle(deps, ctx, roles, budget);
       break;
   }
 
@@ -452,5 +584,8 @@ export async function executeStage(deps: EngineDeps, ctx: StageContext): Promise
   }
 
   ctx.stage.endedAt = Date.now();
-  return { summary: outcome.summary, turns: outcome.turns, artifacts };
+  // `unresolved` is carried through rather than dropped: this rebuilds the
+  // outcome to attach artifacts, and a decision lost in that rebuild would look
+  // exactly like a review that passed.
+  return { summary: outcome.summary, turns: outcome.turns, artifacts, unresolved: outcome.unresolved === true };
 }

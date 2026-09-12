@@ -262,10 +262,12 @@ export function createRunEngine(deps: EngineDeps): RunEngine {
 
       let summary = '';
       let artifacts: Artifact[] = [];
+      let unresolved = false;
       try {
         const outcome = await executeStage(deps, ctx);
         summary = outcome.summary;
         artifacts = outcome.artifacts;
+        unresolved = outcome.unresolved === true;
       } catch (e) {
         stage.error = e instanceof Error ? e.message : String(e);
         emit({
@@ -273,6 +275,26 @@ export function createRunEngine(deps: EngineDeps): RunEngine {
           level: 'error',
           scope: 'engine/run',
           message: `Stage "${stage.spec.name}" threw: ${stage.error}`,
+          at: Date.now(),
+        });
+      }
+
+      /**
+       * A review that ended on an objection is a failed stage, not a finished one.
+       *
+       * The chair's objection used to become the stage summary, so the next stage
+       * received a rejection and read it as the decision. Recording it as an error
+       * means the existing failure path applies: the run stops here unless the
+       * stage is `optional`, and the reason is visible rather than inferred from
+       * the tone of a summary.
+       */
+      if (unresolved && stage.error === null) {
+        stage.error = 'The review ended with objections unresolved; the work was not approved.';
+        emit({
+          type: 'log',
+          level: 'warn',
+          scope: 'engine/run',
+          message: `Stage "${stage.spec.name}" finished with unresolved objections.`,
           at: Date.now(),
         });
       }

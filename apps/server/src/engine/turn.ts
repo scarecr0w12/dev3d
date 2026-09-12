@@ -449,6 +449,17 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
   }
 
   // --- settle --------------------------------------------------------------
+  /**
+   * A turn that ran out of room is a failure, not a finished one.
+   *
+   * Both errors below mean the same thing: the employee stopped mid-task and what
+   * it produced is incomplete. Leaving those as `done` hid the difference between
+   * converging and being cut off — the run engine keys stage failure off
+   * `stage.error` and empty turns, never off `turn.error`, so an unconverged turn
+   * was invisible everywhere except its own record.
+   */
+  if (status === 'done' && error !== null) status = 'failed';
+
   turn.status = status;
   turn.endedAt = Date.now();
   turn.usage = usage;

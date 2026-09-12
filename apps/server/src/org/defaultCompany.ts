@@ -693,7 +693,11 @@ const DEPARTMENTS: Department[] = [
     id: 'design',
     name: 'Design',
     mission: 'Decide what the product is and how it behaves, from the user backwards.',
-    roomIds: ['Anchor_Room_Office2'],
+    // Both rooms the department's people actually sit in. The UI designer works
+    // on the dev floor beside the builders, which is deliberate; a department
+    // that does not claim a room its own members occupy makes that look like a
+    // mistake in the chart rather than a decision.
+    roomIds: ['Anchor_Room_Office2', 'Anchor_Room_DevFloor'],
     color: '#ec4899',
   },
   {

@@ -127,9 +127,16 @@ function identitySection(input: TurnPromptInput): string {
   if (role.persona.debateStyle) {
     lines.push(`When you disagree: ${role.persona.debateStyle}`);
   }
-  if (role.canDelegate && role.maxDirectReports > 0) {
+  if (role.maxDirectReports > 0) {
+    // Deliberately not phrased as "you may delegate". Nothing in the engine can
+    // hand work to a report: work assignment is the pipeline's `roleIds` and the
+    // producers a run has already recorded, and an employee cannot change either.
+    // Telling a model it can delegate produced a promise it had no way to keep,
+    // which is the one thing the house rules below forbid it from doing.
     lines.push(
-      `You may delegate: you can put work on up to ${role.maxDirectReports} people who report to you.`,
+      `Scope: you are responsible for the work ${role.maxDirectReports} people report to you, ` +
+        `but the pipeline assigns their stages — you cannot put work on them yourself. ` +
+        `Say what you need done and let the plan pick it up.`,
     );
   }
   return lines.join('\n');
