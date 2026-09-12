@@ -23,9 +23,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      # v5 targets Node 24. v4 still runs, but on a runtime GitHub has deprecated
+      # and forces onto 24 with a warning, which is noise on every run.
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           # One version on purpose, and it is the floor: `engines` says >=24, and
           # the suites need Node 24 for `--test-isolation=none` and for the
