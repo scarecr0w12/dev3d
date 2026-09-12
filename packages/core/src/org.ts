@@ -20,9 +20,11 @@
  * and hand-edited while the runtime mutates freely.
  */
 
-import type { ModelPolicy, ModelTier, RoutingPosture } from './model.ts';
+import type { ModelPolicy, ModelTier, RoutingPosture, TaskClass } from './model.ts';
 import type { PluginPersistedState } from './plugin.ts';
 import type { FloorLayout } from './block.ts';
+import type { OfficeStyle } from './style.ts';
+import { DEFAULT_STYLE_PRESET } from './style.ts';
 
 /** Identity and mission of one organisation. */
 export interface Company {
@@ -57,6 +59,13 @@ export interface Workspace {
   description?: string;
   /** UI accent colour (hex), used to tag runs, floors and artifacts. */
   color?: string;
+  /**
+   * How this floor looks: palette, surfaces and light. Absent means the default
+   * preset, so a floor that has never been styled renders exactly as it did
+   * before styles existed. Styling never changes the plan - growth, capacity and
+   * seat ids are decided by the layout alone.
+   */
+  style?: OfficeStyle;
   /** The organisation the office was configured with; cannot be removed. */
   isDefault?: boolean;
   /** Floor of the building this organisation occupies. 1 is the ground floor. */
@@ -89,6 +98,17 @@ export interface ModelOverride {
   tier?: ModelTier;
   costPerMTokIn?: number;
   costPerMTokOut?: number;
+  /**
+   * An operator's own overall quality score, 0..1. It is layered on as a
+   * `curated` opinion with the highest confidence, so a human who has actually
+   * run the model outranks a benchmark aggregator that has not.
+   */
+  quality?: number;
+  /**
+   * Per-task-class corrections, 0..1, merged over the blended fitness. An
+   * operator correcting only `coding` leaves every other class alone.
+   */
+  fitness?: Partial<Record<TaskClass, number>>;
 }
 
 /**
@@ -137,6 +157,8 @@ export interface WorkspaceSummary {
   path: string;
   description?: string;
   color?: string;
+  /** The floor's look. On the summary because the view draws every floor. */
+  style?: OfficeStyle;
   isDefault?: boolean;
   floor: number;
   /** Employees in this organisation. */
@@ -347,6 +369,10 @@ export function toWorkspaceSummary(
   };
   if (workspace.description !== undefined) summary.description = workspace.description;
   if (workspace.color !== undefined) summary.color = workspace.color;
+  // Always present, defaulted rather than absent. Every floor is drawn, so every
+  // floor needs a look, and a summary that omitted it would make "has never been
+  // styled" and "the style failed to travel" the same thing to a renderer.
+  summary.style = workspace.style ?? { preset: DEFAULT_STYLE_PRESET };
   if (workspace.isDefault === true) summary.isDefault = true;
   if (workspace.budget.totalUsd !== undefined) summary.budgetTotalUsd = workspace.budget.totalUsd;
   return summary;

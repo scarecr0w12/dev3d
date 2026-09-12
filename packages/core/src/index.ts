@@ -13,3 +13,4 @@ export * from './run.ts';
 export * from './events.ts';
 export * from './plugin.ts';
 export * from './block.ts';
+export * from './style.ts';

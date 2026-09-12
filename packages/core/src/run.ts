@@ -122,6 +122,18 @@ export interface TurnRecord {
   purpose: string;
   /** The routing decision that produced this turn's model. */
   route: RouteDecision;
+  /**
+   * The model that *actually* answered, which differs from `route` whenever the
+   * primary provider failed and a fallback served the turn.
+   *
+   * Recorded because the two are not the same thing and the difference matters
+   * twice over: the console should be able to say a turn ran on a fallback, and
+   * anything learning from outcomes would otherwise credit the chosen model for
+   * work a different one did.
+   */
+  servedBy?: { providerId: string; modelId: string };
+  /** Routes that were tried and failed before one answered, in order. */
+  attemptedRoutes?: string[];
   status: 'running' | 'done' | 'failed' | 'cancelled';
   startedAt: number;
   endedAt: number | null;

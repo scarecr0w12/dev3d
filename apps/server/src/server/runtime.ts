@@ -32,6 +32,7 @@ import type {
   Office,
   OfficeSettings,
   OfficeState,
+  OfficeStyle,
   OrgChart,
   Pipeline,
   PlacedBlock,
@@ -47,9 +48,18 @@ import type {
   PluginPersistedState,
   PluginSystemState,
 } from '@dev3d/core';
-import { MODEL_TIER_ORDER, PLUGIN_API_VERSION, toEmployeeState, toWorkspaceSummary } from '@dev3d/core';
+import {
+  DEFAULT_STYLE_PRESET,
+  MODEL_TIER_ORDER,
+  PLUGIN_API_VERSION,
+  parseOfficeStyle,
+  resolveStyle,
+  stylePreset,
+  toEmployeeState,
+  toWorkspaceSummary,
+} from '@dev3d/core';
 import type { ServerConfig } from '../config.ts';
-import { defaultOfficeSettings } from '../config.ts';
+import { defaultOfficeSettings, detectConfigDrift } from '../config.ts';
 import type { ProviderRegistry } from '../llm/registry.ts';
 import { allSkillIds, defaultCompany, defaultOrgChart, defaultWorkspace } from '../org/defaultCompany.ts';
 import { defaultPipelines } from '../org/defaultPipelines.ts';
@@ -131,6 +141,13 @@ export interface Runtime {
     workspaceId: string,
     patch: { name?: string; description?: string; color?: string },
   ): { ok: boolean; error?: string };
+  /**
+   * Restyle a floor. `null` returns it to the default preset.
+   *
+   * The style is validated the same way a stored one is, so a malformed value
+   * from a client is refused rather than persisted into a renderer.
+   */
+  setWorkspaceStyle(workspaceId: string, style: OfficeStyle | null): { ok: boolean; error?: string };
 
   state(): OfficeState;
   subscribe(fn: (event: ServerEvent) => void): () => void;
@@ -224,6 +241,11 @@ function normalizeWorkspace(raw: unknown, index: number): Workspace | null {
   };
   if (typeof raw['description'] === 'string') workspace.description = raw['description'];
   if (typeof raw['color'] === 'string') workspace.color = raw['color'];
+  // A style is read as untrusted input for the same reason a layout is: a
+  // workspace written by an older build, or hand-edited, must degrade to its
+  // preset rather than putting a `NaN` into a shader.
+  const style = parseOfficeStyle(raw['style']);
+  if (style !== undefined) workspace.style = style;
   if (raw['isDefault'] === true) workspace.isDefault = true;
   // Growth is read back, but not trusted: `reconcileFloors` re-derives it against
   // the current kit at boot, so a layout written by an older kit is corrected
@@ -376,6 +398,10 @@ export function createRuntime(opts: {
    * recomputed does not need to be written down to be safe.
    */
   function reconcileFloors(): void {
+    const pruned = pruneUnknownModules();
+    if (pruned > 0) {
+      log('info', 'office', `dropped ${pruned} room(s) whose kind is no longer in the block kit`);
+    }
     for (const workspace of office.workspaces) {
       const growth = ensureCapacity(workspace, workspace.org.roles.length);
       if (growth.grew > 0) {
@@ -590,13 +616,44 @@ export function createRuntime(opts: {
     return { ok: true, overrides };
   }
 
-  function floorState(workspace: Workspace): OfficeState['floor'] {    const layout = workspace.layout ?? EMPTY_LAYOUT;
+  /** The block kinds the loaded kit actually has, for pruning and reporting. */
+  const kitKinds = new Set((assets.kit?.blocks ?? []).map((block) => block.id));
+
+  /**
+   * Drop modules whose kind no longer exists in the kit.
+   *
+   * A kit is regenerated, not versioned: `blocks.json` is rewritten in place by
+   * the Blender script, so a room type that is renamed or retired leaves every
+   * persisted layout pointing at a module nothing can draw. A floor that keeps
+   * them pays for them in capacity it cannot seat anybody in and renders a hole
+   * where a room should be, so they are dropped here and the floor is left to
+   * re-grow what its roster actually needs.
+   */
+  function pruneUnknownModules(): number {
+    if (assets.kit === null) return 0;
+    let dropped = 0;
+    for (const workspace of office.workspaces) {
+      const layout = workspace.layout;
+      if (layout === undefined) continue;
+      const kept = layout.blocks.filter((block) => kitKinds.has(block.kind));
+      if (kept.length === layout.blocks.length) continue;
+      dropped += layout.blocks.length - kept.length;
+      workspace.layout = { blocks: kept };
+    }
+    return dropped;
+  }
+
+  function floorState(workspace: Workspace): OfficeState['floor'] {
+    const layout = workspace.layout ?? EMPTY_LAYOUT;
     return {
       layout,
       coreSeats: assets.coreSeatIds.length,
       capacity: capacityOf(workspace),
       seatIds: seatIdsOf(workspace),
       modules: structuredClone(assets.kit?.blocks ?? []),
+      // The floor's look travels with everything else about it, so the 3D view
+      // needs no second request and no second source of truth.
+      style: workspace.style ?? { preset: DEFAULT_STYLE_PRESET },
       describe: assets.kit === null ? 'the core office only' : describeLayout(assets.kit, layout),
       problem: assets.problem,
     };
@@ -909,8 +966,12 @@ export function createRuntime(opts: {
       detail: status.detail,
       modelCount: status.modelCount,
       pluginId: status.pluginId,
+      // Where the model list came from. Without it a console sees a count and
+      // cannot tell a provider that was asked from one that never was.
+      modelSource: status.modelSource,
+      modelSourceDetail: status.modelSourceDetail,
+      discoveredAt: status.discoveredAt,
     }));
-
     const runs = engineAccessor.runs().filter((run) => run.workspaceId === workspaceId);
     const activeRunIds = engineAccessor.activeRunIds().filter((id) => runs.some((run) => run.id === id));
 
@@ -931,15 +992,32 @@ export function createRuntime(opts: {
       employees: [...(rosters.get(workspaceId)?.values() ?? [])].map((entry) => structuredClone(entry)),
       skillIds: [...(workspace?.skillIds ?? [])],
       budget: structuredClone(workspace?.budget ?? { defaultRunUsd: 5, spentUsd: 0 }),
+      style: structuredClone(workspace?.style ?? { preset: DEFAULT_STYLE_PRESET }),
       floor: workspace === undefined
-        ? { layout: EMPTY_LAYOUT, coreSeats: assets.coreSeatIds.length, capacity: assets.coreSeatIds.length, seatIds: [...assets.coreSeatIds], modules: [], describe: 'no floor', problem: assets.problem }
+        ? {
+            layout: EMPTY_LAYOUT,
+            coreSeats: assets.coreSeatIds.length,
+            capacity: assets.coreSeatIds.length,
+            seatIds: [...assets.coreSeatIds],
+            modules: [],
+            style: { preset: DEFAULT_STYLE_PRESET },
+            describe: 'no floor',
+            problem: assets.problem,
+          }
         : floorState(workspace),
       pipelines: structuredClone(enabledPipelines(workspace)),
       runs,
       activeRunIds,
       models: structuredClone(registry.models()),
       providers,
+      // Coverage of the quality signals, so the console can say "31 of 445
+      // benchmarked" rather than implying a thin signal is a complete one.
+      modelSignals: registry.signals(),
       llmMode: registry.mock ? 'mock' : 'live',
+      // The reason travels with the mode so the badge can explain itself rather
+      // than leaving "mock" to be interpreted.
+      llmModeReason: config.llmModeReason,
+      configStale: detectConfigDrift(config).detail,
       routingPosture: workspace?.org.routingPosture ?? office.settings.defaultRoutingPosture,
       version: config.version,
       startedAt,
@@ -1192,6 +1270,25 @@ export function createRuntime(opts: {
       }
       if (patch.color !== undefined && patch.color.trim() !== '') workspace.color = patch.color.trim();
       commitWorkspace(workspace, `"${workspace.name}" details updated`);
+      return { ok: true };
+    },
+
+    setWorkspaceStyle(workspaceId, style) {
+      const workspace = workspaceById(workspaceId);
+      if (!workspace) return { ok: false, error: `No workspace "${workspaceId}".` };
+      if (style === null) {
+        delete workspace.style;
+        commitWorkspace(workspace, `"${workspace.name}" returned to the default look`);
+        return { ok: true };
+      }
+      const parsed = parseOfficeStyle(style);
+      if (parsed === undefined) return { ok: false, error: 'That is not a style this build can apply.' };
+      if (style.preset !== undefined && stylePreset(style.preset).id !== style.preset) {
+        return { ok: false, error: `There is no style preset called "${style.preset}".` };
+      }
+      workspace.style = parsed;
+      const resolved = resolveStyle(parsed);
+      commitWorkspace(workspace, `"${workspace.name}" restyled to ${resolved.preset.name}`);
       return { ok: true };
     },
 

@@ -20,7 +20,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import type { BlockKit, OfficeBlockKind } from '@dev3d/core';
+import type {
+  BlockKit,
+  OfficeBlockCategory,
+  OfficeBlockKind,
+  OfficeBlockKindName,
+  OfficeFurniture,
+  OfficeProp,
+} from '@dev3d/core';
 
 const GLB_MAGIC = 0x46546c67;
 const CHUNK_JSON = 0x4e4f534a;
@@ -73,6 +80,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** The categories the console groups space by; anything else is treated as work. */
+const CATEGORIES: readonly OfficeBlockCategory[] = ['work', 'meet', 'quiet', 'support', 'circulation', 'fitting'];
+
+/**
+ * The fit-outs this build knows how to describe. A new one added to the Blender
+ * script and shipped ahead of this file is reported as-is rather than dropped:
+ * `furniture` is a label here, and the walking and seating is decided by the
+ * layout, not by this list.
+ */
+const FURNITURE: readonly OfficeFurniture[] = [
+  'desks',
+  'meeting',
+  'boardroom',
+  'lounge',
+  'booths',
+  'phone',
+  'library',
+  'workshop',
+  'racks',
+  'breakout',
+  'gallery',
+  'none',
+];
+
 /**
  * Parse `blocks.json` into a kit, dropping anything malformed.
  *
@@ -115,15 +146,28 @@ export function parseBlockKit(raw: unknown): { kit: BlockKit | null; problem: st
     const seats = (Array.isArray(entry['seats']) ? entry['seats'] : []).filter(
       (seat): seat is string => typeof seat === 'string' && seat.startsWith('Seat_'),
     );
+    const kind: OfficeBlockKindName = typeof entry['kind'] === 'string' ? entry['kind'] : 'room';
     const block: OfficeBlockKind = {
       id,
       name: typeof entry['name'] === 'string' ? entry['name'] : id,
-      kind: typeof entry['kind'] === 'string' ? entry['kind'] : 'room',
+      kind,
       width: blockWidth,
       depth: blockDepth,
       doors,
       seats,
     };
+    // The descriptive fields are optional: a kit written before they existed,
+    // or by hand, still places and seats correctly without them.
+    if (typeof entry['category'] === 'string' && (CATEGORIES as readonly string[]).includes(entry['category'])) {
+      block.category = entry['category'] as OfficeBlockCategory;
+    }
+    if (typeof entry['furniture'] === 'string' && (FURNITURE as readonly string[]).includes(entry['furniture'])) {
+      block.furniture = entry['furniture'] as OfficeFurniture;
+    }
+    const props = (Array.isArray(entry['props']) ? entry['props'] : []).filter(
+      (prop): prop is OfficeProp => typeof prop === 'string' && prop !== '',
+    );
+    if (props.length > 0) block.props = props;
     if (typeof entry['node'] === 'string' && entry['node'] !== '') block.node = entry['node'];
     if (typeof entry['room'] === 'string' && entry['room'] !== '') block.room = entry['room'];
     if (entry['fitting'] === true) block.fitting = true;

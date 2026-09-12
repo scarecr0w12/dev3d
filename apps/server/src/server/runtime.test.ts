@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { loadConfig } from '../config.ts';
+import { resolveStyle } from '@dev3d/core';
 import { createProviderRegistry } from '../llm/registry.ts';
 import { defaultWorkspace } from '../org/defaultCompany.ts';
 import { openStore } from '../store/store.ts';
@@ -252,4 +253,118 @@ test('a fresh install gets a default organisation on floor 1', () => {
   assert.equal(fresh.workspaces[0]?.path, 'E:\\fresh');
   assert.equal(fresh.workspaces[0]?.floor, 1);
   assert.equal(fresh.settings.workspacesRoot.length > 0, true);
+});
+
+// ------------------------------------------------------------------ the look
+// A style is the one part of a workspace that a naive write could poison: it
+// flows straight into a shader, so a `NaN` or an unknown preset has to be
+// refused at the boundary rather than rendered. It also travels on every state
+// push, which means a round trip through the store is part of the contract.
+
+test('a floor starts on the default preset, and says so', () => {
+  const h = makeRuntime();
+  try {
+    const state = h.runtime.state();
+    assert.equal(state.style.preset, 'studio');
+    assert.equal(state.floor.style.preset, 'studio');
+    // The default is *shown* as a preset rather than as a hole, so the editor has
+    // something to render on a floor nobody has styled.
+    assert.equal(state.workspaces[0]?.style?.preset, 'studio');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a floor can be restyled, and the new look is what the console reads', () => {
+  const h = makeRuntime();
+  try {
+    const result = h.runtime.setWorkspaceStyle('default', {
+      preset: 'nordic',
+      materials: { wall: { color: '#112233' } },
+      lighting: { exposure: 1.4 },
+    });
+    assert.equal(result.ok, true, result.error);
+
+    const state = h.runtime.state();
+    assert.equal(state.style.preset, 'nordic');
+    assert.equal(state.style.materials?.wall?.color, '#112233');
+    assert.equal(state.style.lighting?.exposure, 1.4);
+    // Both places carry it, because the view draws every floor from the summaries
+    // and the editor reads the active floor's style.
+    assert.equal(state.floor.style.preset, 'nordic');
+    assert.equal(state.workspaces[0]?.style?.materials?.wall?.color, '#112233');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a nonsense style is refused rather than stored', () => {
+  const h = makeRuntime();
+  try {
+    const before = h.runtime.state().style;
+    // Not a style at all.
+    assert.equal(h.runtime.setWorkspaceStyle('default', 'neonlab' as never).ok, false);
+    // A preset that does not exist.
+    const unknown = h.runtime.setWorkspaceStyle('default', { preset: 'chartreuse' });
+    assert.equal(unknown.ok, false);
+    assert.match(unknown.error ?? '', /chartreuse/);
+    // A colour that is not a colour is dropped, and the rest is kept.
+    const partial = h.runtime.setWorkspaceStyle('default', {
+      preset: 'noir',
+      materials: { wall: { color: 'red' } },
+    } as never);
+    assert.equal(partial.ok, true);
+    assert.equal(h.runtime.state().style.materials, undefined);
+    // Nothing above left the floor in a broken state.
+    assert.equal(before.preset, 'studio');
+    assert.equal(h.runtime.setWorkspaceStyle('default', null).ok, true);
+    assert.equal(h.runtime.state().style.preset, 'studio');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a style survives a restart, and a corrupt one degrades to its preset', () => {
+  const h = makeRuntime();
+  try {
+    assert.equal(h.runtime.setWorkspaceStyle('default', { preset: 'atelier', environment: { grid: false } }).ok, true);
+    // Round-trip it through the store the way a restart does.
+    const stored = h.runtime.office();
+    const revived = migrateOffice(JSON.parse(JSON.stringify(stored)), { ...loadConfig(), workspace: h.workspace });
+    const only = revived.workspaces[0];
+    assert.ok(only);
+    assert.equal(only.style?.preset, 'atelier');
+    assert.equal(only.style?.environment?.grid, false);
+
+    // And a hand-edited style - a colour that is not one, a preset that is not
+    // one - is read as far as it is usable rather than taken on trust.
+    const broken = migrateOffice(
+      {
+        workspaces: [
+          { id: 'default', name: 'Broken', path: 'E:\\x', org: { roles: [] }, style: { preset: 'nope', materials: { wall: 'blue' } } },
+        ],
+      },
+      { ...loadConfig(), workspace: 'E:\\x' },
+    );
+    const repaired = broken.workspaces[0];
+    assert.ok(repaired);
+    assert.equal(repaired.style?.preset, 'nope', 'an unknown preset id is kept as the user wrote it');
+    assert.equal(repaired.style?.materials, undefined, 'and the unusable material list is dropped');
+    // Which resolves to the default, so it still renders as something.
+    assert.equal(resolveStyle(repaired.style).preset.id, 'studio');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('setting a style on a floor that does not exist is refused, not silently ignored', () => {
+  const h = makeRuntime();
+  try {
+    const result = h.runtime.setWorkspaceStyle('no-such-floor', { preset: 'studio' });
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? '', /no-such-floor/);
+    assert.equal(h.runtime.setWorkspaceDetails('no-such-floor', { name: 'x' }).ok, false);
+  } finally {
+    h.cleanup();
+  }
 });

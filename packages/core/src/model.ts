@@ -60,6 +60,69 @@ export interface ModelCapabilities {
   streaming: boolean;
 }
 
+/**
+ * Where a quality number came from.
+ *
+ * Three sources, deliberately kept distinguishable rather than averaged into
+ * one anonymous score, because they fail differently:
+ *
+ *  - `curated`  a hand-written baseline that ships with the office. Always
+ *               available, never wrong about a model's existence, but it cannot
+ *               know about a model released after the checkout was cut.
+ *  - `learned`  what this office observed from its own turns. The most honest
+ *               signal for *this* codebase and *these* prompts, but it starts
+ *               with no evidence and must not be trusted at n=1.
+ *  - `pooled`   a public benchmark aggregator. Broad coverage and genuine
+ *               measurement, but it ages, it is about a different workload, and
+ *               it can be missing or unreachable entirely.
+ */
+export type QualitySource = 'curated' | 'learned' | 'pooled';
+
+/** One source's opinion about one model. */
+export interface QualityOpinion {
+  source: QualitySource;
+  /** Overall capability, 0..1. */
+  quality: number;
+  /**
+   * Per-task-class fitness, 0..1, partial. A class that is absent here means
+   * "this source expressed no opinion about it", which is not the same as zero.
+   */
+  fitness: Partial<Record<TaskClass, number>>;
+  /**
+   * How much this number should be believed, 0..1. A curated baseline is
+   * confident; a learned score starts near zero and grows with observations; a
+   * pooled score decays as it ages.
+   */
+  confidence: number;
+  /** How many observations stand behind it, when that is meaningful. */
+  samples?: number;
+  /** Where it came from, for the console and the router's reasoning. */
+  attribution?: string;
+  /** When this opinion was formed or last refreshed. */
+  at?: number;
+}
+
+/** The blended quality the router actually ranks on. */
+export interface ModelQuality {
+  quality: number;
+  fitness: Partial<Record<TaskClass, number>>;
+  /** Every opinion that produced the blend, so any number can be explained. */
+  opinions: QualityOpinion[];
+}
+
+/**
+ * Where a catalog entry came from. Membership and metadata are separate
+ * questions: a provider's own `/models` list decides *that* a model exists, and
+ * a curated table decides what it costs and how good it is.
+ */
+export type ModelOrigin =
+  /** Written down in the shipped metadata table. */
+  | 'catalog'
+  /** Reported by the provider's own model-list endpoint. */
+  | 'discovered'
+  /** Contributed by a plugin manifest. */
+  | 'plugin';
+
 /** A concrete, callable model. */
 export interface ModelSpec {
   id: string;
@@ -74,10 +137,60 @@ export interface ModelSpec {
   /** USD per million output tokens. */
   costPerMTokOut: number;
   capabilities: ModelCapabilities;
-  /** Task classes this model is especially good at. */
+  /**
+   * Task classes this model is especially good at, as a flat list. Kept because
+   * it is what plugin manifests write and what the console searches; the router
+   * ranks on the richer `quality.fitness` when one is present.
+   */
   strengths: TaskClass[];
   /** Optional preferred reasoning effort for adapters that support it. */
   defaultEffort?: 'low' | 'medium' | 'high';
+  /** Blended quality, absent when nothing has expressed an opinion. */
+  quality?: ModelQuality;
+  /** How this entry entered the catalog. */
+  origin?: ModelOrigin;
+  /**
+   * True when a provider serves this model but no metadata table describes it,
+   * so its tier and prices are inferred rather than known. The console says so
+   * instead of presenting a guess as a fact.
+   */
+  unrated?: boolean;
+}
+
+/**
+ * One model as reported by a provider's own model-list endpoint.
+ *
+ * Deliberately all-optional except the id: a vendor tells us what it chooses to
+ * tell us, and a missing field has to mean "unknown" rather than a zero that
+ * would win a cheapest-model routing tie.
+ */
+export interface DiscoveredModel {
+  id: string;
+  label?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  /** USD per million input tokens. */
+  costPerMTokIn?: number;
+  /** USD per million output tokens. */
+  costPerMTokOut?: number;
+  capabilities?: Partial<ModelCapabilities>;
+  /** Vendor creation timestamp, when it reports one. */
+  created?: number;
+  /** The vendor's own owner/author string, shown in discovery results. */
+  ownedBy?: string;
+}
+
+/** What one discovery attempt against one provider produced. */
+export interface DiscoveryReport {
+  providerId: string;
+  ok: boolean;
+  /** Models the provider reported, or none when the attempt failed. */
+  models: DiscoveredModel[];
+  /** Why the attempt failed, in the provider's own words where possible. */
+  error: string | null;
+  /** How long the attempt took, in milliseconds. */
+  durationMs: number;
+  at: number;
 }
 
 /**
@@ -101,6 +214,18 @@ export interface ModelPolicy {
   maxOutputTokens?: number;
   /** When true the router must honour `byTaskClass` exactly and never escalate. */
   pin?: boolean;
+  /**
+   * Pin this role to one concrete model by id, rather than letting the router
+   * choose within a tier.
+   *
+   * Tiers answer "how much model does this work deserve" without naming a
+   * vendor, which is what keeps a policy portable across a changing catalog. But
+   * sometimes an operator does know: this role must run on the local model, or on
+   * the one model that handles this codebase. A pin is honoured inside the
+   * policy's own `minTier`/`maxTier` bounds, so pinning to a model the bounds
+   * exclude is reported rather than silently obeyed or silently dropped.
+   */
+  preferredModelId?: string;
 }
 
 export interface RouteRequest {
@@ -131,6 +256,15 @@ export interface RouteCandidate {
   /** Blended USD per 1k tokens, used for tie-breaking and reporting. */
   blendedCostPerKTok: number;
   reason: string;
+  /**
+   * The blended quality the ranking used, when anything had an opinion about
+   * this model. Absent means it was ranked on tier and cost alone.
+   */
+  quality?: number;
+  /** The fitness this candidate scored for the request's task class, 0..1. */
+  fitness?: number;
+  /** The single score the router ordered candidates by, for the routing UI. */
+  score?: number;
 }
 
 export interface RouteDecision {
@@ -143,6 +277,18 @@ export interface RouteDecision {
   fallbacks: RouteCandidate[];
   /** Why cheaper/stronger models were rejected - surfaced in the routing UI. */
   considered: RouteCandidate[];
+  /**
+   * True when the role's `preferredModelId` was honoured. False with a reason in
+   * `reason` when a pin could not be used, so a pin that is not in force is
+   * visible rather than a silent fallback.
+   */
+  pinned?: boolean;
+  /** The blended quality of the chosen model, when one is known. */
+  quality?: number;
+  /** The fitness the chosen model scored for this task class, when known. */
+  fitness?: number;
+  /** The score the chosen model won on. */
+  score?: number;
 }
 
 /** Token/cost accounting for a single model call. */

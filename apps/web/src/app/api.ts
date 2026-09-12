@@ -16,6 +16,7 @@ import type {
   Artifact,
   ChatTurnInput,
   DirectMessage,
+  DiscoveryReport,
   ModelSpec,
   OfficeSettings,
   OfficeState,
@@ -24,6 +25,7 @@ import type {
   PluginRecord,
   PluginSourceRecord,
   PluginSystemState,
+  ProviderStatus,
   Role,
   Run,
   SkillSummary,
@@ -76,6 +78,46 @@ export interface HealthResponse {
 export interface RunDetailResponse extends Run {
   turns?: TurnRecord[];
   artifacts?: Artifact[];
+}
+
+/** What `POST /api/models/discover` answers with. */
+export interface DiscoveryResponse {
+  /** One entry per provider that was asked, in the order they were asked. */
+  reports: DiscoveryReport[];
+  /** Provider status with `modelSource` filled in. */
+  providers: ProviderStatus[];
+  /** The catalog that resulted. */
+  models: ModelSpec[];
+  /** Present when nothing was asked, e.g. in `mock` mode. */
+  note?: string;
+}
+
+/** One model's observed upstream uptime, as the health action returns it. */
+export interface HealthRecordView {
+  modelId: string;
+  permaslug: string;
+  /** Best uptime across the model's endpoints, 0..1. Null when none reported. */
+  uptime: number | null;
+  endpointCount: number;
+  healthyCount: number;
+}
+
+/** What `POST /api/models/benchmarks` answers with. */
+export interface BenchmarkRefreshResponse {
+  ok: boolean;
+  entries: number;
+  error: string | null;
+  coverage?: OfficeState['modelSignals']['benchmarks'];
+}
+
+/** What `POST /api/models/health` answers with. */
+export interface HealthRefreshResponse {
+  ok: boolean;
+  error?: string;
+  fetched?: number;
+  failed?: number;
+  considered?: number;
+  records?: HealthRecordView[];
 }
 
 const DEFAULT_TIMEOUT_MS = 8000;
@@ -137,6 +179,36 @@ export const api = {
   run: (runId: string) => request<RunDetailResponse>(`/api/runs/${encodeURIComponent(runId)}`),
   skills: () => request<SkillSummary[]>('/api/skills'),
   models: () => request<ModelSpec[]>('/api/models'),
+  /**
+   * Asks one provider, or every provider, what models it actually serves.
+   *
+   * A network round trip per provider, so it is a POST the operator triggers
+   * rather than something the console does on load. A provider that could not be
+   * reached answers 200 with `ok: false` and the reason, because the request
+   * succeeded and "I could not ask" is the answer.
+   */
+  discoverModels: (providerId?: string) =>
+    request<DiscoveryResponse>('/api/models/discover', 60_000, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(providerId === undefined ? {} : { providerId }),
+    }),
+  /**
+   * Refreshes pooled benchmark quality. Needs an OpenRouter key on the server;
+   * without one this answers `ok: false` with that reason rather than failing.
+   */
+  refreshBenchmarks: () =>
+    request<BenchmarkRefreshResponse>('/api/models/benchmarks', 90_000, { method: 'POST' }),
+  /**
+   * Fetches upstream endpoint uptime for the models actually in the routing
+   * pool, bounded by `limit`. One request per model, so the server caps it.
+   */
+  refreshHealth: (limit?: number) =>
+    request<HealthRefreshResponse>('/api/models/health', 90_000, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(limit === undefined ? {} : { limit }),
+    }),
   /**
    * Fallback path for a direct chat when the socket is not open. Normally the
    * `chat` command goes over the WebSocket and the reply arrives as a

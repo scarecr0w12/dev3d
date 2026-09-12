@@ -174,7 +174,10 @@ export function SubmitBar() {
 
         <span className="dock-meta dim small mono">
           {office && office.llmMode === 'mock' && (
-            <Badge tone="warn" title="The scripted provider: nothing reaches a real model and nothing is billed">
+            <Badge
+              tone={typeof office.configStale === 'string' && office.configStale !== '' ? 'danger' : 'warn'}
+              title={office.llmModeReason ?? 'The scripted provider: nothing reaches a real model and nothing is billed'}
+            >
               mock
             </Badge>
           )}

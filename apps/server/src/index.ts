@@ -17,13 +17,17 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
-import type { ClientCommand, ServerEvent, SkillSummary } from '@dev3d/core';
+import type { ClientCommand, QualityOpinion, ServerEvent, SkillSummary } from '@dev3d/core';
 import { toSkillSummary } from '@dev3d/core';
-import { loadConfig } from './config.ts';
+import { loadConfig, detectConfigDrift } from './config.ts';
 import type { ProviderConfig } from './config.ts';
 import { createRunEngine } from './engine/runEngine.ts';
 import type { ChatTurn } from './engine/runEngine.ts';
 import { createProviderRegistry } from './llm/registry.ts';
+import { createLearnedProvider } from './llm/quality.ts';
+import { createPooledService } from './llm/pooled.ts';
+import { createBenchmarkService } from './llm/benchmarks.ts';
+import { createHealthService } from './llm/health.ts';
 import { createPluginHost, type PluginHost } from './plugins/host.ts';
 import { createRuntime, type LogFn, type Runtime } from './server/runtime.ts';
 import { loadSkills, loadSkillsWithReport } from './skills/loader.ts';
@@ -134,6 +138,75 @@ async function main(): Promise<void> {
   let pluginHostRef: PluginHost | null = null;
   let runtimeRef: Runtime | null = null;
 
+  /** How many recent turns the learned layer reads. Bounded, and generous. */
+  const LEARNED_TURN_WINDOW = 2_000;
+
+  /**
+   * What this office has learned from its own turns.
+   *
+   * Derived from the persisted turn records rather than a separate table: the
+   * outcomes are already there, and one source of truth cannot disagree with
+   * itself. Cached, because the router asks for the catalog on every turn and a
+   * database scan does not belong in the middle of routing.
+   */
+  const learned = createLearnedProvider({
+    turns: () => store.recentTurns(LEARNED_TURN_WINDOW),
+    ttlMs: 30_000,
+  });
+
+  /**
+   * Public benchmark scores, when an operator has supplied a key.
+   *
+   * Off by default: no key means `refresh()` makes no request at all, so a
+   * default install still makes no outbound call it did not have to.
+   */
+  const pooled = createPooledService({
+    apiKey: process.env[config.pooledQualityKeyVar]?.trim() || null,
+    cachePath: config.pooledQualityCachePath,
+    ttlMs: config.pooledQualityTtlMs,
+    log,
+  });
+  if (pooled.loadCache() > 0) log('debug', 'pooled', `loaded ${pooled.status().count} cached benchmark entry(ies)`);
+
+  /**
+   * Pooled quality from OpenRouter's benchmark aggregation.
+   *
+   * Preferred over the direct Artificial Analysis source when both are
+   * configured, because OpenRouter returns the Artificial Analysis indices *as
+   * one of its three sources* plus Design Arena Elo and its own measured runs -
+   * so one credential covers more ground than two.
+   */
+  const benchmarks = config.benchmarks
+    ? createBenchmarkService({
+        apiKey: process.env.OPENROUTER_API_KEY?.trim() || null,
+        cachePath: config.benchmarkCachePath,
+        ttlMs: config.benchmarkTtlMs,
+        log,
+      })
+    : null;
+  if (benchmarks !== null && benchmarks.loadCache() > 0) {
+    const c = benchmarks.coverage();
+    log('debug', 'benchmarks', `loaded ${c.measured} cached benchmarked model(s)`);
+  }
+
+  /**
+   * Upstream endpoint uptime, which needs no key.
+   *
+   * Fetched lazily for the models actually being routed to, never awaited, so a
+   * turn never waits on a health lookup and a model nobody uses is never polled.
+   */
+  const health = config.endpointHealth
+    ? createHealthService({
+        providerIds: config.endpointHealthProviderIds,
+        cachePath: config.endpointHealthCachePath,
+        ttlMs: config.endpointHealthTtlMs,
+        log,
+      })
+    : null;
+  if (health !== null && health.loadCache() > 0) {
+    log('debug', 'health', `loaded uptime for ${health.status().known} model(s)`);
+  }
+
   const registry = createProviderRegistry(config, {
     // Read on every use, so enabling a plugin changes routing immediately.
     extraModels: () => pluginHostRef?.contributions().models ?? [],
@@ -141,6 +214,67 @@ async function main(): Promise<void> {
     // A corrected price or tier is read on every use, so an edit on the Settings
     // page changes routing and reporting from the next turn.
     modelOverrides: () => runtimeRef?.settings().modelOverrides ?? {},
+    /**
+     * Quality the catalog does not carry: what this office has observed from its
+     * own turns, plus whatever public benchmarks say.
+     *
+     * Asked per model, on every turn, so a finished turn is reflected in the next
+     * routing decision rather than after a restart. Every source is cached
+     * internally because this is on the router's hot path.
+     *
+     * All of them are returned rather than the first hit, so the blend weighs
+     * them against each other. An OpenRouter key subsumes the direct Artificial
+     * Analysis source, so in practice one benchmark opinion is present, not two.
+     */
+    extraOpinions: (spec) => {
+      const opinions: QualityOpinion[] = [];
+      const learnedOpinion = learned.opinions().get(spec.id);
+      if (learnedOpinion !== undefined) opinions.push(learnedOpinion);
+      const benchmarkOpinion = benchmarks?.opinionFor(spec) ?? pooled.opinionFor(spec);
+      if (benchmarkOpinion !== undefined) opinions.push(benchmarkOpinion);
+      return opinions;
+    },
+
+    /**
+     * Upstream uptime, as a demotion rather than an exclusion.
+     *
+     * Unknown contributes nothing, so a model on a provider we cannot ask about
+     * is never penalised for being unmeasured. Returns undefined for everything,
+     * harmlessly, when health tracking is switched off.
+     */
+    reliability: (spec) => health?.uptimeFor(spec),
+
+    /** Coverage of every signal the router weighs, for the console. */
+    signals: () => {
+      const coverage = benchmarks?.coverage() ?? null;
+      const learnedNow = learned.opinions();
+      let samples = 0;
+      for (const opinion of learnedNow.values()) samples += opinion.samples ?? 0;
+      return {
+        benchmarks: {
+          enabled: benchmarks !== null,
+          entries: coverage?.entries ?? 0,
+          models: coverage?.models ?? 0,
+          measured: coverage?.measured ?? 0,
+          fetchedAt: coverage?.fetchedAt ?? null,
+          attribution: coverage?.attribution ?? '',
+          detail:
+            benchmarks === null
+              ? 'switched off'
+              : process.env.OPENROUTER_API_KEY === undefined || process.env.OPENROUTER_API_KEY.trim() === ''
+                ? 'set OPENROUTER_API_KEY to enable pooled quality'
+                : coverage !== null && coverage.measured === 0
+                  ? 'no benchmarks have been fetched yet'
+                  : null,
+        },
+        health: {
+          enabled: health !== null,
+          known: health?.status().known ?? 0,
+          fetchedAt: health?.status().fetchedAt ?? null,
+        },
+        learned: { models: learnedNow.size, samples },
+      };
+    },
     /**
      * Whole providers from plugins. The credential is looked up in the
      * environment by the name the manifest declared, so a marketplace bundle
@@ -385,6 +519,16 @@ async function main(): Promise<void> {
           return;
         }
 
+        case 'setWorkspaceStyle': {
+          const result = runtime.setWorkspaceStyle(
+            cmd.workspaceId ?? runtime.activeWorkspaceId(),
+            cmd.style,
+          );
+          if (!result.ok) push(ws, { type: 'error', message: result.error ?? 'Failed.', at: Date.now() });
+          else broadcast({ type: 'office.updated', state: runtime.state(), at: Date.now() });
+          return;
+        }
+
         case 'approve': {
           const ok = runtime.decideApproval(cmd.approvalId, cmd.approved);
           if (!ok) {
@@ -576,9 +720,15 @@ async function main(): Promise<void> {
       }
 
       if (path === '/api/health') {
+        const drift = detectConfigDrift(config);
         sendJson(res, 200, {
           ok: true,
           llmMode: registry.mock ? 'mock' : 'live',
+          // Why the mode is what it is, and whether a restart would change it.
+          // A bare "mock" is what made a stale process look like a config bug.
+          llmModeReason: config.llmModeReason,
+          configStale: drift.stale,
+          configStaleDetail: drift.detail,
           version: config.version,
           store: store.backend,
           uptimeMs: Date.now() - runtime.startedAt,
@@ -697,6 +847,7 @@ async function main(): Promise<void> {
           name?: unknown;
           description?: unknown;
           color?: unknown;
+          style?: unknown;
         }>(req, res);
         if (body === null) return;
 
@@ -718,8 +869,14 @@ async function main(): Promise<void> {
             }),
           );
         }
+        // An explicit `null` resets the floor to the default preset; an absent
+        // field leaves the look alone. That distinction is why this is `in`
+        // rather than a truthiness check.
+        if ('style' in body) {
+          steps.push(runtime.setWorkspaceStyle(workspaceId, (body.style ?? null) as never));
+        }
         if (steps.length === 0) {
-          sendJson(res, 400, { error: 'Nothing to update: send skillIds, budget, name, description or color.' });
+          sendJson(res, 400, { error: 'Nothing to update: send skillIds, budget, name, description, color or style.' });
           return;
         }
         const failed = steps.find((step) => !step.ok);
@@ -774,6 +931,102 @@ async function main(): Promise<void> {
 
       if (path === '/api/providers') {
         sendJson(res, 200, registry.status());
+        return;
+      }
+
+      // ------------------------------------------------------- model discovery
+      //
+      // Asking a provider what it serves is a network round trip, so it is a
+      // POST the console triggers rather than something a GET does as a side
+      // effect. It answers with the whole refreshed picture - the reports, the
+      // provider statuses and the resulting catalog - so a console never has to
+      // guess what an attempt changed, and a provider that could not be reached
+      // is a 200 carrying the reason rather than an error: the request
+      // succeeded, and "I could not ask" is the answer.
+      if (path === '/api/models/discover' && req.method === 'POST') {
+        const body = await readJson<{ providerId?: unknown; force?: unknown }>(req, res);
+        if (body === null) return;
+
+        // In `mock` mode the seed IS the catalog - the mock adapter serves every
+        // provider, so a provider's real list is deliberately ignored. Asking
+        // would make a keyless office perform outbound requests that cannot
+        // change anything, so it does not.
+        if (registry.mock) {
+          sendJson(res, 200, {
+            reports: [],
+            providers: registry.status(),
+            models: registry.models(),
+            note: 'mock mode keeps the curated catalog; discovery is skipped.',
+          });
+          return;
+        }
+
+        const providerId = typeof body.providerId === 'string' && body.providerId !== '' ? body.providerId : null;
+        if (providerId !== null && registry.get(providerId) === undefined) {
+          sendJson(res, 404, { error: `No provider with id '${providerId}' is loaded.` });
+          return;
+        }
+
+        const reports =
+          providerId === null
+            ? await registry.discovery.discoverAll({ force: body.force !== false })
+            : [await registry.discovery.discover(providerId, { force: body.force !== false })].filter(
+                (report): report is NonNullable<typeof report> => report !== null,
+              );
+
+        registry.discovery.saveCache();
+        // The catalog just changed, so every open console is told rather than
+        // left showing the list it had a moment ago.
+        broadcast({ type: 'office.updated', state: runtime.state(), at: Date.now() });
+
+        sendJson(res, 200, {
+          reports,
+          providers: registry.status(),
+          models: registry.models(),
+        });
+        return;
+      }
+
+      // Pooled quality and endpoint health are refreshed on demand as well as at
+      // boot, because both are network work the operator may want to trigger
+      // deliberately and watch the result of.
+      if (path === '/api/models/benchmarks' && req.method === 'POST') {
+        if (benchmarks === null) {
+          sendJson(res, 200, { ok: false, error: 'benchmark quality is switched off (DEV3D_BENCHMARKS=false)' });
+          return;
+        }
+        const result = await benchmarks.refresh();
+        if (result.ok) benchmarks.saveCache();
+        broadcast({ type: 'office.updated', state: runtime.state(), at: Date.now() });
+        sendJson(res, 200, { ...result, coverage: benchmarks.coverage(), models: registry.models() });
+        return;
+      }
+
+      if (path === '/api/models/health' && req.method === 'POST') {
+        if (health === null) {
+          sendJson(res, 200, { ok: false, error: 'endpoint health is switched off (DEV3D_ENDPOINT_HEALTH=false)' });
+          return;
+        }
+        // Bounded deliberately: this is one request per model, so refreshing the
+        // whole 445-model catalog would be 445 requests for a signal the router
+        // only consults for models actually in play.
+        const body = await readJson<{ limit?: unknown }>(req, res);
+        if (body === null) return;
+        const limit = Math.max(1, Math.min(50, typeof body.limit === 'number' ? Math.floor(body.limit) : 20));
+        const candidates = registry
+          .routableModels()
+          .filter((model) => config.endpointHealthProviderIds.includes(model.providerId))
+          .slice(0, limit);
+        const result = await health.refresh(candidates);
+        health.saveCache();
+        broadcast({ type: 'office.updated', state: runtime.state(), at: Date.now() });
+        // The records are returned because uptime is a per-model lookup the
+        // console cannot read from `office.models`, and an action that produces
+        // nothing visible is one nobody can trust.
+        const records = candidates
+          .map((model) => health.recordFor(model))
+          .filter((record): record is NonNullable<typeof record> => record !== undefined);
+        sendJson(res, 200, { ok: true, ...result, considered: candidates.length, records, status: health.status() });
         return;
       }
 
@@ -1088,8 +1341,7 @@ async function main(): Promise<void> {
   const configured = registry.status().filter((p) => p.configured);
   log('info', 'boot', `dev3d ${config.version} - ${runtime.org.chart().company.name}`);
   log('info', 'boot', `http://${config.host}:${config.port}  ws://${config.host}:${config.port}/ws`);
-  log('info', 'boot', `mode: ${registry.mock ? 'mock (scripted, no billing)' : 'live'} | routing: ${config.routingPosture}`);
-  const activeWorkspace = runtime.workspace(runtime.activeWorkspaceId());
+  log('info', 'boot', `mode: ${registry.mock ? 'mock (scripted, no billing)' : 'live'} | routing: ${config.routingPosture}`);  const activeWorkspace = runtime.workspace(runtime.activeWorkspaceId());
   const buildings = runtime.workspaces();
   log(
     'info',
@@ -1104,6 +1356,17 @@ async function main(): Promise<void> {
   );
   log('info', 'boot', `skills: ${skills.length} | tools: ${tools.names().length} | models: ${registry.models().length}`);
   log('info', 'boot', `providers configured: ${configured.length > 0 ? configured.map((p) => p.id).join(', ') : 'none'}`);
+  if (config.modelDiscovery) {
+    const seeded = registry.status().filter((p) => p.configured && p.modelSource !== 'discovered');
+    log(
+      'info',
+      'boot',
+      `model discovery: on (cache ${config.discoveryCachePath ?? 'off'}, ttl ${Math.round(config.discoveryTtlMs / 60_000)}m)` +
+        (seeded.length > 0 ? ` — ${seeded.length} configured provider(s) not yet discovered` : ''),
+    );
+  } else {
+    log('info', 'boot', 'model discovery: off — the curated catalog is the only source');
+  }
   log('info', 'boot', `workspace: ${config.workspace}`);
   log('info', 'boot', `store: ${store.backend}`);
   if (config.dotEnvCount > 0) log('info', 'boot', `loaded ${config.dotEnvCount} value(s) from .env`);
@@ -1111,7 +1374,13 @@ async function main(): Promise<void> {
     log('warn', 'boot', 'DEV3D_AUTO_APPROVE_SHELL is on: employees may run shell commands without asking.');
   }
   if (registry.mock) {
-    log('info', 'boot', 'no provider keys found - the office runs its scripted employees end to end.');
+    // The reason, not a guess at it. This line used to read "no provider keys
+    // found" whenever the mode was mock, which was simply false when mock had
+    // been forced with keys present - and cost somebody an afternoon of looking
+    // for a configuration bug that did not exist.
+    log('info', 'boot', `scripted employees: ${config.llmModeReason}`);
+  } else {
+    log('info', 'boot', `live providers: ${config.llmModeReason}`);
   }
 
   runtime.emit({
@@ -1124,6 +1393,73 @@ async function main(): Promise<void> {
       `${registry.mock ? 'running on scripted employees (no API keys configured)' : 'live model providers connected'}.`,
     at: Date.now(),
   });
+
+  // ---------------------------------------------------------- model discovery
+  //
+  // Deliberately *after* the office is listening and deliberately not awaited
+  // before it. Asking six providers what they serve is six network round trips,
+  // and boot must not depend on somebody else's uptime: the console comes up on
+  // the cached or curated catalog and the list corrects itself a moment later.
+  if (config.modelDiscovery && !registry.mock) {
+    const configuredIds = registry
+      .status()
+      .filter((provider) => provider.configured && provider.modelSource !== 'discovered')
+      .map((provider) => provider.id);
+
+    if (configuredIds.length > 0) {
+      log('info', 'discovery', `asking ${configuredIds.length} configured provider(s) what they serve`);
+      // Not awaited: the server is already serving, and a provider that hangs
+      // must not hold the process open.
+      void (async () => {
+        try {
+          const reports = await registry.discovery.discoverAll({ onlyConfigured: true });
+          registry.discovery.saveCache();
+          for (const report of reports) {
+            log(
+              report.ok ? 'info' : 'warn',
+              'discovery',
+              report.ok
+                ? `${report.providerId}: ${report.models.length} model(s) in ${report.durationMs}ms`
+                : `${report.providerId}: ${report.error ?? 'failed'} — using the curated catalog`,
+            );
+          }
+          // The catalog is now different from the one `hello` carried, so any
+          // console already connected is handed the corrected state.
+          broadcast({ type: 'office.updated', state: runtime.state(), at: Date.now() });
+        } catch (err) {
+          // `discoverAll` does not throw, so reaching here would be a bug - but a
+          // background task must never take the process down.
+          log('warn', 'discovery', `unexpected failure: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      })();
+    }
+  }
+
+  // ---------------------------------------------------------- pooled quality
+  //
+  // Also after the office is listening, and also not awaited. A benchmark
+  // aggregator is a third party we do not depend on: if it is slow or down, the
+  // curated and learned opinions are unaffected and nobody notices.
+  if (benchmarks !== null && (process.env.OPENROUTER_API_KEY?.trim() ?? '') !== '') {
+    void (async () => {
+      const result = await benchmarks.refresh();
+      if (result.ok) {
+        benchmarks.saveCache();
+        const c = benchmarks.coverage();
+        log('info', 'benchmarks', `${c.measured} benchmarked model(s) of ${c.models} in the payload`);
+      }
+    })();
+  }
+
+  if (process.env[config.pooledQualityKeyVar]?.trim()) {
+    void (async () => {
+      const result = await pooled.refresh();
+      if (result.ok) {
+        pooled.saveCache();
+        log('info', 'pooled', `pooled quality: ${result.count} benchmarked model(s) from ${pooled.status().attribution}`);
+      }
+    })();
+  }
 
   // ----------------------------------------------------------------- shutdown
   let closing = false;

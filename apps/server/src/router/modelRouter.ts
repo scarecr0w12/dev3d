@@ -4,6 +4,28 @@
  *
  * The router never throws on an empty catalog — it returns an empty decision so
  * the caller can surface a clear error instead of crashing the turn.
+ *
+ * ## What changed, and what deliberately did not
+ *
+ * Ranking used to be a tier walk with a cost tiebreak: `ModelSpec.strengths` was
+ * populated and displayed but never read, so size and price decided everything.
+ * It now ranks on a score (see `score.ts`) built from the model's quality, its
+ * fitness for *this* task class, how close its tier is to the one the policy
+ * asked for, and its price. A model that is genuinely better at the work can win
+ * from a tier away.
+ *
+ * Three things are deliberately unchanged, because they are contracts other
+ * parts of the office rely on:
+ *
+ *  - **The policy still decides the tier.** Complexity, escalation threshold,
+ *    `posture`, budget pressure and the min/max clamp all resolve a target tier
+ *    exactly as before, and that target is the front of the walk.
+ *  - **A plugin rule still cannot move a turn to another tier.** A rule's tier
+ *    joins the front of the walk and its model/provider preferences apply as
+ *    score bonuses *confined to that tier*, so it can reorder candidates without
+ *    being able to make the router pick something the policy did not allow.
+ *  - **With no quality information anywhere, the outcome is identical to the old
+ *    one.** This is pinned by test, not asserted in a comment.
  */
 
 import type {
@@ -17,6 +39,13 @@ import type {
 } from '@dev3d/core';
 import { MODEL_TIER_ORDER, applyRoutingHints, hintsForTaskClass, tierRank } from '@dev3d/core';
 import { blendedCostPerKTok } from '../llm/pricing.ts';
+import {
+  explainScore,
+  provenanceOf,
+  rankCandidates,
+  walkOrder,
+  type ScoredCandidate,
+} from './score.ts';
 
 export interface RouteOptions {
   models: ModelSpec[];
@@ -29,7 +58,29 @@ export interface RouteOptions {
    * make the router pick a model that lacks tools or context.
    */
   hints?: RoutingHint[];
+  /**
+   * Observed upstream uptime for a model, 0..1, or undefined when unknown.
+   * Undefined contributes nothing to the score.
+   */
+  reliability?: (model: ModelSpec) => number | undefined;
 }
+
+/**
+ * What a plugin preference is worth, as a score bonus.
+ *
+ * Sized against `SCORE_WEIGHTS`: a fitness term spans 0.45, so 0.08 is a real
+ * pull within a tier without being able to outweigh a tier step (0.35 x 0.15 =
+ * 0.0525 for the affinity alone). Since a bonus is only ever applied to models in
+ * the rule's own tier, it cannot move the decision across tiers at all.
+ */
+const HINT_BONUS = {
+  /** This exact model. */
+  model: 0.08,
+  /** A provider the rule named. */
+  provider: 0.04,
+  /** A model the rule asked to avoid. */
+  avoid: -0.12,
+} as const;
 
 function tierAt(rank: number): ModelTier {
   const clamped = Math.max(0, Math.min(MODEL_TIER_ORDER.length - 1, rank));
@@ -40,18 +91,18 @@ function oneTierUp(t: ModelTier): ModelTier {
   return tierAt(tierRank(t) + 1);
 }
 
-function byCost(a: ModelSpec, b: ModelSpec): number {
-  return blendedCostPerKTok(a) - blendedCostPerKTok(b) || a.id.localeCompare(b.id);
-}
-
-function toCandidate(m: ModelSpec, reason: string): RouteCandidate {
-  return {
-    providerId: m.providerId,
-    modelId: m.id,
-    tier: m.tier,
-    blendedCostPerKTok: blendedCostPerKTok(m),
+function toCandidate(scored: ScoredCandidate, reason: string): RouteCandidate {
+  const out: RouteCandidate = {
+    providerId: scored.model.providerId,
+    modelId: scored.model.id,
+    tier: scored.model.tier,
+    blendedCostPerKTok: blendedCostPerKTok(scored.model),
     reason,
+    fitness: scored.fitness,
+    quality: scored.quality,
+    score: scored.score,
   };
+  return out;
 }
 
 interface FilterFlags {
@@ -75,6 +126,44 @@ function applyFilters(
     }
     return true;
   });
+}
+
+/**
+ * Build the per-model score bonuses a task class's plugin rules ask for.
+ *
+ * A rule's preferences are confined to one tier: the tier it declares, or the
+ * policy's target tier when it declares none. That is what keeps the documented
+ * promise - a rule reorders the candidates the router already considers, and
+ * cannot re-price the pipeline or move a turn to a tier the policy did not ask
+ * for.
+ */
+function hintBonuses(
+  hints: RoutingHint[],
+  target: ModelTier,
+  pool: ModelSpec[],
+): Map<string, number> {
+  const bonuses = new Map<string, number>();
+  if (hints.length === 0) return bonuses;
+
+  const add = (modelId: string, amount: number): void => {
+    bonuses.set(modelId, (bonuses.get(modelId) ?? 0) + amount);
+  };
+
+  for (const hint of hints) {
+    const scopedTier = hint.tier ?? target;
+    const inScope = pool.filter((model) => model.tier === scopedTier);
+    const preferredProviders = new Set(hint.preferProviderIds);
+    const preferredModels = new Set(hint.preferModelIds);
+    const avoidedModels = new Set(hint.avoidModelIds);
+
+    for (const model of inScope) {
+      if (preferredModels.has(model.id)) add(model.id, HINT_BONUS.model);
+      if (preferredProviders.has(model.providerId)) add(model.id, HINT_BONUS.provider);
+      if (avoidedModels.has(model.id)) add(model.id, HINT_BONUS.avoid);
+    }
+  }
+
+  return bonuses;
 }
 
 export function routeModel(req: RouteRequest, opts: RouteOptions): RouteDecision {
@@ -154,54 +243,64 @@ export function routeModel(req: RouteRequest, opts: RouteOptions): RouteDecision
     relaxNote = 'no model satisfied the request; fell back to the full catalog';
   }
 
-  // 6. cheapest at exactly target, then step up, then down.
-  // A plugin rule that names a tier for this task class pulls it to the front of
-  // the walk, which is the only way a hint can move the chosen tier. A rule
-  // scoped to one task class must not touch any other, or a tweak meant for
-  // intake would silently re-price the whole pipeline.
   const hints = hintsForTaskClass(opts.hints ?? [], req.taskClass);
+
+  // 6. Everything the walk and the score need, derived once.
+  //
+  // A plugin rule that names a tier pulls it to the front of the walk, which is
+  // the only way a hint can move the chosen tier. A rule scoped to one task
+  // class must not touch any other, or a tweak meant for intake would silently
+  // re-price the whole pipeline.
   const hintedTiers = hints
     .filter((hint) => hint.tier !== undefined)
     .map((hint) => hint.tier as ModelTier);
-  const targetRank = tierRank(target);
-  const order: ModelTier[] = [];
-  for (const tier of hintedTiers) {
-    if (!order.includes(tier)) order.push(tier);
-  }
-  if (!order.includes(target)) order.push(target);
-  for (let r = targetRank + 1; r < MODEL_TIER_ORDER.length; r++) {
-    const tier = tierAt(r);
-    if (!order.includes(tier)) order.push(tier);
-  }
-  for (let r = targetRank - 1; r >= 0; r--) {
-    const tier = tierAt(r);
-    if (!order.includes(tier)) order.push(tier);
-  }
-
-  /** Order one tier's models so plugin preferences come first, cost breaking ties. */
-  const orderTier = (models: ModelSpec[]): ModelSpec[] => {
-    const byCostFirst = [...models].sort(byCost);
-    if (hints.length === 0) return byCostFirst;
-    const byId = new Map(models.map((model) => [model.id, model]));
-    const ordered = applyRoutingHints(
-      byCostFirst.map((model) => toCandidate(model, '')),
-      hints,
-    );
-    return ordered
-      .map((candidate) => byId.get(candidate.modelId))
-      .filter((model): model is ModelSpec => model !== undefined);
+  const walk = walkOrder(target, hintedTiers);
+  const scoreCtx = {
+    taskClass: req.taskClass,
+    walk,
+    posture,
+    pool,
+    hintBonus: hintBonuses(hints, target, pool),
+    ...(opts.reliability !== undefined ? { reliability: opts.reliability } : {}),
+    ...(req.budgetRemainingUsd !== undefined ? { budgetRemainingUsd: req.budgetRemainingUsd } : {}),
   };
 
-  let chosen: ModelSpec | undefined;
-  for (const tier of order) {
-    const first = orderTier(pool.filter((m) => m.tier === tier))[0];
-    if (first) {
-      chosen = first;
-      break;
+  const ranked = rankCandidates(pool, scoreCtx);
+  const byId = new Map(ranked.map((scored) => [scored.model.id, scored]));
+
+  // 7. A role pinned to one concrete model, when the operator has set one.
+  //
+  // The pin is honoured inside the policy's own bounds rather than above them:
+  // `minTier`/`maxTier` are the statement about how much model this role may
+  // have, and a pin that contradicts them is a mistake worth reporting, not a
+  // silently honoured instruction that makes the bounds a lie.
+  let chosen: ScoredCandidate | undefined;
+  let pinned = false;
+  if (policy.preferredModelId !== undefined && policy.preferredModelId !== '') {
+    const wanted = policy.preferredModelId;
+    const candidate = byId.get(wanted);
+    if (candidate === undefined) {
+      const known = models.some((model) => model.id === wanted);
+      notes.push(
+        known
+          ? `pinned model '${wanted}' is excluded or lacks a required capability; chose normally instead`
+          : `pinned model '${wanted}' is not in the catalog; chose normally instead`,
+      );
+    } else if (tierRank(candidate.model.tier) < minRank || tierRank(candidate.model.tier) > maxRank) {
+      notes.push(
+        `pinned model '${wanted}' is a ${candidate.model.tier} model, outside this policy's ` +
+          `${policy.minTier}..${policy.maxTier} bounds; chose normally instead`,
+      );
+    } else {
+      chosen = candidate;
+      pinned = true;
     }
   }
 
-  if (!chosen) {
+  // 8. Otherwise the best score wins.
+  if (chosen === undefined) chosen = ranked[0];
+
+  if (chosen === undefined) {
     // Unreachable when the catalog is non-empty, but kept as a hard guard.
     return {
       providerId: '',
@@ -214,64 +313,77 @@ export function routeModel(req: RouteRequest, opts: RouteOptions): RouteDecision
     };
   }
 
-  // 7. build the decision.
-  const chosenKey = `${chosen.providerId}/${chosen.id}`;
+  const chosenKey = `${chosen.model.providerId}/${chosen.model.id}`;
 
+  // 9. Fallbacks: same tier on another provider first, then one tier up.
+  //
+  // Ordered by score rather than by price, so the first thing the engine reaches
+  // for when a provider dies is the next-best model for this work, not merely
+  // the next-cheapest one. Plugin preferences reorder within that, which is what
+  // keeps `applyRoutingHints` doing something real.
   const fallbacks: RouteCandidate[] = [];
   const seen = new Set<string>([chosenKey]);
-  const sameTier = pool
-    .filter((m) => m.tier === chosen!.tier && m.providerId !== chosen!.providerId)
-    .sort(byCost);
-  for (const m of sameTier) {
+  const sameTier = ranked
+    .filter((scored) => scored.model.tier === chosen!.model.tier && scored.model.providerId !== chosen!.model.providerId)
+    .map((scored) => toCandidate(scored, 'same-tier fallback'));
+  for (const candidate of applyRoutingHints(sameTier, hints)) {
     if (fallbacks.length >= 3) break;
-    const key = `${m.providerId}/${m.id}`;
+    const key = `${candidate.providerId}/${candidate.modelId}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    fallbacks.push(toCandidate(m, 'same-tier fallback'));
+    fallbacks.push(candidate);
   }
-  if (fallbacks.length < 3 && tierRank(chosen!.tier) < MODEL_TIER_ORDER.length - 1) {
-    const up = pool.filter((m) => m.tier === oneTierUp(chosen!.tier)).sort(byCost)[0];
-    if (up) {
-      const key = `${up.providerId}/${up.id}`;
+  if (fallbacks.length < 3 && tierRank(chosen.model.tier) < MODEL_TIER_ORDER.length - 1) {
+    const up = ranked.filter((scored) => scored.model.tier === oneTierUp(chosen!.model.tier))[0];
+    if (up !== undefined) {
+      const key = `${up.model.providerId}/${up.model.id}`;
       if (!seen.has(key)) fallbacks.push(toCandidate(up, 'next tier up fallback'));
     }
   }
 
-  const considered: RouteCandidate[] = [];
-  for (const m of models) {
-    if (`${m.providerId}/${m.id}` === chosenKey) continue;
-    considered.push(toCandidate(m, rejectReason(m)));
-  }
-  considered.sort((a, b) => a.blendedCostPerKTok - b.blendedCostPerKTok);
+  // 10. Everything else, with the honest reason it lost.
+  const considered: RouteCandidate[] = ranked
+    .filter((scored) => scored.model.id !== chosen!.model.id || scored.model.providerId !== chosen!.model.providerId)
+    .map((scored) => toCandidate(scored, rejectReason(scored)));
+  considered.sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || a.blendedCostPerKTok - b.blendedCostPerKTok);
 
-  function rejectReason(m: ModelSpec): string {
+  function rejectReason(scored: ScoredCandidate): string {
+    const m = scored.model;
     if (excluded.has(m.id)) return 'excluded';
     if (req.requiresTools && !m.capabilities.tools) return 'lacks tool calling';
     if (req.requiresVision && !m.capabilities.vision) return 'lacks vision';
     if (req.minContextTokens !== undefined && m.contextWindow < req.minContextTokens) {
       return 'context window too small';
     }
-    const r = tierRank(m.tier);
-    const cr = tierRank(chosen!.tier);
-    if (r < cr) return 'tier too low';
-    if (r === cr) return 'more expensive than the chosen model at the same tier';
-    return 'above the selected tier';
+    if (pinned) return 'a pin is in force for this role';
+    if (scored.walkPosition < 0) return 'tier is not on this policy\u2019s walk';
+    if (scored.score < chosen!.score) {
+      return `scored ${scored.score.toFixed(3)} against the chosen ${chosen!.score.toFixed(3)}`;
+    }
+    return 'tied on score; more expensive, or later by id';
   }
 
-  const clauses: string[] = [
-    `task '${req.taskClass}' maps to ${target} under this role's policy`,
-  ];
+  const clauses: string[] = [`task '${req.taskClass}' maps to ${target} under this role's policy`];
   for (const n of notes) clauses.push(n);
   if (relaxNote) clauses.push(relaxNote);
-  clauses.push(`chose ${chosen.label} (${chosen.providerId}/${chosen.id})`);
+  if (pinned) clauses.push(`pinned by this role's model policy`);
+  clauses.push(`chose ${chosen.model.label} (${chosen.model.providerId}/${chosen.model.id})`);
+  clauses.push(explainScore(chosen, scoreCtx));
+  const provenance = provenanceOf(chosen.model);
+  if (provenance !== null) clauses.push(`quality from ${provenance}`);
 
-  return {
-    providerId: chosen.providerId,
-    modelId: chosen.id,
-    tier: chosen.tier,
+  const decision: RouteDecision = {
+    providerId: chosen.model.providerId,
+    modelId: chosen.model.id,
+    tier: chosen.model.tier,
     taskClass: req.taskClass,
     reason: clauses.join(' — '),
     fallbacks,
     considered,
+    pinned,
+    quality: chosen.quality,
+    fitness: chosen.fitness,
+    score: chosen.score,
   };
+  return decision;
 }

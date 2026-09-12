@@ -517,15 +517,31 @@ function TopBar({
         {office && (
           <>
             <Badge
-              tone={office.llmMode === 'mock' ? 'warn' : 'ok'}
-              title={
-                office.llmMode === 'mock'
-                  ? 'Scripted provider: no API spend'
-                  : 'Live providers: turns spend real money'
+              tone={
+                office.llmMode !== 'mock'
+                  ? 'ok'
+                  : typeof office.configStale === 'string' && office.configStale !== ''
+                    ? 'danger'
+                    : 'warn'
               }
+              // The reason, not a restatement of the mode. The top bar is the
+              // badge people actually stare at, so a bare "mock" here is exactly
+              // what made a stale process look like a configuration bug.
+              title={office.llmModeReason ?? `llm: ${office.llmMode}`}
             >
               {office.llmMode}
             </Badge>
+            {/*
+              Always visible, because the mode badge alone cannot say "the
+              environment changed after this process started, so restart it".
+              Without this the natural conclusion is that the mode logic is
+              broken, which is exactly what it looked like.
+            */}
+            {typeof office.configStale === 'string' && office.configStale !== '' && (
+              <Badge tone="danger" title={office.configStale}>
+                restart needed
+              </Badge>
+            )}
             <span className="dim small mono header-spend" title="active runs · total runs · spend this session">
               {activeRuns} active · {formatUsd(spend)}
             </span>

@@ -4,5 +4,7 @@
     "lib": ["ES2023", "DOM"],
     "types": []
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "//": "Test files are excluded: they import node:test, and this package deliberately has no @types/node so its source cannot reach for a Node API by accident. `pnpm test` runs them through Node's own type stripping, and apps/server typechecks its tests because it genuinely is a Node process.",
+  "exclude": ["src/**/*.test.ts"]
 }

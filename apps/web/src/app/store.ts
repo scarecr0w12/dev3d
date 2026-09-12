@@ -690,7 +690,7 @@ export class OfficeStore implements ClientOfficeStore {
     this.emit('connection');
     this.pushFeed({
       kind: 'lifecycle',
-      text: `connected · ${state.company.name} · ${state.roles.length} roles · llmMode=${state.llmMode} · posture=${state.routingPosture}`,
+      text: `connected · ${state.company.name} · ${state.roles.length} roles · llmMode=${state.llmMode} · posture=${state.routingPosture}${typeof state.configStale === 'string' && state.configStale !== '' ? ` · RESTART NEEDED: ${state.configStale}` : ''}`,
       at,
     });
   }

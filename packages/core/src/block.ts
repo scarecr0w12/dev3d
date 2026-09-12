@@ -18,6 +18,87 @@
 /** The four sides of a module, named for the direction the wall faces. */
 export type BlockEdge = 'n' | 'e' | 's' | 'w';
 
+/**
+ * What a module is *for*.
+ *
+ * A flat string with a documented vocabulary rather than a closed union: a
+ * plugin-contributed module, or one hand-added to `blocks.json` ahead of a
+ * Blender rebuild, must be placeable rather than rejected for being a kind this
+ * build has not heard of. The renderer switches on `furniture`, which is the
+ * narrower question it actually needs answered.
+ */
+export type OfficeBlockKindName =
+  | 'open'
+  | 'room'
+  | 'meeting'
+  | 'lounge'
+  | 'junction'
+  | 'corridor'
+  | 'portal'
+  | 'focus'
+  | 'phone'
+  | 'library'
+  | 'workshop'
+  | 'server'
+  | 'breakroom'
+  | 'boardroom'
+  | 'gallery'
+  | string;
+
+/** Coarse grouping, so a UI can offer "more meeting space" as one choice. */
+export type OfficeBlockCategory = 'work' | 'meet' | 'quiet' | 'support' | 'circulation' | 'fitting';
+
+/**
+ * How the inside of a module is fitted out.
+ *
+ * The layout of desks, tables and soft seating inside a room is not a property
+ * of its size — a 6 x 6 room can be a booth, a library or a rack room — so it is
+ * named separately and the Blender builder switches on it. `none` is a room you
+ * walk through: a junction or a corridor.
+ */
+export type OfficeFurniture =
+  | 'desks'
+  | 'meeting'
+  | 'boardroom'
+  | 'lounge'
+  | 'booths'
+  | 'phone'
+  | 'library'
+  | 'workshop'
+  | 'racks'
+  | 'breakout'
+  | 'gallery'
+  | 'none';
+
+/**
+ * A loose object that dresses a module without being furniture.
+ *
+ * Props are what stop two rooms of the same size reading as the same room: a
+ * plant, a whiteboard, a shelf, a rack of coats. They carry no seats and never
+ * affect capacity — they are placed by the Blender builder, and this list is how
+ * `blocks.json` records which of them a module ships with, for the console to
+ * describe and for a future editor to toggle.
+ */
+export type OfficeProp =
+  | 'plant'
+  | 'tallPlant'
+  | 'whiteboard'
+  | 'pinboard'
+  | 'shelf'
+  | 'storage'
+  | 'coatRack'
+  | 'water'
+  | 'coffee'
+  | 'printer'
+  | 'lockers'
+  | 'lamp'
+  | 'pendant'
+  | 'rug'
+  | 'partition'
+  | 'stool'
+  | 'screen'
+  | 'art';
+
 /** A doorway on the core, in world metres: its centre and outward normal. */
 export interface CorePort {
   id: string;
@@ -30,8 +111,14 @@ export interface CorePort {
 export interface OfficeBlockKind {
   id: string;
   name: string;
-  /** `open` | `room` | `meeting` | `lounge` | `junction` | `portal`. */
-  kind: string;
+  /** What the module is for. See {@link OfficeBlockKindName}. */
+  kind: OfficeBlockKindName;
+  /** Coarse grouping, for a UI that offers space by purpose. */
+  category?: OfficeBlockCategory;
+  /** How the inside is fitted out. Absent means `desks`. */
+  furniture?: OfficeFurniture;
+  /** Loose objects the module ships with. See {@link OfficeProp}. */
+  props?: OfficeProp[];
   width: number;
   depth: number;
   /** Edges with a doorway. Growth attaches through these. */

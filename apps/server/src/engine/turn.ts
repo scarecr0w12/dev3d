@@ -274,7 +274,14 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
       budgetRemainingUsd,
       posture,
     },
-    { models: deps.registry.routableModels(), posture, hints: deps.routingHints?.() ?? [] },
+    {
+      models: deps.registry.routableModels(),
+      posture,
+      hints: deps.routingHints?.() ?? [],
+      // Upstream uptime, when it is known. Never awaited: an unknown model is
+      // queued for a background lookup and routes without it this time.
+      reliability: (model) => deps.registry.reliability(model),
+    },
   );
 
   const turn: TurnRecord = {
@@ -339,6 +346,10 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
   let assistantText = '';
   let reasoningText: string | null = null;
   let status: TurnRecord['status'] = 'done';
+  /** The model that actually answered, once one has. */
+  let servedBy: { providerId: string; modelId: string } | null = null;
+  /** Routes that failed before one answered. */
+  const attemptedRoutes: string[] = [];
   let error: string | null = null;
 
   const appendText = (chunk: string): void => {
@@ -357,7 +368,7 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
         break;
       }
 
-      const { result } = await deps.registry.chat(
+      const { result, used, attempted } = await deps.registry.chat(
         { providerId: route.providerId, modelId: route.modelId },
         route.fallbacks.map((f) => ({ providerId: f.providerId, modelId: f.modelId })),
         {
@@ -375,6 +386,12 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
           signal: req.signal,
         },
       );
+
+      // Which model actually answered, and what was tried before it. Kept on the
+      // turn because a fallback serving the work is a fact about that model's
+      // health, and crediting the routed model for it would be wrong.
+      servedBy = used;
+      if (attempted.length > 0) attemptedRoutes.push(...attempted);
 
       usage.tokensIn += result.usage.tokensIn;
       usage.tokensOut += result.usage.tokensOut;
@@ -430,6 +447,8 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
   turn.reasoning = reasoningText;
   turn.wroteFiles = [...turnWrites];
   turn.error = error;
+  if (servedBy !== null) turn.servedBy = servedBy;
+  if (attemptedRoutes.length > 0) turn.attemptedRoutes = [...attemptedRoutes];
 
   // The run's budget is live: a turn that costs money must move it immediately,
   // or the next turn routes as though the run were still free.

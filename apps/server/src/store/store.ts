@@ -37,6 +37,14 @@ export interface Store {
   saveTurn(turn: TurnRecord): void;
   turnsForRun(runId: string): TurnRecord[];
   turnsForStage(stageId: string): TurnRecord[];
+  /**
+   * The most recent turns across every run, newest first.
+   *
+   * Bounded rather than "all" because its only consumer is outcome-based
+   * learning, which is about recent behaviour on the current catalog and would
+   * be actively misled by turns from a model version that no longer exists.
+   */
+  recentTurns(limit: number): TurnRecord[];
 
   saveArtifact(artifact: Artifact): void;
   artifactsForRun(runId: string): Artifact[];
@@ -98,6 +106,8 @@ function createMemoryStore(reason: string, log: Log): Store {
     },
     turnsForRun: (runId) => [...turns.values()].filter((t) => t.runId === runId),
     turnsForStage: (stageId) => [...turns.values()].filter((t) => t.stageId === stageId),
+    recentTurns: (limit) =>
+      [...turns.values()].sort((a, b) => b.startedAt - a.startedAt).slice(0, limit),
     saveArtifact: (artifact) => {
       artifacts.set(artifact.id, structuredClone(artifact));
     },
@@ -306,6 +316,15 @@ export function openStore(dbPath: string, log: Log): Store {
       const rows = db
         .prepare('SELECT json FROM turns WHERE stage_id = ? ORDER BY started_at ASC')
         .all(stageId) as JsonRow[];
+      return rows.map((r) => parse<TurnRecord>(r.json, null)).filter((t): t is TurnRecord => t !== null);
+    },
+
+    recentTurns(limit) {
+      // Served by the `turns_started` index, so a bounded read stays cheap on a
+      // table that grows with every turn the office has ever taken.
+      const rows = db
+        .prepare('SELECT json FROM turns ORDER BY started_at DESC LIMIT ?')
+        .all(Math.max(0, Math.floor(limit))) as JsonRow[];
       return rows.map((r) => parse<TurnRecord>(r.json, null)).filter((t): t is TurnRecord => t !== null);
     },
 

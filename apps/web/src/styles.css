@@ -607,6 +607,14 @@ textarea {
   flex: 0 0 120px;
 }
 
+/* A model picker's options carry vendor ids - `openrouter/deepseek/deepseek-chat`
+   is not unusual - and a select takes its longest option as an intrinsic
+   minimum. A full basis puts it on its own line in a wrapping row instead of
+   forcing every other field in that row to squeeze. */
+.field-wide {
+  flex: 1 1 100%;
+}
+
 /* A form control carries its longest option as an intrinsic minimum, so a
    `flex: 0 0 168px` field still overflows its own basis and wraps the row it is
    in. These are the two declarations that let a field actually be narrow. */
@@ -1097,6 +1105,177 @@ textarea {
   z-index: 2;
 }
 
+/* ------------------------------------------------------------ floor style
+   The look editor, anchored in the viewport's top bar. It expands downward over
+   the 3D view rather than displacing it: the whole point of the panel is that a
+   change is visible in the floor behind it. */
+
+.office-style {
+  position: relative;
+  z-index: 4;
+}
+
+.office-style-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.office-style-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  flex: 0 0 auto;
+}
+
+.office-style-body {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 380px;
+  max-height: min(72vh, 620px);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: rgba(10, 13, 18, 0.96);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.office-style-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.office-style-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.office-style-presets {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.office-style-preset {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: #10151c;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.office-style-preset:hover {
+  color: var(--text);
+}
+
+.office-style-preset.chip-active {
+  border-color: var(--accent, #38bdf8);
+  color: var(--text);
+  background: #16202c;
+}
+
+.office-style-preset-chips {
+  display: inline-flex;
+  border-radius: 3px;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+
+.office-style-preset-chip {
+  width: 8px;
+  height: 14px;
+}
+
+.office-style-surface {
+  display: grid;
+  grid-template-columns: 22px 1fr 84px 92px 26px;
+  align-items: center;
+  gap: 6px;
+}
+
+.office-style-color {
+  width: 22px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  background: none;
+  cursor: pointer;
+}
+
+.office-style-surface-name {
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.office-style-range {
+  width: 100%;
+  accent-color: var(--accent, #38bdf8);
+}
+
+.office-style-pattern {
+  max-width: none;
+  width: 100%;
+}
+
+.office-style-rig {
+  display: grid;
+  grid-template-columns: 92px 1fr 38px;
+  align-items: center;
+  gap: 6px;
+}
+
+.office-style-rig-name {
+  color: var(--text-dim);
+}
+
+.office-style-value {
+  text-align: right;
+}
+
+.office-style-scene {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.office-style-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+@media (max-width: 720px) {
+  .office-style-body {
+    width: min(92vw, 380px);
+  }
+}
+
+
 /* ------------------------------------------------------------- brief input */
 
 .brief-input {
@@ -1442,17 +1621,44 @@ textarea {
  *   Chat         one surface, scrolled internally by the thread itself
  */
 
+/**
+ * A flex container's automatic minimum size is its content, and *that* is what
+ * broke this pane.
+ *
+ * The inspector is capped by a `max-height`, so its body had less room than its
+ * content wanted. Without a floor here the body keeps its content height, its
+ * overflow does not scroll, and the space is instead *distributed*: the detail
+ * keeps its `min-height` floor and the chooser - the only item allowed to
+ * shrink - is squeezed from 119px to 32px. Its children then paint outside it,
+ * straight over the transcript's header. That is the reported screenshot: not a
+ * spacing bug, but a flex item crushed below its content while its neighbours
+ * kept theirs.
+ *
+ * `min-height: 0` lets the body be scrolled by its own `overflow` instead. The
+ * scroll is the last resort rather than the normal case: both panes inside are
+ * bounded (a fixed chooser, a detail with a floor), so on any pane tall enough
+ * for a run list and a transcript nothing scrolls but the transcript itself.
+ */
 .popout-body-agent,
 .popout-body-run {
-  overflow: hidden;
+  min-height: 0;
+  /* Scrolled, not hidden. Clipping here would make the bottom of a squeezed
+     transcript unreachable, which is the failure this whole pane exists to
+     avoid - and the two inner scrollers mean this one stays idle in practice. */
+  overflow-y: auto;
 }
 
 /* The detail half is one pane, whatever the panels inside it happen to be. */
 .popout-detail {
   flex: 1 1 auto;
-  /* A floor, so the thing you selected can never be crushed to nothing by a long
-     list above it. Both halves now yield proportionally instead. */
-  min-height: 160px;
+  /**
+   * A floor, so the thing you selected can never be crushed to nothing by a long
+   * list above it - but a floor that scales, because a fixed 160px is a demand
+   * the pane cannot always meet. On a short window the fixed floor plus the
+   * chooser exceeded the body, and the overflow landed on whichever sibling was
+   * allowed to shrink (see the note on `.popout-body-run`).
+   */
+  min-height: clamp(120px, 26vh, 240px);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1521,19 +1727,26 @@ textarea {
    its own height so the detail below always has room to be read. */
 
 /**
- * The chooser may shrink when the window is short, down to the point where the
- * detail below it still has room to be read.
+ * The chooser keeps its own height; the detail below yields.
  *
- * A fixed cap alone was wrong: `vh` knows nothing about the header and the dock,
- * so on a short window the list kept its full height and the transcript was
- * crushed to sixteen pixels - reachable, but useless.
+ * This was `flex: 1 1 auto` with `min-height: 0`, which read as "the chooser may
+ * shrink" but meant "the chooser may shrink to nothing". In a short pane the
+ * flex algorithm gave the detail its `min-height` floor first and squeezed the
+ * chooser down to 32px for 119px of content, so the run row, the status filter
+ * and the transcript's own sticky header all painted over each other - the
+ * reported screenshot.
+ *
+ * Shrinking the wrong one is also backwards for the intent: the list is the
+ * control you pick from, and the detail below it already scrolls. So the
+ * chooser is fixed and bounded instead - it takes exactly its content height up
+ * to its list's cap, and the detail takes every pixel that is left.
  */
 .chooser {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  flex: 1 1 auto;
-  min-height: 0;
+  /* `0 0 auto`, not `1 1 auto`: see the note above on who yields to whom. */
+  flex: 0 0 auto;
 }
 
 .chooser-head {
@@ -1582,10 +1795,10 @@ textarea {
   gap: 2px;
   overflow-y: auto;
   overscroll-behavior: contain;
-  /* Bounded above by a cap the window can override, and below by enough to show
-     a row or two: a list squeezed to eight pixels is not a chooser. */
+  /* Bounded above by a cap the window can override, and it sizes to its rows
+     below that. No `min-height`: the chooser above is now fixed, so a floor here
+     only pushes the whole inspector past its own edge on a short pane. */
   max-height: min(30vh, 240px);
-  min-height: 56px;
   padding-right: 2px;
 }
 
@@ -1865,7 +2078,6 @@ textarea {
 .chooser-list-runs {
   max-height: min(34vh, 280px);
 }
-
 .chat-empty {
   padding: 6px 2px;
   line-height: 1.45;

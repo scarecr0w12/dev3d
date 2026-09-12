@@ -4,7 +4,7 @@
  * Plain imperative three.js, driven by one `requestAnimationFrame` loop:
  *
  *   renderer + perspective camera + OrbitControls
- *   lights (key with shadows, hemisphere fill, a warm bounce and a cool rim)
+ *   a light rig and a scene environment taken from the floor's style
  *   office.glb loaded once, anchors indexed by node name
  *   one procedural avatar per employee, placed by looking its seat up
  *
@@ -12,6 +12,10 @@
  * changes are pushed into the live scene through a small imperative API kept in
  * a ref. That is what keeps the office usable while runs stream - no remounts,
  * no WebGL context churn.
+ *
+ * Every floor is *dressed* from its own style on the way in: materials are
+ * remapped by role, so the hand-authored core office and the generated room
+ * modules take the same palette even though they share no material names.
  *
  * The view never crashes on missing data: an unknown seat parks the employee on
  * the bench row (and says so in the overlay), an employee with a null seat is
@@ -23,17 +27,20 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
-import type { EmployeeState, Role, RoleAppearance, WorkspaceSummary } from '@dev3d/core';
+import type { EmployeeState, OfficeStyle, Role, RoleAppearance, WorkspaceSummary } from '@dev3d/core';
 
 import { usePrefersReducedMotion } from '../app/hooks';
 import { useOffice, useSelection, useStore } from '../app/StoreContext';
 import { FALLBACK_APPEARANCE } from '../app/store';
 import { STATUS_COLOR, STATUS_LABEL, STATUS_ORDER } from '../app/status';
+import { StylePanel } from '../console/StylePanel';
 import { indexAnchors, roomLabel } from './anchors';
-  import { floorOffset, floorVisibility, resolveFloorId } from './floors';
+import { floorOffset, floorVisibility, resolveFloorId } from './floors';
 import type { AnchorStats, OfficeAnchors } from './anchors';
 import { createAvatar } from './avatar';
 import type { Avatar } from './avatar';
+import { applyStyle, disposeMaterials, dressMaterials, groundGridTexture } from './theme';
+import type { AppliedStyle, FloorLighting, FloorMaterials } from './theme';
 
 const OFFICE_URL = `${import.meta.env.BASE_URL}office/office.glb`;
 const KIT_URL = `${import.meta.env.BASE_URL}office/blocks.glb`;
@@ -168,6 +175,15 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
     controls.maxPolarAngle = Math.PI * 0.495;
     controls.target.set(0, 1.1, 0);
 
+    /**
+     * The light rig.
+     *
+     * Every value here is overwritten by the active floor's style in
+     * `applyEnvironment`, which is what makes one floor a bright Nordic studio
+     * and the next a blacked-out noir room. The numbers below are the shipped
+     * default, so the scene is never unlit even for the frame before the first
+     * floor arrives.
+     */
     const hemisphere = new THREE.HemisphereLight(0x9dc4ff, 0x14161d, 0.72);
     const keyLight = new THREE.DirectionalLight(0xffffff, 1.35);
     keyLight.position.set(10, 16, 8);
@@ -196,6 +212,28 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
     ground.receiveShadow = true;
     scene.add(ground);
 
+    // A faint grid on that floor, so the building stands on something rather
+    // than floating in a void. It is part of the style, and a style can turn
+    // it off. `depthWrite: false` keeps it from occluding the shadow catcher.
+    const groundGridMesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(160, 160),
+      new THREE.MeshBasicMaterial({
+        map: groundGridTexture(),
+        transparent: true,
+        opacity: 0.5,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }),
+    );
+    groundGridMesh.rotation.x = -Math.PI / 2;
+    groundGridMesh.position.y = -0.008;
+    groundGridMesh.visible = false;
+    scene.add(groundGridMesh);
+
+    // The scene starts lit from the default preset, so the frame before the
+    // first floor arrives is not a black viewport.
+    applyEnvironment(applyStyle(undefined));
+
     const officeRoot = new THREE.Group();
     officeRoot.name = 'OfficeRoot';
     scene.add(officeRoot);
@@ -223,6 +261,16 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       modules: THREE.Group;
       /** The layout this floor was built from, to detect that it changed. */
       layoutKey: string;
+      /**
+       * The material set this floor is dressed in. Owned by the floor: the
+       * GLB's own materials are shared by every clone, so a floor that repainted
+       * them in place would repaint the whole building.
+       */
+      materials: FloorMaterials;
+      /** The style this floor was dressed from, to detect that it changed. */
+      styleKey: string;
+      /** What that style resolved to, for the rig and the scene. */
+      applied: AppliedStyle;
       /** The plate size currently built, so it is only rebuilt when it changes. */
       slabSize: string;
       /**
@@ -233,6 +281,15 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
     }
 
     const floors = new Map<string, Floor>();
+    /**
+     * A reusable carrier for `dressMaterials`, which only reads `materials`.
+     *
+     * The alternative - a fresh `AppliedStyle` per mesh set - is a full palette
+     * allocation on every module clone, and modules are cloned by the dozen.
+     */
+    const styleScratch = { materials: {} as FloorMaterials } as AppliedStyle;
+    /** The rig currently in force, so a floor can be re-lit without re-resolving. */
+    let activeLighting: FloorLighting | null = null;
     /** The loaded model, cloned once per organisation. */
     let template: THREE.Object3D | null = null;
     /** The block kit: one cloneable group per module kind, keyed by node name. */
@@ -246,13 +303,25 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
     }
 
     /**
+     * A stable key for a floor's look.
+     *
+     * Compared as a signature rather than by object identity, because the style
+     * arrives fresh from the server on every state push - so a reference check
+     * would re-dress every floor on every event, and re-dressing is the
+     * expensive part.
+     */
+    function styleKeyOf(style: OfficeStyle | undefined): string {
+      return JSON.stringify(style ?? { preset: 'studio' });
+    }
+
+    /**
      * Instantiate the modules a floor has grown.
      *
      * Each cloned node is renamed to its namespaced seat id, which is what makes
      * two pods distinguishable: without it both would offer `Seat_POD4_02` and the
      * anchor index would keep whichever loaded first.
      */
-    function buildModules(workspace: WorkspaceSummary): THREE.Group {
+    function buildModules(workspace: WorkspaceSummary, materials: FloorMaterials): THREE.Group {
       const group = new THREE.Group();
       group.name = `Modules_${workspace.id}`;
       for (const placed of workspace.layout.blocks) {
@@ -271,6 +340,7 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
           mesh.castShadow = true;
           mesh.receiveShadow = true;
         });
+        dressMaterials(instance, withMaterials(materials));
         group.add(instance);
       }
       // The floor group already sits at the storey height, so modules stay local.
@@ -301,15 +371,34 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
      * with them - and disposing them on a *rebuild* would do the same to a kit
      * that is still in use.
      *
-     * What a floor really owns is its coloured plate: that geometry and those two
-     * materials are created for it and for nothing else.
+     * What a floor really owns is its coloured plate and its own material set:
+     * those were created for it and for nothing else.
      */
     function disposeFloor(entry: Floor): void {
       entry.slab.geometry.dispose();
       entry.edges.geometry.dispose();
       (entry.slab.material as THREE.Material).dispose();
       (entry.edges.material as THREE.Material).dispose();
+      disposeMaterials(entry.materials);
       floorsRoot.remove(entry.group);
+    }
+
+    /**
+     * Re-dress a floor's core clone in a material set.
+     *
+     * The clone is only ever re-dressed in place rather than rebuilt: it is three
+     * hundred meshes, and a style change has to be cheap enough to follow a
+     * colour picker. One pass, because the swap is memoised per distinct
+     * material - the clone shares its material objects with the template.
+     */
+    function dressClone(clone: THREE.Object3D, materials: FloorMaterials): void {
+      dressMaterials(clone, withMaterials(materials));
+    }
+
+    /** The scratch carrier with a floor's material set in it. */
+    function withMaterials(materials: FloorMaterials): AppliedStyle {
+      styleScratch.materials = materials;
+      return styleScratch;
     }
 
     /** A thin coloured plate per floor, so the building reads as a stack. */
@@ -387,10 +476,24 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       for (const workspace of workspaces) {
         const existing = floors.get(workspace.id);
         const key = layoutKeyOf(workspace);
+        const styleKey = styleKeyOf(workspace.style);
+        const applied =
+          existing !== undefined && existing.styleKey === styleKey ? existing.applied : applyStyle(workspace.style);
+        const materialSet = applied.materials;
         if (existing) {
           const color = new THREE.Color(workspace.color ?? '#a78bfa');
           (existing.slab.material as THREE.MeshBasicMaterial).color.copy(color);
           (existing.edges.material as THREE.LineBasicMaterial).color.copy(color);
+          // A restyled floor is re-dressed in place: the walls are the expensive
+          // part to rebuild and nothing about them moved.
+          if (existing.styleKey !== styleKey) {
+            disposeMaterials(existing.materials);
+            existing.materials = materialSet;
+            existing.applied = applied;
+            existing.styleKey = styleKey;
+            dressClone(existing.clone, materialSet);
+            if (activeFloorId === workspace.id) applyEnvironment(applied);
+          }
           // A floor that grew (or lost) a room is rebuilt in place: the core clone
           // is left alone and only the modules are replaced, because re-cloning
           // 312 meshes to add one pod would stutter the view.
@@ -399,7 +502,7 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
             // with the kit template, so disposing here would release buffers the
             // other floors and the next clone are still using.
             existing.group.remove(existing.modules);
-            existing.modules = buildModules(workspace);
+            existing.modules = buildModules(workspace, existing.materials);
             existing.group.add(existing.modules);
             existing.layoutKey = key;
             existing.anchors = indexAnchors(existing.group);
@@ -421,9 +524,10 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
           mesh.castShadow = true;
           mesh.receiveShadow = true;
         });
+        dressClone(clone, materialSet);
         group.add(clone);
 
-        const modules = buildModules(workspace);
+        const modules = buildModules(workspace, materialSet);
         group.add(modules);
 
         const { slab, edges } = buildSlab(workspace);
@@ -449,12 +553,51 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
           slotFloor: Math.max(1, workspace.floor),
           modules,
           layoutKey: key,
+          materials: materialSet,
+          styleKey,
+          applied,
           slabSize: '',
           focus: { x: 0, z: 0, distance: FLOOR_DISTANCE },
         };
         floors.set(workspace.id, entry);
         applySlabScale(entry);
       }
+    }
+
+    /**
+     * Point the rig and the scene at one floor's look.
+     *
+     * Called when the floor being looked at changes and when its style does, so
+     * the light rig follows the floor on screen rather than being a property of
+     * the building. The lights are directional and already climb with the storey
+     * height in `showFloor`, which is why the positions here are relative.
+     */
+    function applyEnvironment(applied: FloorLighting): void {
+      const { lighting, environment } = applied;
+      hemisphere.color.set(lighting.skyColor);
+      hemisphere.groundColor.set(lighting.groundColor);
+      hemisphere.intensity = lighting.ambientIntensity;
+      keyLight.color.set(lighting.keyColor);
+      keyLight.intensity = lighting.keyIntensity;
+      keyLight.castShadow = lighting.shadows;
+      keyLight.position.set(lighting.keyPosition.x, lighting.keyPosition.y, lighting.keyPosition.z);
+      fillLight.color.set(lighting.fillColor);
+      fillLight.intensity = lighting.fillIntensity;
+      rimLight.color.set(lighting.rimColor);
+      rimLight.intensity = lighting.rimIntensity;
+      renderer.toneMappingExposure = lighting.exposure;
+
+      (scene.background as THREE.Color).set(environment.background);
+      const fog = scene.fog as THREE.Fog | null;
+      if (fog) {
+        fog.color.set(environment.fogColor);
+        fog.near = environment.fogNear;
+        fog.far = environment.fogFar;
+      }
+      groundMaterial.opacity = environment.groundShadowOpacity;
+      groundGridMesh.visible = environment.grid;
+      (groundGridMesh.material as THREE.MeshBasicMaterial).color.set(environment.gridColor);
+      activeLighting = applied;
     }
 
     /**
@@ -483,11 +626,15 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
         floor.edges.visible = plate;
       }
       ground.position.y = entry.offset - 0.012;
+      groundGridMesh.position.y = entry.offset - 0.008;
+      // The rig is the floor's own, so switching floors is also switching look.
+      applyEnvironment(entry.applied);
       // The lights are directional, so they have to climb with the building or
-      // an upper floor ends up lit from underneath.
-      keyLight.position.y = 16 + entry.offset;
-      fillLight.position.y = 8 + entry.offset;
-      rimLight.position.y = 6 + entry.offset;
+      // an upper floor ends up lit from underneath - and they are relative to the
+      // storey, which is why the climb happens after the style has set them.
+      keyLight.position.y += entry.offset;
+      fillLight.position.y += entry.offset;
+      rimLight.position.y += entry.offset;
       // A grown floor is not centred on the origin any more, and it is wider than
       // the room it started as: framing on (0,0) at a fixed distance would push
       // the new rooms off the edges of the viewport.
@@ -825,6 +972,8 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       disposeObject3D(scene);
       groundGeometry.dispose();
       groundMaterial.dispose();
+      groundGridMesh.geometry.dispose();
+      (groundGridMesh.material as THREE.Material).dispose();
       renderer.dispose();
       if (canvasElement.parentNode === host) host.removeChild(canvasElement);
       apiRef.current = null;
@@ -915,6 +1064,7 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
               <span className="floor-tag mono">F{activeFloor.floor}</span> {activeFloor.name}
             </span>
           )}
+          <StylePanel />
           <button type="button" className="btn btn-ghost btn-sm" onClick={handleReset}>
             Reset view
           </button>

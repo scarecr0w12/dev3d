@@ -16,15 +16,40 @@ office with a bare shell, and this script will refuse to do it. Pass
 `-- --force-empty` if you really mean to.
 
 Run through the Blender MCP bridge. Safe mode allows import/export operators
-but not `os`, so the output path is fixed and verification happens outside.
+but not `os`, so the output path is resolved from this file's own location where
+that is available, and from `DEV3D_OFFICE_DIR` where it is not; verification
+happens outside either way.
 """
 
 import bpy
 import json
 import math
+import os
 import sys
 
-OUT = r"E:\Development\dev3d\apps\web\public\office\office.glb"
+
+def _office_dir():
+    """Where the office asset is written: `<repo>/apps/web/public/office`.
+
+    Derived from this file's location rather than hard-coded, so a checkout
+    anywhere exports into its own tree. Blender's `--python` sets `__file__`;
+    under the MCP bridge it may be absent, so `DEV3D_OFFICE_DIR` is the way to
+    say where to write without guessing.
+    """
+    override = os.environ.get("DEV3D_OFFICE_DIR")
+    if override:
+        return override
+    source = globals().get("__file__")
+    if source:
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(source))))
+        return os.path.join(repo, "apps", "web", "public", "office")
+    raise RuntimeError(
+        "cannot locate the office directory: run this with Blender's --python "
+        "(which sets __file__), or set DEV3D_OFFICE_DIR."
+    )
+
+
+OUT = os.path.join(_office_dir(), "office.glb")
 
 seats_present = [o for o in bpy.data.objects if o.type == 'EMPTY' and o.name.startswith("Seat_")]
 force = "--force-empty" in sys.argv

@@ -27,7 +27,7 @@ runtime reducer harness, and a production bundle that the orchestrator serves.
 | Area | State |
 |---|---|
 | Shared domain contracts (`packages/core`) | Complete |
-| Model layer: providers, adapters, catalog, router | Complete — 14 tests |
+| Model layer: providers, adapters, discovery, curated overlay, quality blend, router | Complete — 5 suites |
 | Tool layer: 9 restricted tools | Complete — 9 tests |
 | Skill layer: markdown loader + per-turn selection | Complete — 8 tests, 15 skills on disk |
 | Org chart: 13 roles, 8 departments, 3 pipelines | Complete — 11 runtime tests, per organisation |
@@ -75,6 +75,21 @@ the UI badges it so nobody thinks they are spending money.
 
 Set `DEV3D_LLM_MODE=live` to require real providers, or `mock` to force the
 scripted ones even when keys are present.
+
+**The mode always comes with its reason.** `/api/health` and `OfficeState` carry
+`llmModeReason`, and the badge shows it: *"DEV3D_LLM_MODE=auto, and deepseek,
+openrouter are configured"*, or *"DEV3D_LLM_MODE=mock forces scripted employees
+even though deepseek, openrouter are configured"*. That last case used to log
+**"no provider keys found"**, which was simply false and cost an operator an
+afternoon looking for a configuration bug that did not exist — so a mode is never
+reported without the reason it resolved the way it did.
+
+**`.env` is read once, at startup** — correct, and completely invisible. So
+editing it does nothing to a running server, which looks exactly like a bug. The
+health endpoint and the console now detect that: `configStale` is set when `.env`
+has been modified since boot, or when a provider key has appeared in the
+environment since the mode was resolved, and the console says so with the remedy
+(*"restart the orchestrator to apply it"*).
 
 ### Driving it without the UI
 
@@ -292,36 +307,235 @@ report sees the decision the workshop reached.
 
 ---
 
-## Model routing
+## Models and routing
+
+### Which models exist is the provider's answer, not ours
+
+`apps/server/src/llm/catalog.ts` is a **curated metadata table**, not a roster.
+The distinction is the design, because two different questions used to be
+answered by one static array:
+
+- **Which models exist?** Only the provider knows, and it changes without a
+  commit. This checkout shipped `deepseek-v4-flash-vision-exp` for DeepSeek, and
+  the DeepSeek endpoint does not serve it — a routable model that could only ever
+  produce a failed turn. That was found by asking, not by reading.
+- **What do they cost, and how good are they?** No `/models` endpoint answers
+  this. Prices and capability have to be curated, measured, or pooled.
+
+So membership comes from **discovery** and metadata comes from the **overlay**:
+
+```
+provider /models   →  membership, plus facts the vendor knows (context, price, tools, vision)
+curated table      →  judgement the vendor cannot state (tier, strengths, quality)
+learned outcomes   →  what this office observed on its own work
+pooled benchmarks  →  what a public aggregator measured
+```
+
+A model the provider reports but the table has never heard of is still routable,
+flagged `unrated`: its tier is inferred from its published price — a better
+signal than its name, which is marketing — and the console says the tier is a
+guess. A model the table describes that the provider no longer serves is
+**withdrawn** and logged by name, so a retired model becomes visible instead of
+silently vanishing.
+
+Discovery runs at boot, behind the listening socket and never awaited: six
+providers are six round trips, and boot must not depend on somebody else's
+uptime. Results are cached to disk and refreshed on a TTL. The **Routing & cost**
+page has a *Fetch model lists* button, per provider and for all of them.
+
+Three outcomes are kept distinct, because they have opposite consequences:
+
+| Situation | Recorded as | Effect on the catalog |
+|---|---|---|
+| The provider answered | `discovered` | Its list is authoritative |
+| The provider answered with nothing | `discovered`, zero models | Emptiness is a fact about the provider |
+| We could not ask | `degraded`, with the reason | The curated seed stands in; nothing is emptied |
+
+`mock` mode never discovers, so the keyless office keeps its full demonstrable
+catalog. `DEV3D_MODEL_DISCOVERY=false` keeps the office entirely offline.
+
+### How a model is chosen
 
 Every role carries a `ModelPolicy`: a default tier, per-task-class overrides,
-hard min/max bounds, and an escalation threshold. The router combines that with
-the global posture (`cheap` | `balanced` | `quality`), a complexity estimate for
-the specific turn, and the remaining budget, then picks the cheapest capable
-model and returns ordered fallbacks plus the reasoning for every model it
-rejected.
+hard min/max bounds, an escalation threshold, and optionally a **pin to one
+concrete model**. The router combines that with the global posture
+(`cheap` | `balanced` | `quality`), a complexity estimate for the specific turn,
+and the remaining budget, then ranks candidates on a score:
+
+```
+score = 0.45 × fitness for this task class
+      + 0.20 × overall quality
+      + 0.35 × tier affinity (position in the policy's tier walk)
+      − cost pressure × relative cost        (0.30 cheap, 0.12 balanced, 0.03 quality)
+```
+
+`fitness` is per `TaskClass`, so a coder-tuned model and a generalist of the same
+size are no longer interchangeable — which the flat `strengths` list could never
+express on its own. Ranking used to be a tier walk with a cost tiebreak, and
+`ModelSpec.strengths` was populated and displayed but **never read by the
+router**.
+
+Two properties matter more than the weights:
+
+- **With no quality information this reproduces the old behaviour exactly.** The
+  quality terms come from a prior that is the mean of the *rated* population, so
+  when nothing is rated they cancel; and cost pressure is switched off entirely,
+  so price cannot pull a turn off the tier the policy asked for when nothing is
+  known about what that money buys. It is pinned by test, not asserted in a
+  comment.
+- **A plugin routing rule still cannot move a turn to another tier.** A rule's
+  declared tier joins the front of the walk, as it always did, and its
+  model/provider preferences apply as score bonuses *confined to that tier* — so
+  a rule can reorder candidates without making the router pick something the
+  policy did not allow.
+
+A **pin** is honoured inside the policy's own `minTier`/`maxTier` bounds. One that
+is missing, excluded, lacks a required capability, or sits outside the bounds is
+**named in the routing reason** and normal selection stands, so a pin that is not
+in force is visible rather than a silent fallback.
 
 The complexity estimate is a deterministic function of observable things: the
 stage kind, how much text the turn must digest, whether it touches files, how
-many revision passes have already failed to settle it, and whether the text
-names a known-hard problem (concurrency, migration, security, protocol,
-idempotency…). It is a heuristic and meant to be one — it only has to be ordered
-correctly.
+many revision passes have already failed to settle it, and whether the text names
+a known-hard problem (concurrency, migration, security, protocol, idempotency…).
+It is a heuristic and meant to be one — it only has to be ordered correctly.
 
-Prices in `llm/catalog.ts` are **estimates for routing and display, not billing
-truth**. They only need to be ordered plausibly.
+### Where quality numbers come from
 
-**Correcting one does not need a code change.** Settings → Models can override a
-model's tier and its per-million prices for the whole installation: the registry
-reads the overrides on every use, so a correction changes routing and cost
-reporting on the next turn. An override is a patch, so the fields it does not
-mention keep the catalog's values, and it is validated against the live catalog —
-a tier that is not a tier is refused, and an entry for a model that no longer
-exists is dropped and logged rather than left behind in the settings document.
+Three sources, kept as separate opinions rather than averaged into one anonymous
+number, because they fail differently:
 
-This matters more than it sounds: a tier decides where a model sits in the routing
-walk and a price decides what a turn costs and which model wins a tie. Hard-coding
-both meant a stale price could only be answered by editing source and redeploying.
+| Source | What it is | Confidence | Leaves the machine |
+|---|---|---|---|
+| `curated` | The table in `llm/catalog.ts`: tier-derived, with explicit per-class corrections where a model's character is genuinely known | 0.5–0.7 | No |
+| `learned` | Beta-smoothed outcomes from this office's own finished turns | grows with evidence | No |
+| `pooled` | Artificial Analysis intelligence / coding / math indices | 0.55 | Yes, opt-in |
+
+The blend is confidence-weighted, and a learned score is **shrunk towards its
+prior** rather than reported raw: five observations are needed to move an estimate
+halfway, so one bad turn cannot condemn a good model and one success cannot make
+an unproven one look proven. An **operator correction** (Settings → Models)
+enters as the loudest opinion there is, because a human who has run the model on
+their own work outranks a benchmark that measured somebody else's.
+
+The learned layer reads the persisted turn records directly rather than keeping a
+second table, so the two cannot disagree. It separates three cases a naive "did it
+fail" counter conflates: a cancelled turn is the operator's decision and votes on
+nothing; a turn whose `servedBy` differs from its routed model is a **failure for
+the routed model** and a success for whatever actually answered — without which a
+model that fails every single time would have no observations at all, invisible
+exactly where it should be most visible.
+
+### Pooled quality, and what the public data actually contains
+
+With an `OPENROUTER_API_KEY`, `GET /api/v1/benchmarks` (bearer token) returns
+three source shapes in one payload:
+
+| Source | Contributes | Maps onto |
+|---|---|---|
+| `artificial-analysis` | `intelligence_index`, `coding_index`, `agentic_index` | overall quality; coding/review/testing/architecture; ops/planning/workshop |
+| `design-arena` | Elo, win rate, timing, per arena and category | `design` — the creative counterpart to a coding index |
+| `openrouter` | its own runs (`gpqa_diamond`, …) with accuracy | `research` |
+
+Because it *includes* the Artificial Analysis indices, this makes a separate
+`ARTIFICIAL_ANALYSIS_API_KEY` redundant: one credential covers more ground. It is
+still supported for anyone who has one and would rather not route through
+OpenRouter for it.
+
+**The index scale is calibrated from the data, because a fixed one is wrong.**
+The published example shows values around 60–90, which invites `(v - 15) / 65`.
+Measured against the live payload:
+
+```
+intelligence_index   min  3.8   p50 22.3   max 53.4
+coding_index         min  2.7   p50 42.8   max 81.6
+agentic_index        min  0.1   p50 17.2   max 58.0
+```
+
+That window would place the *median* model at 0.11 and never award a top score to
+anything. So every index is converted to a **percentile of the population the
+provider actually returned** — self-calibrating as the field moves, no invented
+constants, and honest about being a standing among benchmarked models rather than
+absolute capability.
+
+**Coverage is partial, and the console reports the real numbers rather than
+implying otherwise.** Measured: **118 of OpenRouter's 445 models** match a
+benchmark row. The payload uses dated snapshots
+(`anthropic/claude-fable-5.1-20260831`) that frequently do not match a current
+model id. So for most models the pooled opinion is simply absent — which is
+precisely why the learned layer is the one that usually matters: it covers every
+model this office actually runs.
+
+**A false match would be worse than a miss**, so matching is two-tier. A
+full-slug match (`deepseek/deepseek-chat`, after stripping our own provider
+prefix) is unambiguous. A bare-name match is used **only when that name appears
+once in the whole payload** — otherwise the key is poisoned, because
+`vendorA/llama-3.3-70b` and `vendorB/llama-3.3-70b` both reduce to `llama3370b`
+and handing one of them the other's scores would mislead routing while looking
+authoritative.
+
+### Uptime: a routing signal that needs no key at all
+
+`GET /api/v1/models/{author}/{slug}/endpoints` is public and lists every upstream
+OpenRouter would route a model to. Measured field coverage across 34 endpoints:
+
+| Field | Populated |
+|---|---|
+| `uptime_last_30m` | **79%** |
+| `latency_last_30m` | **0%** |
+| `throughput_last_30m` | **0%** |
+
+So this tracks **uptime and nothing else**. Latency and throughput are documented
+fields that are simply empty in the live payload; a speed-aware router built on
+them would have been built on zeros.
+
+The router scores it as a **penalty, never a filter**: `0.30 × (1 − uptime)`, so
+a model at 0% loses about a tier and a half and one at 99% loses 0.003. It is a
+demotion rather than an exclusion because uptime is a rolling figure that can be
+stale, and hard-excluding on a stale reading would remove a good option — with a
+pinned role having no way back. The retry-and-fail-over loop already handles a
+genuinely dead provider.
+
+Two rules keep it from doing harm. **Unknown contributes exactly nothing** — the
+same rule quality follows — so a model on a provider we cannot ask about is never
+penalised for being unmeasured. And lookups are **on demand and never awaited**:
+the router asks as it considers a model, a model nobody routes to is never
+fetched, and the first turn on a new model routes exactly as it would have before
+this existed. The best endpoint wins the aggregate, because that is the one
+OpenRouter will actually use; the healthy-endpoint count travels alongside it, so
+"the only one of twelve still standing" is visible rather than hidden by an
+average.
+
+`/analytics/*` is **not** wired, and cannot be with a normal key: it answers
+`403 Only management keys can access analytics`. It is also about your own spend
+rather than model capability, so it belongs in a cost dashboard, not in routing.
+
+```
+GET    /api/models             → the merged catalog, with provenance
+GET    /api/providers          → status, including how each model list was obtained
+POST   /api/models/discover    { providerId?, force? }
+POST   /api/models/benchmarks  → refresh pooled quality; returns coverage
+POST   /api/models/health      { limit? }  → sample endpoint uptime; returns the readings
+```
+
+Prices in the curated table are **estimates for routing and display, not billing
+truth**. They only need to be ordered plausibly — and where a provider publishes
+real ones, discovery overwrites them.
+
+**Correcting a model does not need a code change.** Settings → Models overrides a
+model's tier, its per-million prices, and its quality and per-task-class fitness
+for the whole installation. The registry reads the overrides on every use, so a
+correction changes routing and cost reporting on the next turn. An override is a
+patch, so the fields it does not mention keep the catalog's values, and it is
+validated against the live catalog — a tier that is not a tier is refused, and an
+entry for a model that no longer exists is dropped and logged rather than left
+behind in the settings document. A quality correction enters the blend as the
+loudest opinion there is.
+
+The **Routing & cost** page reports coverage for every signal — curated, learned,
+pooled and uptime — rather than implying that a thin one is a complete one, and
+carries the buttons that re-fetch model lists, benchmark scores and endpoint
+uptime.
 
 ---
 
@@ -610,24 +824,102 @@ hot-desking forever or silently failing to hire.
 writes the sidecar that describes them — so `blocks.json` cannot describe a block
 that does not exist, and the geometry and the metadata cannot drift.
 
-| Module | Size | Doorways | Seats |
-|---|---|---|---|
-| `pod4` | 8 × 6 m | west, east | 4 |
-| `office2` | 8 × 6 m | west | 2 |
-| `meeting6` | 8 × 6 m | west | 6 |
-| `lounge3` | 8 × 6 m | west, east | 3 |
-| `junction` | 6 × 6 m | all four | 0 |
-| `corridor` | 8 × 3 m | west, east, north | 0 |
-| `portal` | 1.9 × 0.5 m | none | 0 |
+Twenty-four modules, grouped by what they are for. Sizes are all whole metres so
+two modules always tile the core's 16 m side walls exactly:
 
-Two 8 m modules tile each of the core's 16 m side walls exactly. A **junction** is
-what lets the building turn a corner instead of growing in one straight line, and
-a **corridor** — thin, no desks, doorways at both ends and along one side — is what
-gives a floor routes between rooms rather than a chain of them: a room with one
-doorway is a dead end, so without one the building stops growing the moment it runs
-out of through-rooms. A **portal** is the glazed doorway that connects a module to
-the core; it has no doorways of its own, so the placement search can never mistake
-it for a room.
+| Category | Modules | Sizes | Seats |
+|---|---|---|---|
+| work | `pod4` `studio4` `studio6` `open8` `duo2` | 4–16 × 4–6 m | 2, 4, 6, 8 |
+| meet | `hoot4` `meeting6` `board12` `forum16` | 6–12 × 6–8 m | 4, 6, 12 |
+| quiet | `phone1` `focus4` `focus6` `library4` | 4–12 × 4–6 m | 1, 4, 6 |
+| support | `workshop4` `server4` `break6` `locker6` `lounge3` `gallery6` | 6–10 × 4–6 m | 0–4 |
+| circulation | `junction` `junction4` `corridor` `passage4` | 4–8 × 3–6 m | 0 |
+| fitting | `portal` | 1.9 × 0.5 m | 0 |
+
+Three things make a module more than a box with a doorway:
+
+- **A fit-out** (`furniture`): `desks`, `meeting`, `boardroom`, `booths`,
+  `library`, `workshop`, `racks`, `breakout`, `lounge`, `gallery`, `phone` or
+  `none`. A 6 × 6 m room can be a huddle room, a reading room or a rack room, so
+  the layout inside is named separately from the size.
+- **Props** (`props`): plants, whiteboards, shelving, a coffee station, lockers,
+  pendants, rugs, art. These are what stop two rooms of the same size reading as
+  the same room, and the list travels to `blocks.json` so the console can
+  describe a room without loading the GLB.
+- **A threshold**: a lit stroke on every edge that has a doorway, so an opening
+  reads as a way through rather than as a gap somebody forgot to fill.
+
+A **junction** is what lets the building turn a corner instead of growing in one
+straight line, and a **corridor** — thin, no desks, doorways at both ends and
+along one side — is what gives a floor routes between rooms rather than a chain
+of them: a room with one doorway is a dead end, so without one the building stops
+growing the moment it runs out of through-rooms. A **portal** is the glazed
+doorway that connects a module to the core; it has no doorways of its own, so the
+placement search can never mistake it for a room.
+
+The script **refuses to export a kit that breaks its own contract**, which is
+cheaper than noticing it in a viewport. It checks, per module: that the size is
+whole metres, that every doorway fits its wall, that the fit-out fits the room
+(measured, not assumed — this is what caught three under-sized rooms and a
+phantom seventh chair at a six-seat table), that every declared seat was actually
+built, that every seat has a `Desk_*` anchor and every anchor a seat, that no
+mesh wears a reserved prefix, and that no prop sits outside the module.
+
+To look at it:
+
+```bash
+pnpm check:blocks      # the GLB against its sidecar: sizes, anchors, heights, material roles
+pnpm preview:blocks    # a rendered contact sheet of all 24 modules
+```
+
+`02_office_blocks.py` builds one primitive mesh per distinct *size and surface*
+and shares it across every part that uses it. That is not premature optimisation:
+built one-mesh-per-part it exported a 2.4 MB GLB of 1 468 identical cubes, and
+sharing them brought it to 438 KB with the same geometry.
+
+### Making a floor look like somewhere
+
+Shape is only half of "custom". The other half is what the rooms are made of, and
+that is a per-floor **style**.
+
+A style is a sparse patch over a **preset** — `studio` (the default, and the
+palette the office shipped with), `nordic`, `industrial`, `glasshouse`,
+`neonlab`, `noir`, `paper`, `atelier`. `{ preset: 'nordic' }` already means
+something complete, so a floor that has never been styled renders as its preset
+rather than as a hole, and `resolveStyle` is pure, so the server and the browser
+cannot disagree about what a floor looks like.
+
+The two halves that make it work:
+
+- **Roles, not material names.** Nothing in a style mentions `M_Wall_Paint` or
+  `W_Wall`. A style talks about fourteen *roles* — wall, accent wall, glass,
+  floor finish, rug, metalwork, desking, upholstery, planting, fixtures, screens
+  — and each renderer maps its own materials onto them. The core office is a
+  hand-authored asset from before the kit existed and shares no material name
+  with it; a role table in `apps/web/src/office/theme.ts` is what lets one style
+  dress both. `pnpm check:blocks` fails if either asset gains a material the table
+  has never heard of, because the symptom is a single grey wall nobody notices.
+- **Materials are cloned per floor.** The GLB's materials are shared by every
+  clone, so a floor that repainted them in place would repaint the whole
+  building. Each floor owns its material set and releases it when it closes.
+
+Beyond colour, a style carries roughness and a **surface pattern** (grid, planks,
+hex, weave, speckle) — generated as a small deterministic texture, not sampled
+from a file, so a floor looks the same on the first frame as on the hundredth and
+nothing has to be awaited. It carries a **light rig** (key, fill, rim, ambient,
+exposure, shadows), a scene **environment** (background, fog, ground shadow, grid)
+and a palette for the screens and fixtures, which is what makes `neonlab` read as
+a late-night lab and `paper` as a diagram.
+
+The editor lives in the 3D view's top bar, under the floor's name: **Look ·
+\<preset\>**. Presets are one click, eight surfaces have a colour, a roughness and
+a pattern, the rig has five sliders, and every control can be returned to the
+preset. A change is sent whole and paced, so dragging a colour slider is one round
+trip rather than sixty — and the style is saved with the floor, so it is there
+when you come back.
+
+Styling never touches the plan: growth, capacity and seat ids are decided by the
+layout alone, so a restyle can never move anybody's desk.
 
 ### The office asset is generated, not curated
 
@@ -781,17 +1073,27 @@ to start is worse.
 ## Verification
 
 ```bash
-# server: 119 tests — 118 pass, 1 skipped, 0 fail (47 cover plugins, 13 the block layout)
+# core: 14 tests — the style model: preset completeness, sparse-patch resolution,
+# and that a corrupt style degrades to its preset instead of into a shader
+cd packages/core && node --test --test-isolation=none "src/**/*.test.ts"
+
+# server: 305 tests — 304 pass, 1 skipped, 0 fail (47 cover plugins, 13 the block layout, 5 the floor style)
 cd apps/server && node --test --test-isolation=none "src/**/*.test.ts"
 
 # live protocol: drives a RUNNING server as a real client — 202 checks
 node scripts/smoke-ws.mjs
 
-# the office store's reducer, driven with one frame per event variant — 104 checks
+# the office store's reducer, driven with one frame per event variant — 129 checks,
+# including that every preset dresses every role and every material in both GLBs
+# maps to one
 node apps/web/.verify/smoke.ts
 
 # the degradation promises: no database, a malformed skill file, an empty skills dir
 node scripts/check-failure-paths.mjs
+
+# the office kit: the GLB against its sidecar — sizes, anchors, heights, and that
+# no material has escaped the theme's role table
+node blender/scripts/verify-blocks-glb.mjs
 
 # typecheck every package
 node apps/server/node_modules/typescript/bin/tsc -p apps/server/tsconfig.json --noEmit
@@ -813,14 +1115,35 @@ node scripts/shoot-state.mjs --out .screenshots/wide.png \
 node scripts/inspect-glb.mjs apps/web/public/office/office.glb
 ```
 
-- **Server: 118 pass, 1 skipped, 0 fail.** The engine tests drive real runs — real
+- **Server: 304 pass, 1 skipped, 0 fail.** The engine tests drive real runs — real
   pipelines, real router, real tool loop — against the scripted provider and a
   scratch workspace, proving files land on disk, budget halts, cancellation is
   safe, debates produce verdicts, the review loop sends work back to the
   builders, the spend gate asks exactly once, and a run in one organisation
   leaves another floor's directory untouched. The runtime tests cover the
   workspace rules and the migration directly, because a folder name that escapes
-  the workspaces root would hand thirteen agents the whole disk.
+  the workspaces root would hand thirteen agents the whole disk — and the floor
+  style, because a value that reaches a shader is a value that has to be refused
+  at the boundary rather than rendered.
+- **The model layer is five suites, and the interesting ones are about failure.**
+  `modelList.test.ts` parses real captured payloads — DeepSeek's two-field answer,
+  OpenRouter's 445-entry one, Anthropic's `display_name` spelling — and asserts
+  that an unrecognisable body *throws* while a recognised-but-empty list returns
+  `[]`, because "I could not read this" and "the vendor serves nothing" have
+  opposite consequences for routing. `discovery.test.ts` covers the cache
+  round-trip, a corrupt or foreign cache being ignored, a failure after a success
+  *withdrawing* the discovered set, and a provider answering with nothing being a
+  success rather than a failure. `quality.test.ts` pins that confidence gates
+  influence, that smoothing survives one bad turn out of twenty, that a cancelled
+  turn votes on nothing, and that a fallback-served turn is recorded as a failure
+  for the model that did not answer. `score.test.ts` opens with the
+  backward-compatibility invariant and `modelRouter.test.ts` covers the pin
+  refusals and hint scoping. `benchmarks.test.ts` pins the percentile calibration
+  against the measured distribution, and that an ambiguous bare model name is
+  refused rather than guessed — a false match would hand one vendor's scores to
+  another's model while looking authoritative. `health.test.ts` pins that a
+  lookup never blocks a turn, never fails one, and that a model with no endpoints
+  is not mistaken for a model with a broken one.
 - **`smoke-ws.mjs`: 202 checks.** It drives a *running* server as a real client
   over the socket: office state on connect, two full runs (question + build),
   streaming deltas reconstructing the final text, replay from the persisted log,
@@ -913,7 +1236,16 @@ node apps/web/.verify/smoke.ts   # instead of compiling to CJS first
 # will refuse, because re-running 01 destroys the furniture. See Known gaps.
 D:\Blender\blender.exe --background --factory-startup `
   --python blender\scripts\02_office_blocks.py
+
+# a rendered contact sheet of the whole kit, for looking at a change before it
+# reaches the browser. `-- --only pod4,lounge3` draws just those modules.
+D:\Blender\blender.exe --background --factory-startup `
+  --python blender\scripts\04_preview_blocks.py
 ```
+
+`02_office_blocks.py` writes `blocks.json` directly when Blender runs it, and
+prints the same document as `BLOCKS_JSON=…` when it cannot — the MCP bridge's
+safe mode withholds `open`, so the printed copy is the sidecar of record there.
 
 The one test that is skipped asserts that an approved `run_shell` actually
 executes a command; it needs a piped child process, so it reports itself as

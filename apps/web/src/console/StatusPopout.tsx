@@ -91,16 +91,26 @@ export function StatusPopout({ onClose }: { onClose: () => void }) {
               <div className="popout-section-title">
                 Posture
                 <Badge
-                  tone={office.llmMode === 'mock' ? 'warn' : 'ok'}
-                  title={
-                    office.llmMode === 'mock'
-                      ? 'Scripted provider: the office runs end to end without spending anything'
-                      : 'Live providers: turns cost real money'
+                  tone={
+                    office.llmMode !== 'mock'
+                      ? 'ok'
+                      : typeof office.configStale === 'string' && office.configStale !== ''
+                        ? 'danger'
+                        : 'warn'
                   }
+                  // The reason, not a restatement of the mode. "mock" without a
+                  // why reads the same whether no key was found, an operator
+                  // forced it, or the process predates the key being added.
+                  title={office.llmModeReason ?? `llm: ${office.llmMode}`}
                 >
                   llm: {office.llmMode}
                 </Badge>
               </div>
+              {typeof office.configStale === 'string' && office.configStale !== '' && (
+                <div className="alert alert-warn small" role="status">
+                  {office.configStale}
+                </div>
+              )}
               <div className="segmented" role="group" aria-label="Global routing posture">
                 {POSTURES.map((posture) => (
                   <button

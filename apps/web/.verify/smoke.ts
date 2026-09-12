@@ -36,6 +36,9 @@ import { toEmployeeState } from '@dev3d/core';
 import { OfficeStore } from '../src/app/store.ts';
 import { paneCeiling } from '../src/app/paneGeometry.ts';
 import { FLOOR_STEP, floorOffset, floorVisibility, resolveFloorId } from '../src/office/floors.ts';
+import { STYLE_ROLES, applyStyle, disposeMaterials, dressMaterials, roleForMaterial } from '../src/office/theme.ts';
+import { DEFAULT_STYLE_PRESET, STYLE_PRESETS, STYLE_PRESET_ORDER } from '@dev3d/core';
+import * as THREE from 'three';
 
 let failures = 0;
 let checks = 0;
@@ -108,7 +111,7 @@ const pluginRecord: PluginRecord = {
     contributes: { toolNames: ['echo'] },
     settings: [{ key: 'aggressiveness', label: 'How hard', type: 'select', default: 'balanced', options: ['balanced'] }],
   },
-  directory: 'E:/Development/dev3d/plugins/dev3d.cost-guard',
+  directory: '/plugins/dev3d.cost-guard',
   source: 'bundled',
   enabled: true,
   status: 'loaded',
@@ -147,7 +150,7 @@ function run(id: string, status: Run['status']): Run {
     stages: [stage(id, `${id}-s1`, 'pending')],
     budget: { limitUsd: 5, spentUsd: 0 },
     workspaceId: 'default',
-    workspacePath: 'E:/Development/dev3d/workspace',
+    workspacePath: '/workspace',
     objective: null,
     tags: ['ui'],
     outcome: null,
@@ -189,7 +192,7 @@ function turn(id: string, runId: string, stageId: string, employeeId: string): T
 function officeState(roles: Role[], runs: Run[], employees?: EmployeeState[]): OfficeState {
   return {
     settings: {
-      workspacesRoot: 'E:/Development/dev3d/workspaces',
+      workspacesRoot: '/workspaces',
       allowExternalWorkspaces: true,
       defaultRoutingPosture: 'balanced',
       maxConcurrency: 4,
@@ -214,7 +217,7 @@ function officeState(roles: Role[], runs: Run[], employees?: EmployeeState[]): O
       {
         id: 'default',
         name: 'Default project',
-        path: 'E:/Development/dev3d/workspace',
+        path: '/workspace',
         isDefault: true,
         floor: 1,
         roleCount: roles.length,
@@ -242,7 +245,7 @@ function officeState(roles: Role[], runs: Run[], employees?: EmployeeState[]): O
     },
     plugins: {
       apiVersion: '1',
-      pluginsRoot: 'E:/Development/dev3d/plugins',
+      pluginsRoot: '/plugins',
       allowInstall: true,
       records: [pluginRecord],
       sources: [
@@ -718,6 +721,74 @@ const other = floorVisibility('portal', 'payments');
 check('the floor being looked at shows its walls', shown.walls === true);
 check('another floor keeps only its plate', other.walls === false && other.plate === true);
 check('the active floor hides its plate so it cannot z-fight the real slab', shown.plate === false);
+
+// ------------------------------------------------------------------ the dressing
+// A floor's style is a sparse patch over a preset, and the renderer dresses a
+// clone by looking each material's *name* up in a role table. Both halves can be
+// wrong in ways a typecheck cannot see: a preset missing a role leaves a surface
+// grey, and a material the table has never heard of ships unstyled no matter what
+// the user picks. Neither is visible without a viewport, so both are pinned here.
+
+check('there is a role for every surface a floor can show', STYLE_ROLES.length >= 14, STYLE_ROLES.length);
+
+for (const presetId of STYLE_PRESET_ORDER) {
+  const applied = applyStyle({ preset: presetId });
+  const missing = STYLE_ROLES.filter((role) => applied.materials[role] === undefined);
+  check(`${presetId}: every role resolves to a material`, missing.length === 0, missing);
+  check(`${presetId}: the wall takes the preset's own colour`,
+    applied.materials.wall.color.getHexString() === STYLE_PRESETS[presetId]?.materials.wall.color.slice(1),
+    applied.materials.wall.color.getHexString());
+}
+
+// The default must be exactly the look the office shipped with, or "unstyled"
+// would have been a redesign rather than a no-op.
+const defaultApplied = applyStyle(undefined);
+check('an unstyled floor resolves to the default preset', defaultApplied.presetId === DEFAULT_STYLE_PRESET);
+check(
+  'the default preset paints the walls the pre-style grey',
+  defaultApplied.materials.wall.color.getHexString() === '9a9ba1',
+  defaultApplied.materials.wall.color.getHexString(),
+);
+
+// Every material the two GLBs actually carry, so a new one cannot slip through.
+// Kept as a list rather than read from the assets because this runs without a
+// filesystem; `blender/scripts/verify-blocks-glb.mjs` reads the real files.
+const ASSET_MATERIALS = [
+  // blocks.glb - the generated kit's surfaces
+  'W_Slab', 'W_Floor', 'W_Carpet', 'W_Wall', 'W_AccentWall', 'W_Partition', 'W_Glass', 'W_Trim',
+  'F_Frame', 'F_Rail', 'F_Desk', 'F_DeskTop', 'F_Soft', 'F_SoftDeep', 'F_Rug', 'F_Plant',
+  'F_Board', 'F_Cork', 'F_Storage', 'F_Art', 'F_Fixture', 'F_Neon', 'F_Screen', 'F_ScreenOff',
+  // office.glb - the hand-authored core
+  'M_Floor_Concrete', 'M_Carpet_DevFloor', 'M_Wall_Paint', 'M_Wall_Accent', 'M_Glass_Partition',
+  'M_Metal_Frame', 'M_Accent_Orange', 'M_Desk_Oak', 'M_Desk_Top', 'M_Table_Meeting',
+  'M_Chair_Shell', 'M_Chair_Pad', 'M_Soft_Furnishing', 'M_Rug', 'M_Plant', 'M_Screen_Emissive',
+];
+const unmappedNames = ASSET_MATERIALS.filter((name) => roleForMaterial(name) === null);
+check('every material in both GLBs maps to a role', unmappedNames.length === 0, unmappedNames);
+
+// A dressing pass must actually swap the materials, and must name anything it
+// could not place - a silently unstyled mesh is what this table exists to prevent.
+const styledFloor = applyStyle({ preset: 'neonlab', materials: { wall: { color: '#123456' } } });
+const wallMesh = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial({ name: 'W_Wall' }));
+const leftover = dressMaterials(wallMesh, styledFloor);
+check('dressing a mesh swaps its material for the styled one', wallMesh.material === styledFloor.materials.wall);
+check('a known material leaves nothing unmapped', leftover.length === 0, leftover);
+check(
+  'a colour override reaches the material the renderer uses',
+  styledFloor.materials.wall.color.getHexString() === '123456',
+  styledFloor.materials.wall.color.getHexString(),
+);
+
+const strayMesh = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial({ name: 'Not_A_Real_Material' }));
+const strayLeftover = dressMaterials(strayMesh, styledFloor);
+check('an unrecognised material is named in the report', strayLeftover.includes('Not_A_Real_Material'), strayLeftover);
+
+// Materials are owned per floor, so releasing one must not disturb a sibling.
+const otherFloor = applyStyle({ preset: 'nordic' });
+disposeMaterials(styledFloor.materials);
+check('releasing a floor keeps a sibling floor intact',
+  otherFloor.materials.wall.color.getHexString() === 'e9e6df',
+  otherFloor.materials.wall.color.getHexString());
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) {

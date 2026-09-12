@@ -12,6 +12,7 @@ import type { Company, Department, EmployeeState, EmployeeUsage, Role, OrgChart,
 import type { PluginSystemState } from './plugin.ts';
 import type { Approval, Artifact, DirectMessage, Pipeline, Run, StageRun, TurnRecord } from './run.ts';
 import type { FloorLayout, OfficeBlockKind } from './block.ts';
+import type { OfficeStyle } from './style.ts';
 
 export interface ProviderStatus {
   id: string;
@@ -28,6 +29,20 @@ export interface ProviderStatus {
    * guess.
    */
   pluginId: string | null;
+  /**
+   * How this provider's model list was obtained.
+   *
+   * The distinction matters to anyone reading the catalog: `discovered` means
+   * the vendor told us which models it serves, `seed` means nobody asked, and
+   * `degraded` means we asked and could not get an answer, so the curated
+   * catalog is standing in. A count with no provenance is a number nobody can
+   * act on.
+   */
+  modelSource: 'discovered' | 'degraded' | 'seed';
+  /** Why discovery failed, when it did. */
+  modelSourceDetail: string | null;
+  /** When the model list was last obtained, in epoch milliseconds. */
+  discoveredAt: number | null;
 }
 
 /**
@@ -40,6 +55,45 @@ export interface ProviderStatus {
 export interface ChatTurnInput {
   role: 'user' | 'assistant';
   text: string;
+}
+
+/**
+ * What the office knows about its models, beyond the catalog itself.
+ *
+ * Every one of these is optional information the router uses when it has it and
+ * ignores when it does not, so the console reports coverage rather than implying
+ * that a thin signal is a complete one.
+ */
+export interface ModelSignals {
+  /** Public benchmark scores, from OpenRouter's aggregation of three sources. */
+  benchmarks: {
+    enabled: boolean;
+    /** Rows returned, across every source. */
+    entries: number;
+    /** Distinct models those rows describe. */
+    models: number;
+    /** Rows carrying an Artificial Analysis index, which is the usable subset. */
+    measured: number;
+    fetchedAt: number | null;
+    /** Required attribution, shown wherever a score is. */
+    attribution: string;
+    /** Why it is empty, when it is. */
+    detail: string | null;
+  };
+  /** Upstream endpoint uptime. Needs no key. */
+  health: {
+    enabled: boolean;
+    /** Models an uptime reading has been obtained for. */
+    known: number;
+    fetchedAt: number | null;
+  };
+  /** What the office has observed from its own finished turns. */
+  learned: {
+    /** Models with at least one observed outcome. */
+    models: number;
+    /** Turns the estimate is built from. */
+    samples: number;
+  };
 }
 
 /** Everything the office needs to render itself from cold. */
@@ -63,6 +117,14 @@ export interface OfficeState {
   skillIds: string[];
   /** The active organisation's money. */
   budget: WorkspaceBudget;
+  /**
+   * How the active floor looks, at the top level as well as on its floor state.
+   *
+   * The style editor is a top-level panel, and reaching into `floor.style` for
+   * the value it edits - while every other panel on the same page reads a
+   * top-level field - is the kind of inconsistency that gets copied.
+   */
+  style: OfficeStyle;
   /** Everything about the floor the console is looking at, in one place. */
   floor: {
     /** The modules this floor has grown beyond the core office. */
@@ -75,6 +137,12 @@ export interface OfficeState {
     seatIds: string[];
     /** The module kinds a floor can be grown with. */
     modules: OfficeBlockKind[];
+    /**
+     * How this floor looks: the preset it starts from plus whatever was changed.
+     * Sparse, so a floor that has never been styled is one field rather than a
+     * full palette the client has to diff against the default.
+     */
+    style: OfficeStyle;
     /** A short human line: `core + 3 rooms · Open pod, Lounge`. */
     describe: string;
     /** Why there is no kit, when there is none. */
@@ -87,8 +155,27 @@ export interface OfficeState {
   /** Full model catalog the router chooses from. */
   models: ModelSpec[];
   providers: ProviderStatus[];
+  /** Coverage of the quality signals the router weighs. */
+  modelSignals: ModelSignals;
   /** 'mock' runs the whole engine against scripted employees, no keys needed. */
   llmMode: 'mock' | 'live';
+  /**
+   * Why `llmMode` is what it is, in words.
+   *
+   * The console badges the mode, and a badge that says "mock" without a reason
+   * is a riddle: it looks identical whether no key was found, or an operator
+   * forced it, or the process simply predates the key being added.
+   */
+  llmModeReason: string;
+  /**
+   * Set when the environment has changed since this process read it, so a
+   * restart would resolve something differently.
+   *
+   * `.env` is read once at startup, which is correct and completely invisible.
+   * Without this, editing it and seeing no change looks like a bug in the
+   * configuration rather than a process that has not been restarted.
+   */
+  configStale: string | null;
   routingPosture: RoutingPosture;
   /** Installed plugins, marketplaces, and what they contribute. */
   plugins: PluginSystemState;
@@ -249,6 +336,15 @@ export type ClientCommand =
       color?: string;
       workspaceId?: string;
     }
+  /**
+   * Restyle a floor: its preset, and whatever it changes about it.
+   *
+   * A whole style rather than a patch, because that is what the editor holds -
+   * it renders the resolved palette, so it always sends back a complete answer,
+   * and a merge would make "reset this surface to the preset" impossible to
+   * express. `null` returns the floor to the default preset.
+   */
+  | { type: 'setWorkspaceStyle'; style: OfficeStyle | null; workspaceId?: string }
 
   // ------------------------------------------------------ building and system
   /**

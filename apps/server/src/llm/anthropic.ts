@@ -7,11 +7,12 @@
  * the tool-result side. Streaming is Anthropic's SSE event stream.
  */
 
-import type { ChatMessage, ToolCallRequest, UsageRecord } from '@dev3d/core';
+import type { ChatMessage, DiscoveredModel, ToolCallRequest, UsageRecord } from '@dev3d/core';
 import type { ProviderConfig } from '../config.ts';
 import { isProviderConfigured } from '../config.ts';
 import type { ChatRequest, ChatResult, LlmProvider, LlmToolSchema } from './types.ts';
 import { computeCost } from './pricing.ts';
+import { parseModelList } from './modelList.ts';
 
 type Block =
   | { type: 'text'; text: string }
@@ -246,11 +247,36 @@ async function parseStream(resp: Response, req: ChatRequest): Promise<ChatResult
 export function createAnthropicProvider(cfg: ProviderConfig): LlmProvider {
   const baseUrl = cfg.baseUrl.replace(/\/+$/, '');
 
+  function authHeaders(): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      'x-api-key': cfg.apiKey ?? '',
+      'anthropic-version': '2023-06-01',
+    };
+  }
+
   const provider: LlmProvider = {
     id: cfg.id,
     label: cfg.label,
     models: [],
     isConfigured: () => isProviderConfigured(cfg),
+
+    /**
+     * `GET /models` on the Messages API. Anthropic spells the human label
+     * `display_name`, which the shared parser understands; everything else it
+     * returns (a creation date, a type) is either mapped or ignored.
+     */
+    async listModels(): Promise<DiscoveredModel[]> {
+      const resp = await fetch(`${baseUrl}/models?limit=1000`, {
+        method: 'GET',
+        headers: { ...authHeaders(), accept: 'application/json' },
+      });
+      if (!resp.ok) {
+        const detail = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status} from ${cfg.id}/models: ${detail.slice(0, 200)}`);
+      }
+      return parseModelList(await resp.json());
+    },
 
     async chat(req: ChatRequest): Promise<ChatResult> {
       const { system, messages } = translateMessages(req.messages);
@@ -271,11 +297,7 @@ export function createAnthropicProvider(cfg: ProviderConfig): LlmProvider {
       if (req.temperature !== undefined) body.temperature = req.temperature;
       if (req.onDelta) body.stream = true;
 
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-api-key': cfg.apiKey ?? '',
-        'anthropic-version': '2023-06-01',
-      };
+      const headers: Record<string, string> = authHeaders();
 
       const resp = await fetch(`${baseUrl}/messages`, {
         method: 'POST',

@@ -515,10 +515,12 @@ function isTaskClass(value: string): value is TaskClass {
 }
 
 function ModelPolicyEditor({ role, onApply }: { role: Role; onApply: (policy: ModelPolicy) => void }) {
+  const office = useOffice();
   const policy = role.modelPolicy;
   const [defaultTier, setDefaultTier] = useState<ModelTier>(policy.defaultTier);
   const [minTier, setMinTier] = useState<ModelTier>(policy.minTier);
   const [maxTier, setMaxTier] = useState<ModelTier>(policy.maxTier);
+  const [preferredModelId, setPreferredModelId] = useState<string>(policy.preferredModelId ?? '');
   const [overrides, setOverrides] = useState<Partial<Record<TaskClass, ModelTier>>>({ ...(policy.byTaskClass ?? {}) });
   const [escalateAt, setEscalateAt] = useState<string>(policy.escalateAtComplexity !== undefined ? String(policy.escalateAtComplexity) : '');
   const [escalateTo, setEscalateTo] = useState<ModelTier | ''>(policy.escalateTo ?? '');
@@ -527,6 +529,25 @@ function ModelPolicyEditor({ role, onApply }: { role: Role; onApply: (policy: Mo
   const [newClass, setNewClass] = useState<TaskClass>('coding');
   const [newTier, setNewTier] = useState<ModelTier>('standard');
   const [applied, setApplied] = useState(false);
+
+  /**
+   * The models this role may actually be pinned to.
+   *
+   * Sourced from the live catalog rather than a literal, so the list is whatever
+   * the providers reported - and filtered to the policy's own tier bounds, since
+   * a pin outside them is refused by the router and offering one would be
+   * offering a setting that cannot work.
+   */
+  const pinChoices = useMemo(() => {
+    const minRank = MODEL_TIER_ORDER.indexOf(minTier);
+    const maxRank = MODEL_TIER_ORDER.indexOf(maxTier);
+    return (office?.models ?? [])
+      .filter((model) => {
+        const rank = MODEL_TIER_ORDER.indexOf(model.tier);
+        return rank >= minRank && rank <= maxRank;
+      })
+      .sort((a, b) => a.tier.localeCompare(b.tier) || a.label.localeCompare(b.label));
+  }, [office?.models, minTier, maxTier]);
 
   const overrideEntries = useMemo(
     () => Object.entries(overrides).filter((entry): entry is [string, ModelTier] => typeof entry[1] === 'string'),
@@ -537,6 +558,7 @@ function ModelPolicyEditor({ role, onApply }: { role: Role; onApply: (policy: Mo
     defaultTier !== policy.defaultTier ||
     minTier !== policy.minTier ||
     maxTier !== policy.maxTier ||
+    preferredModelId !== (policy.preferredModelId ?? '') ||
     pin !== (policy.pin === true) ||
     escalateAt !== (policy.escalateAtComplexity !== undefined ? String(policy.escalateAtComplexity) : '') ||
     escalateTo !== (policy.escalateTo ?? '') ||
@@ -550,6 +572,7 @@ function ModelPolicyEditor({ role, onApply }: { role: Role; onApply: (policy: Mo
       defaultTier,
       minTier,
       maxTier,
+      ...(preferredModelId !== '' ? { preferredModelId } : {}),
       ...(Number.isFinite(parsedComplexity) ? { escalateAtComplexity: Math.min(1, Math.max(0, parsedComplexity)) } : {}),
       ...(escalateTo !== '' ? { escalateTo } : {}),
       ...(Number.isFinite(parsedTokens) && parsedTokens > 0 ? { maxOutputTokens: parsedTokens } : {}),
@@ -565,7 +588,7 @@ function ModelPolicyEditor({ role, onApply }: { role: Role; onApply: (policy: Mo
     };
     onApply(next);
     setApplied(true);
-  }, [defaultTier, escalateAt, escalateTo, maxOutputTokens, maxTier, minTier, onApply, overrideEntries, pin]);
+  }, [defaultTier, escalateAt, escalateTo, maxOutputTokens, maxTier, minTier, onApply, overrideEntries, pin, preferredModelId]);
 
   return (
     <div className="role-section policy-editor">
@@ -608,6 +631,29 @@ function ModelPolicyEditor({ role, onApply }: { role: Role; onApply: (policy: Mo
         <label className="field field-check">
           <input type="checkbox" checked={pin} onChange={(event) => setPin(event.target.checked)} />
           <span>pin (never escalate)</span>
+        </label>
+      </div>
+
+      <div className="policy-row">
+        <label className="field field-wide">
+          <span className="field-label">Pin to a specific model</span>
+          <select
+            value={preferredModelId}
+            onChange={(event) => setPreferredModelId(event.target.value)}
+            title="Tiers keep a policy portable; a pin is for when you know exactly which model this role must run on."
+          >
+            <option value="">no pin — let the router choose within the tiers</option>
+            {pinChoices.map((model) => (
+              <option key={`${model.providerId}/${model.id}`} value={model.id}>
+                {model.label} · {model.providerId}/{model.id} ({model.tier})
+              </option>
+            ))}
+          </select>
+          <span className="dim small">
+            {preferredModelId === ''
+              ? `${pinChoices.length} model(s) within ${minTier}..${maxTier} available to pin`
+              : 'a pin is honoured inside the min/max tiers above; one outside them is refused and reported'}
+          </span>
         </label>
       </div>
 

@@ -131,7 +131,18 @@ function GeneralSettings() {
         <div className="kv">
           <div className="kv-label">Providers</div>
           <div className="kv-value">
-            <Badge tone={office.llmMode === 'mock' ? 'warn' : 'ok'}>{office.llmMode}</Badge>
+            <Badge
+              tone={
+                office.llmMode !== 'mock'
+                  ? 'ok'
+                  : typeof office.configStale === 'string' && office.configStale !== ''
+                    ? 'danger'
+                    : 'warn'
+              }
+              title={office.llmModeReason ?? `llm: ${office.llmMode}`}
+            >
+              {office.llmMode}
+            </Badge>
           </div>
         </div>
         <div className="kv">
@@ -251,6 +262,30 @@ function ModelSettings() {
             )}
             <Badge tone={provider.configured ? 'ok' : 'neutral'}>
               {provider.configured ? 'key set' : 'no key'}
+            </Badge>
+            {/* Where the model list came from. Without it a count is a number
+                nobody can act on: a provider that was asked and one that never
+                was look identical. */}
+            <Badge
+              tone={
+                provider.modelSource === 'discovered'
+                  ? 'ok'
+                  : provider.modelSource === 'degraded'
+                    ? 'danger'
+                    : 'neutral'
+              }
+              title={
+                provider.modelSourceDetail ??
+                (provider.modelSource === 'discovered'
+                  ? 'Reported by the provider itself.'
+                  : 'Never asked: the curated catalog is in use.')
+              }
+            >
+              {provider.modelSource === 'discovered'
+                ? 'listed'
+                : provider.modelSource === 'degraded'
+                  ? 'unreachable'
+                  : 'catalog'}
             </Badge>
             <span className="dim small mono">{provider.modelCount} models</span>
           </span>
@@ -387,6 +422,7 @@ function ModelOverrideEditor({
   const [tier, setTier] = useState<ModelTier>(override?.tier ?? model.tier);
   const [priceIn, setPriceIn] = useState(String(override?.costPerMTokIn ?? model.costPerMTokIn));
   const [priceOut, setPriceOut] = useState(String(override?.costPerMTokOut ?? model.costPerMTokOut));
+  const [quality, setQuality] = useState(override?.quality !== undefined ? String(override.quality) : '');
 
   const price = (raw: string): number | null => {
     if (raw.trim() === '') return null;
@@ -396,7 +432,16 @@ function ModelOverrideEditor({
 
   const inValue = price(priceIn);
   const outValue = price(priceOut);
-  const valid = !Number.isNaN(inValue) && !Number.isNaN(outValue);
+  /**
+   * Quality is a 0..1 score, so a value outside that is a typo rather than a
+   * strong opinion. A blank field means "no correction", which is not the same
+   * as zero - zero would mean "this model is worthless".
+   */
+  const qualityValue = quality.trim() === '' ? null : Number(quality);
+  const qualityValid =
+    qualityValue === null || (Number.isFinite(qualityValue) && qualityValue >= 0 && qualityValue <= 1);
+  const valid = !Number.isNaN(inValue) && !Number.isNaN(outValue) && qualityValid;
+  const measured = model.quality?.quality;
 
   return (
     <div className="model-override">
@@ -404,6 +449,7 @@ function ModelOverrideEditor({
         <span className="strong mono">{model.id}</span>
         <span className="dim small">
           shipped as {model.tier} · {model.costPerMTokIn.toFixed(2)} / {model.costPerMTokOut.toFixed(2)} per million
+          {measured !== undefined && ` · quality ${measured.toFixed(2)}`}
         </span>
       </div>
 
@@ -438,11 +484,26 @@ function ModelOverrideEditor({
             onChange={(event: ChangeEvent<HTMLInputElement>) => setPriceOut(event.target.value)}
           />
         </label>
+        <label className="field">
+          <span className="field-label">Quality (0–1)</span>
+          <input
+            type="number"
+            min="0"
+            max="1"
+            step="0.05"
+            value={quality}
+            placeholder={measured !== undefined ? measured.toFixed(2) : 'unrated'}
+            onChange={(event: ChangeEvent<HTMLInputElement>) => setQuality(event.target.value)}
+            title="Your own score for this model. It outranks the curated baseline, what the office has observed, and any published benchmark."
+          />
+        </label>
       </div>
 
       {!valid && (
         <div className="alert alert-warn small" role="status">
-          A price has to be a number of dollars per million tokens, zero or more.
+          {qualityValid
+            ? 'A price has to be a number of dollars per million tokens, zero or more.'
+            : 'Quality is a score from 0 to 1. Leave it blank to keep whatever the catalog and the benchmarks say.'}
         </div>
       )}
 
@@ -456,6 +517,7 @@ function ModelOverrideEditor({
               tier,
               ...(inValue === null ? {} : { costPerMTokIn: inValue }),
               ...(outValue === null ? {} : { costPerMTokOut: outValue }),
+              ...(qualityValue === null ? {} : { quality: qualityValue }),
             })
           }
         >
@@ -768,7 +830,18 @@ export function SettingsPanel() {
       }
       actions={
         office ? (
-          <Badge tone={office.llmMode === 'mock' ? 'warn' : 'ok'}>{office.llmMode} providers</Badge>
+          <Badge
+            tone={
+              office.llmMode !== 'mock'
+                ? 'ok'
+                : typeof office.configStale === 'string' && office.configStale !== ''
+                  ? 'danger'
+                  : 'warn'
+            }
+            title={office.llmModeReason ?? `llm: ${office.llmMode}`}
+          >
+            {office.llmMode} providers
+          </Badge>
         ) : null
       }
     >

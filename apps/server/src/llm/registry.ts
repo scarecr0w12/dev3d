@@ -7,11 +7,13 @@
  * shows the true provider list (just scripted, not billed).
  */
 
-import type { ModelOverride, ModelSpec } from '@dev3d/core';
+import type { ModelOverride, ModelSignals, ModelSpec, QualityOpinion } from '@dev3d/core';
 import type { ProviderConfig, ServerConfig } from '../config.ts';
 import { isProviderConfigured } from '../config.ts';
 import type { ChatRequest, ChatResult, LlmProvider } from './types.ts';
 import { modelsForProvider } from './catalog.ts';
+import { createDiscoveryService, type DiscoveryMode, type DiscoveryService } from './discovery.ts';
+import { applyOpinions, blendQuality, operatorOpinion } from './quality.ts';
 import { createOpenAICompatProvider } from './openaiCompat.ts';
 import { createAnthropicProvider } from './anthropic.ts';
 import { createMockProvider } from './mock.ts';
@@ -25,6 +27,16 @@ export interface RegistryStatus {
   modelCount: number;
   /** The plugin that contributed this provider, or null for a built-in one. */
   pluginId: string | null;
+  /**
+   * How this provider's model list was obtained. `discovered` means the vendor
+   * told us; `seed` means we never asked; `degraded` means we asked and could
+   * not get an answer, so the curated catalog is standing in.
+   */
+  modelSource: DiscoveryMode;
+  /** Why discovery failed, when it did. */
+  modelSourceDetail: string | null;
+  /** When the model list was last obtained, in epoch milliseconds. */
+  discoveredAt: number | null;
 }
 
 export interface ProviderRegistry {
@@ -37,6 +49,15 @@ export interface ProviderRegistry {
   findModel(modelId: string): ModelSpec | undefined;
   /** Rebuild the adapter list, picking up providers plugins have contributed. */
   refreshProviders(): void;
+  /** The discovery service, so the console can trigger and read it. */
+  discovery: DiscoveryService;
+  /**
+   * Observed upstream uptime for a model, or undefined when nothing is known.
+   * Undefined for every model when endpoint health is switched off.
+   */
+  reliability(spec: ModelSpec): number | undefined;
+  /** Coverage of the quality signals the router weighs. */
+  signals(): ModelSignals;
   /** True when the whole office is running scripted (no billing). */
   mock: boolean;
   /** Walk `primary` then `fallbacks` on provider/transport failure. */
@@ -75,6 +96,36 @@ export interface RegistryOptions {
    * shows none.
    */
   log?: (level: 'debug' | 'info' | 'warn' | 'error', scope: string, message: string) => void;
+  /**
+   * Quality opinions from sources outside the catalog: what the office has
+   * observed from its own turns, and what a benchmark aggregator published.
+   *
+   * Asked for **one model at a time**, and read on every use, so a finished turn
+   * or a refreshed index shows up in routing without a restart. It is a
+   * resolver rather than a map on purpose: a map would have to be built for the
+   * whole catalog before the catalog exists.
+   *
+   * It may return several opinions, and they all blend: an office with an
+   * OpenRouter key has a benchmark-derived opinion *and* whatever it learned
+   * from its own turns, and keeping the sources distinct is the point.
+   */
+  extraOpinions?: (spec: ModelSpec) => readonly QualityOpinion[];
+  /**
+   * Observed upstream uptime for a model, 0..1, or undefined when unknown.
+   *
+   * A demotion signal, not a filter: see `router/score.ts`. Undefined must mean
+   * "no opinion", never "zero", or every model outside the measured provider set
+   * would lose to every model inside it.
+   */
+  reliability?: (spec: ModelSpec) => number | undefined;
+  /**
+   * Coverage of the quality signals, for the console.
+   *
+   * Supplied from outside because the registry owns only discovery and the
+   * catalog; the learned, benchmark and health services live with the runtime
+   * that starts them.
+   */
+  signals?: () => ModelSignals;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -94,12 +145,43 @@ function applyOverride(model: ModelSpec, override: ModelOverride | undefined): M
   if (override.tier !== undefined) next.tier = override.tier;
   if (override.costPerMTokIn !== undefined) next.costPerMTokIn = override.costPerMTokIn;
   if (override.costPerMTokOut !== undefined) next.costPerMTokOut = override.costPerMTokOut;
+  // A quality correction joins the blend as the loudest opinion, so an operator
+  // who has actually run the model outranks a benchmark that measured somebody
+  // else's workload. The measured opinions are kept for display, not discarded.
+  if (override.quality !== undefined || override.fitness !== undefined) {
+    next.quality = blendQuality([
+      ...(next.quality?.opinions ?? []),
+      operatorOpinion(override.quality ?? next.quality?.quality ?? 0.5, override.fitness ?? {}),
+    ]);
+  }
   return next;
 }
 
 export function createProviderRegistry(config: ServerConfig, options: RegistryOptions = {}): ProviderRegistry {  let providerConfigs: ProviderConfig[] = [];
   let providers: LlmProvider[] = [];
   let byId = new Map<string, LlmProvider>();
+
+  /**
+   * What each provider actually serves.
+   *
+   * Built before the adapters so `build()` can consult it, and given a thunk
+   * over the live adapter list rather than a snapshot, because a plugin being
+   * enabled or disabled replaces that list.
+   */
+  const discovery = createDiscoveryService({
+    providers: () => providers,
+    isConfigured: (providerId) => {
+      const cfg = providerConfigs.find((c) => c.id === providerId);
+      return cfg !== undefined && isProviderConfigured(cfg);
+    },
+    ttlMs: config.discoveryTtlMs,
+    cachePath: config.discoveryCachePath,
+    ...(options.log !== undefined ? { log: options.log } : {}),
+  });
+
+  // Pick up whatever the last run cached, so a restart does not need every
+  // vendor to be reachable before the catalog is right.
+  if (config.modelDiscovery) discovery.loadCache();
 
   /**
    * (Re)build every adapter. A plugin cannot shadow a built-in provider: the
@@ -150,15 +232,21 @@ export function createProviderRegistry(config: ServerConfig, options: RegistryOp
   build();
 
   /**
-   * The catalog a provider actually serves: what it shipped with, plus any
-   * plugin entries aimed at it, minus whatever the operator disabled. Plugin
+   * The catalog a provider actually serves.
+   *
+   * Membership comes from discovery when we have it, and from the curated seed
+   * when we do not - a provider with no list endpoint, an install with discovery
+   * switched off, a vendor that is down, or an office running in `mock` mode,
+   * where the whole catalog must stay demonstrable without a key.
+   *
+   * Plugin entries and operator corrections are applied on top either way. Plugin
    * models for a provider that is not configured are still catalogued so the UI
    * can show them, but no adapter will serve them.
    */
   function modelsFor(providerId: string): ModelSpec[] {
     const disabled = new Set(options.disabledModelIds?.() ?? []);
     const overrides = options.modelOverrides?.() ?? {};
-    const base = providers.find((p) => p.id === providerId)?.models ?? [];
+    const base = modelBasisFor(providerId);
     const extra = (options.extraModels?.() ?? []).filter((model) => model.providerId === providerId);
     const seen = new Set<string>();
     const out: ModelSpec[] = [];
@@ -167,7 +255,28 @@ export function createProviderRegistry(config: ServerConfig, options: RegistryOp
       seen.add(model.id);
       out.push(applyOverride(model, overrides[model.id]));
     }
-    return out;
+    // Learned and pooled opinions blend over whatever the catalog and the
+    // operator established, so the router ranks on everything known about a
+    // model rather than only the part that shipped with the checkout.
+    if (options.extraOpinions === undefined) return out;
+    return applyOpinions(out, options.extraOpinions);
+  }
+
+  /**
+   * What a provider offers before plugins and corrections: what it told us, or
+   * the curated seed.
+   *
+   * `mock` mode always uses the seed. The mock adapter serves every provider, so
+   * excluding a model because a *real* vendor does not offer it would make the
+   * keyless office less capable than the billed one - the opposite of the
+   * promise that the whole pipeline is demonstrable with no keys.
+   */
+  function modelBasisFor(providerId: string): ModelSpec[] {
+    if (config.llmMode !== 'mock' && config.modelDiscovery) {
+      const discovered = discovery.modelsFor(providerId);
+      if (discovered !== null) return discovered;
+    }
+    return providers.find((p) => p.id === providerId)?.models ?? [];
   }
 
   const allModels = (): ModelSpec[] => providers.flatMap((p) => modelsFor(p.id));
@@ -200,20 +309,42 @@ export function createProviderRegistry(config: ServerConfig, options: RegistryOp
     all: () => providers.slice(),
     get: (id) => byId.get(id),
     refreshProviders: build,
+    discovery,
+    reliability: (spec) => options.reliability?.(spec),
+    signals: () =>
+      options.signals?.() ?? {
+        benchmarks: {
+          enabled: false,
+          entries: 0,
+          models: 0,
+          measured: 0,
+          fetchedAt: null,
+          attribution: '',
+          detail: 'benchmark quality is switched off',
+        },
+        health: { enabled: false, known: 0, fetchedAt: null },
+        learned: { models: 0, samples: 0 },
+      },
     status: () =>
       providers.map((p) => {
         const cfg = providerConfigs.find((c) => c.id === p.id);
+        const report = discovery.report(p.id);
+        const mode = discovery.modeFor(p.id);
         return {
           id: p.id,
           label: p.label,
           configured: cfg ? isProviderConfigured(cfg) : false,
-          ok: null,
-          detail: null,
+          ok: report === undefined ? null : report.ok,
+          detail: report?.error ?? null,
           // The merged catalog, not just what the adapter shipped with: a
           // plugin can add models to a built-in provider, and a count that
           // disagreed with the model list would be a bug report waiting to happen.
           modelCount: modelsFor(p.id).length,
           pluginId: cfg?.pluginId ?? null,
+          modelSource: mode,
+          modelSourceDetail:
+            mode === 'degraded' ? (report?.error ?? 'discovery failed') : null,
+          discoveredAt: report?.at ?? null,
         };
       }),
     models: allModels,

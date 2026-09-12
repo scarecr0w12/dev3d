@@ -8,11 +8,12 @@
  * estimate so cost accounting still works offline.
  */
 
-import type { ChatMessage, ToolCallRequest, UsageRecord } from '@dev3d/core';
+import type { ChatMessage, DiscoveredModel, ToolCallRequest, UsageRecord } from '@dev3d/core';
 import type { ProviderConfig } from '../config.ts';
 import { isProviderConfigured } from '../config.ts';
 import type { ChatRequest, ChatResult, LlmProvider, LlmToolSchema } from './types.ts';
 import { computeCost } from './pricing.ts';
+import { parseModelList } from './modelList.ts';
 
 interface OpenAICompletionResponse {
   choices?: Array<{
@@ -197,18 +198,41 @@ async function parseStream(resp: Response, req: ChatRequest): Promise<ChatResult
 export function createOpenAICompatProvider(cfg: ProviderConfig): LlmProvider {
   const baseUrl = cfg.baseUrl.replace(/\/+$/, '');
 
+  function authHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
+    if (cfg.extraHeaders) {
+      for (const [k, v] of Object.entries(cfg.extraHeaders)) headers[k] = v;
+    }
+    return headers;
+  }
+
   const provider: LlmProvider = {
     id: cfg.id,
     label: cfg.label,
     models: [],
     isConfigured: () => isProviderConfigured(cfg),
 
-    async chat(req: ChatRequest): Promise<ChatResult> {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
-      if (cfg.extraHeaders) {
-        for (const [k, v] of Object.entries(cfg.extraHeaders)) headers[k] = v;
+    /**
+     * `GET /models`: the vendor's own list, which is the only thing that knows
+     * which models exist today. Optional fields it omits stay omitted, so a
+     * bare `{id}` answer (DeepSeek's) does not overwrite curated metadata with
+     * zeroes.
+     */
+    async listModels(): Promise<DiscoveredModel[]> {
+      const resp = await fetch(`${baseUrl}/models`, {
+        method: 'GET',
+        headers: { ...authHeaders(), accept: 'application/json' },
+      });
+      if (!resp.ok) {
+        const detail = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status} from ${cfg.id}/models: ${detail.slice(0, 200)}`);
       }
+      return parseModelList(await resp.json());
+    },
+
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const headers = authHeaders();
 
       const body: Record<string, unknown> = {
         model: req.model.id,
