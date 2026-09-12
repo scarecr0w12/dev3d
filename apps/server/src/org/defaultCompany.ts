@@ -1,7 +1,7 @@
 /**
  * The default dev3d company.
  *
- * This is the org chart the office boots with: seven departments, thirteen
+ * This is the org chart the office boots with: eight departments, thirteen
  * employees, and an explicit reporting line. Every field here is load-bearing:
  *
  *  - `seatId` / `roomId` are GLB node names, so the 3D office places people
