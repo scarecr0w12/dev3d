@@ -59,7 +59,8 @@ curl -s localhost:8787/api/runs/<runId>
 | **Run engine** | Four stage modes — `single`, `parallel`, `debate`, `review-loop` — with a tool loop, spend ceiling and cancellation |
 | **Org chart** | 13 roles across 8 departments, 3 shipped pipelines, editable live from the console |
 | **Model layer** | Provider discovery, a curated metadata overlay, learned quality from the office's own turns, pooled benchmarks, uptime, and a cost-aware router |
-| **Tools** | Nine tools, every one confined to the run's workspace root |
+| **Tools** | 14 built-in tools, every one confined to the run's workspace root — plus any tool an MCP server provides |
+| **MCP** | Connect Model Context Protocol servers (stdio or Streamable HTTP); their tools are published to employees as `mcp__<server>__<tool>` |
 | **Knowledge** | 15 skill documents selected per turn, plus stage summaries and artifacts threaded forward |
 | **Plugins** | Providers, models, skills, routing rules, tools, role templates, pipelines and console panels — without editing this repository |
 | **The office** | A generated 3D building: one floor per organisation, block-kit growth, per-floor styles |
@@ -293,8 +294,24 @@ truth**; where a provider publishes real ones, discovery overwrites them.
 
 ## Tools and confinement
 
-Nine tools: `think`, `list_dir`, `read_file`, `search_files`, `write_file`,
-`edit_file`, `run_shell`, `web_search`, `web_fetch`.
+Fourteen built-in tools:
+
+| Tool | What it is for |
+|---|---|
+| `think` | A private scratchpad note. Writes nothing, moves nothing forward. |
+| `todo_write` | The working plan for the run. Send the whole list each time. |
+| `list_dir` | A directory as a small tree. |
+| `read_file` | A UTF-8 file with line numbers, paged. |
+| `glob` | Find files by path pattern, newest first (`**/*.test.ts`). |
+| `grep` | Search file contents by regex, with context lines and include/exclude filters. |
+| `search_files` | A one-directory regex search, kept for compatibility with existing skills. |
+| `write_file` | Create or overwrite a file, making parent directories. |
+| `edit_file` | Replace one exact literal string in a file. |
+| `apply_patch` | Several exact-text edits across files, applied atomically. |
+| `run_shell` | Run a command in the workspace. The only approval-gated tool. |
+| `git` | Read-only repository inspection: status, diff, log, show, blame and more. |
+| `web_search` | Search the web. |
+| `web_fetch` | Fetch one URL and return its text. |
 
 - Every path funnels through one `resolveInWorkspace` choke point that rejects
   `..`, absolute paths outside the root, and Windows drive-relative tricks like
@@ -304,9 +321,72 @@ Nine tools: `think`, `list_dir`, `read_file`, `search_files`, `write_file`,
   see the other's files.
 - `run_shell` is the only tool that goes through a human approval round trip, and
   the only one that can be switched off safety-wise — see
-  `DEV3D_AUTO_APPROVE_SHELL`.
+  `DEV3D_AUTO_APPROVE_SHELL`. `git` is deliberately outside that gate because it
+  cannot write: its subcommands and arguments are allow-listed, and anything that
+  could change the repository is refused by name.
 - Grants are enforced per employee: the org chart decides who may hold a tool, and
   anything else is refused with a message the model can act on.
+
+### The working plan, and why it lives on the run
+
+`todo_write` is the only tool that changes the run rather than the workspace. It
+writes into the run's own plan, so it survives the turn that created it and is
+handed to whoever picks the work up in a later stage — which is exactly when a
+plan starts to matter. Every call sends the **complete** list: an incremental
+add/complete API invites drift between what the model believes the list is and
+what it is, while resending it makes each call self-consistent and impossible to
+half-apply. It is emitted with `run.updated`, so the console can show progress
+without a new protocol surface.
+
+---
+
+## MCP servers
+
+dev3d is an MCP **client**. Point it at servers and their tools become tools your
+employees can hold — with no code change, and without those servers being able to
+see anything they were not asked for.
+
+```bash
+# one or two servers, inline. Entries are separated by ";" because arguments
+# routinely contain spaces.
+DEV3D_MCP_SERVERS="fs=npx -y @modelcontextprotocol/server-filesystem /srv"
+
+# or a file, which is the better editor for anything richer
+cp mcp.json.example mcp.json
+```
+
+```jsonc
+// mcp.json
+{
+  "servers": [
+    { "id": "fs", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] },
+    { "id": "remote", "type": "http", "url": "https://mcp.example.com/mcp",
+      "headers": { "authorization": "Bearer …" } }
+  ]
+}
+```
+
+Both transports are supported: **stdio** (the server runs as a child process,
+which is how nearly every published server is used) and **Streamable HTTP** for
+hosted ones. The protocol is implemented directly on Node's built-ins, so this
+adds no dependency.
+
+**Names cannot collide.** A remote server names its own tools, so every one is
+published as `mcp__<server-id>__<tool-name>`. A server offering `read_file`
+therefore cannot shadow the built-in of that name, and two servers may both offer
+`search` without interfering.
+
+**Grants are deliberate, and off by default.** A remote server can be a
+filesystem, a database or a deployment system — more reach than any built-in
+tool. So MCP tools are never inherited from the fact that a server is connected:
+`DEV3D_MCP_GRANT_ROLES` names the roles that may call them, and the default is
+`shell-roles`, meaning the roles that already hold `run_shell`. Connecting a
+server widens nobody's reach beyond what they already had.
+
+**A server that is down is not a failure of the office.** Connections are made in
+the background after the HTTP listener is open, a failed server is recorded with
+its reason and the last thing it printed on stderr, and the others keep working.
+Settings → **MCP** shows every configured server, its state and its tool count.
 
 ---
 
@@ -475,6 +555,10 @@ The ones that matter most:
 | `DEV3D_PLUGINS_DIR` | `./plugins` | Where plugins are discovered. Each subdirectory with a `plugin.json` is one plugin. |
 | `DEV3D_PLUGIN_INSTALL_DIR` | `./data/plugins` | Where marketplace installs land, kept apart from the shipped set. |
 | `DEV3D_ALLOW_PLUGIN_INSTALL` | `false` | Allow installing a plugin bundle from a marketplace URL. |
+| `DEV3D_MCP` | `true` | Connect to configured MCP servers. Does nothing until one is configured. |
+| `DEV3D_MCP_CONFIG` | `./mcp.json` | The MCP server file. An empty value disables the file. |
+| `DEV3D_MCP_SERVERS` | *(empty)* | Inline servers: `<id>=<command> [args…]`, separated by `;`. |
+| `DEV3D_MCP_GRANT_ROLES` | `shell-roles` | Who may call MCP tools: role ids, `*`, or `none`. |
 
 Provider keys: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 `ANTHROPIC_API_KEY`, and `DEV3D_LOCAL_BASE_URL` for any OpenAI-compatible local
@@ -502,6 +586,7 @@ console says so with the remedy.
 | [`docs/development.md`](docs/development.md) | Working on dev3d: layout, the verification suite, the Blender asset pipeline, and the UI screenshot tooling |
 | [`docs/design-notes.md`](docs/design-notes.md) | Why the model layer, plugin host, block kit and persistence are shaped the way they are |
 | [`docs/wire-protocol.md`](docs/wire-protocol.md) | The WebSocket protocol, the read API, and the plugin authoring surfaces |
+| [`mcp.json.example`](mcp.json.example) | MCP server configuration, with a worked example of each transport |
 | [`docs/sandbox.md`](docs/sandbox.md) | Running the toolchain inside a restricted sandbox or CI runner |
 | [`RELEASE.md`](RELEASE.md) | The release process and version policy |
 

@@ -40,7 +40,9 @@ apps/server        The orchestrator.
                    and the fail-over registry.
   router/          Cost-aware model selection.
   skills/          Skill markdown loader, index, and per-turn selection.
-  tools/           The 9 tools, all confined to the workspace root.
+  tools/           The 14 built-in tools, all confined to the workspace root.
+  mcp/             MCP client: JSON-RPC, the stdio and HTTP transports, and the
+                   manager that publishes remote tools into the registry.
   org/             The shipped company and its pipelines.
   engine/          complexity -> prompt -> turn -> stage -> run.
   store/           SQLite persistence (node:sqlite), with a memory fallback.
@@ -74,7 +76,7 @@ One command per suite, each covering something the others cannot.
 # and that a corrupt style degrades to its preset instead of into a shader
 cd packages/core && node --test --test-isolation=none "src/**/*.test.ts"
 
-# server: 305 tests — 304 pass, 1 skipped, 0 fail (47 cover plugins, 13 the block layout, 5 the floor style)
+# server: 402 tests — 399 pass, 3 skipped, 0 fail (47 cover plugins, 13 the block layout, 5 the floor style)
 cd apps/server && node --test --test-isolation=none "src/**/*.test.ts"
 
 # live protocol: drives a RUNNING server as a real client — 202 checks
@@ -117,7 +119,7 @@ node scripts/inspect-glb.mjs apps/web/public/office/office.glb
 - **Core: 14 tests** — the style model: preset completeness, sparse-patch
   resolution, and that a corrupt style degrades to its preset instead of into a
   shader.
-- **Server: 304 pass, 1 skipped, 0 fail.** The engine tests drive real runs — real
+- **Server: 399 pass, 3 skipped, 0 fail.** The engine tests drive real runs — real
   pipelines, real router, real tool loop — against the scripted provider and a
   scratch workspace, proving files land on disk, budget halts, cancellation is
   safe, debates produce verdicts, the review loop sends work back to the
@@ -208,7 +210,7 @@ the others cannot.
    cd packages/core && node --test --test-isolation=none "src/**/*.test.ts"
    ```
 
-3. **Server tests** — 305 tests, 304 pass, 1 skipped, 0 fail (47 cover plugins,
+3. **Server tests** — 402 tests, 399 pass, 3 skipped, 0 fail (47 cover plugins,
    13 the block layout, 5 the floor style).
 
    ```bash
@@ -426,11 +428,19 @@ Two traps it exists to avoid:
 
 ---
 
-## The one skipped test
+## The three skipped tests
 
-`apps/server/src/tools/tools.test.ts` contains the single test the server suite
-reports as skipped: it asserts that an approved `run_shell` actually executes a
-command and writes its file. `run_shell` captures stdout/stderr by contract,
-which means spawning a child with piped stdio — where that is not permitted, the
-test reports itself skipped with that reason rather than failing. It still runs,
-and still has to pass, anywhere child processes are allowed.
+The server suite reports three skips, and all three have the same cause: this
+environment blocks child processes with piped stdio, which is what capturing a
+command's output requires.
+
+- `apps/server/src/tools/tools.test.ts` — an approved `run_shell` actually
+  executes a command and writes its file.
+- `apps/server/src/tools/plan.test.ts` — two `git` tests that need a real
+  repository: one that reads status, log and ls-files back, and one that proves a
+  shell metacharacter in an argument is inert.
+
+Each reports itself skipped with that reason rather than failing, and each still
+runs, and still has to pass, anywhere child processes are allowed. Nothing else in
+the MCP layer is skipped: the protocol, the client, the manager and the
+configuration are all tested through injected transports, so they run everywhere.

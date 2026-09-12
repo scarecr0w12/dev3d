@@ -74,6 +74,29 @@ locally, and it has the authority of the workspace it is pointed at. **Bind it t
 `localhost`.** Provider API keys are never exposed to the browser — the client
 learns whether a key is present, never its value.
 
+`OfficeState.mcp` reports the configured MCP servers and their state, including
+the last lines a failing server printed on stderr. It never carries a server's
+headers or credentials: only the transport description (a command line or a URL),
+the state, and the tool count.
+
+---
+
+# MCP servers
+
+dev3d is an MCP **client**. A connected server's tools are published to the tool
+registry as `mcp__<server-id>__<tool-name>` and are grantable to roles like any
+built-in tool. Servers are configured in `mcp.json` or `DEV3D_MCP_SERVERS`; see
+the README for the configuration and `docs/design-notes.md` for why the naming and
+grant rules are what they are.
+
+Two transports are supported: **stdio**, where the server runs as a child process
+and speaks newline-delimited JSON-RPC on its stdin and stdout, and **Streamable
+HTTP**, where every message is POSTed to one endpoint and the reply arrives as
+JSON or as an event stream.
+
+A server that is down, slow or misconfigured does not affect the office: it is
+recorded as `failed` with its reason, and every other server keeps working.
+
 ---
 
 # Writing a plugin

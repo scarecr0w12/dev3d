@@ -314,8 +314,11 @@ layout alone, so a restyle can never move anybody's desk.
 
 ## Tools and confinement
 
-Nine tools: `think`, `list_dir`, `read_file`, `search_files`, `write_file`,
-`edit_file`, `run_shell`, `web_search`, `web_fetch`.
+Fourteen built-in tools, in rough order of how much they can do:
+
+| Read-only | Writes |
+|---|---|
+| `think`, `todo_write`, `list_dir`, `read_file`, `glob`, `grep`, `search_files`, `git`, `web_search`, `web_fetch` | `write_file`, `edit_file`, `apply_patch`, `run_shell` |
 
 - Every path funnels through one `resolveInWorkspace` choke point that rejects
   `..`, absolute paths outside the root, and Windows drive-relative tricks like
@@ -327,6 +330,45 @@ Nine tools: `think`, `list_dir`, `read_file`, `search_files`, `write_file`,
   anything else is refused with a message the model can act on.
 - A tool contributed by a plugin is adapted into an ordinary `Tool` and receives
   the same `workspaceRoot` every other tool gets, so it is confined identically.
+- A tool provided by an MCP server is adapted in the same way, under a namespaced
+  name. See below.
+
+### Why `glob`, `grep` and `apply_patch` exist
+
+The first three filesystem tools answer narrow questions: `list_dir` shows one
+directory and truncates, and `search_files` searches one directory root for a
+regex and only reports files that matched. Neither can answer "where is that
+file?" — a filename hunt across a repository was effectively impossible — so
+`glob` exists, returning paths newest-first because the file being worked on is
+far more likely to be the one that just changed.
+
+`grep` is the same search with the things that make it usable across a real tree:
+context lines, an include filter, an exclude filter, a case switch and a stated
+truncation point. `search_files` is kept because skills and pipelines already name
+it, and removing it would silently change what those roles can do.
+
+`apply_patch` exists because a change spanning several files is safer applied as
+one unit than as a sequence of literal replacements that can half-apply. Every
+block is validated against the files as they are **before** anything is written,
+and a single missing or ambiguous block means nothing is written at all. Its
+format is exact-text `Find`/`Replace` blocks rather than a unified diff: a diff
+carries line numbers and hunk offsets, and a model that miscounts one of them
+produces a patch that lands in the wrong place, which is the worst possible
+outcome.
+
+### Why the working plan is run state
+
+`todo_write` does not write a file and does not return anything the model needs to
+act on; it changes the run. A pipeline hands work between people and spans many
+turns, so a plan that lived inside one turn's context would be lost exactly when it
+started to matter. Keeping it on the run means it survives a stage handover, is
+persisted with everything else, and reaches the operator through the existing
+`run.updated` event rather than a new protocol surface.
+
+Two rules make it trustworthy rather than decorative: the whole list is sent on
+every call, so there is no incremental state to drift; and at most one step may be
+`in_progress`, because a list with three things in flight is not describing what is
+actually being worked on.
 
 ### The shell approval gate
 
@@ -352,6 +394,82 @@ safe:
   different skills, different money, and no visibility of each other's files.
 - `Run.workspaceId` and `Run.workspacePath` are resolved at submit time and frozen
   onto the run, so its record stays truthful after the floor is renamed or closed.
+
+---
+
+## MCP servers
+
+dev3d speaks MCP as a **client**. The decision that shapes everything else is
+that a connected server is a source of *tools* and nothing more: it cannot add a
+role, change routing, or reach the console. That keeps one integration point —
+the tool registry — instead of one per capability, and it means an MCP tool is
+confined, granted and displayed by exactly the machinery a built-in tool uses.
+
+### Implemented directly, not through the SDK
+
+`jsonrpc.ts`, `client.ts`, `stdio.ts` and `http.ts` are hand-written on Node's
+built-ins. The surface the office needs is small — request, response,
+notification, error, plus `initialize`, `tools/list` and `tools/call` — and the
+server already runs on Node plus `ws` alone. Pulling in a transport stack to use
+three methods would have made this the largest dependency in the project, and the
+two transports are precisely the part worth owning: they are where a timeout, a
+framing rule and a stderr buffer have to be bounded, and those bounds are
+decisions rather than details.
+
+The spec version is negotiated rather than assumed: the client sends
+`2025-06-18` and accepts whatever the server answers, because the negotiation
+exists so an older server can be talked to at all.
+
+### Naming: the one rule that prevents a class of bug
+
+A remote server names its own tools. Nothing stops two servers from both offering
+`search`, and nothing stops a server from offering `read_file` and shadowing the
+built-in — which would be a silent privilege change, since the built-in is
+confined to the workspace and the remote one may not be. So every remote tool is
+published as:
+
+```
+mcp__<server-id>__<tool-name>
+```
+
+The prefix makes a collision with a built-in impossible, the server id makes a
+collision between two servers impossible, and the published name can be split back
+apart unambiguously. The original name is what travels on the wire.
+
+### Grants: default-deny, and why
+
+A remote MCP server can be a filesystem, a database, a browser or a deployment
+system — more reach than any built-in tool the office ships. So MCP tools are
+never inherited from the fact that a server is connected, and there is no
+"trust everything" mode.
+
+`DEV3D_MCP_GRANT_ROLES` names the roles that may call them. Its default is
+`shell-roles`, meaning *every role that already holds `run_shell`*. That marker
+rather than a list of role ids because role ids belong to an org chart an operator
+can edit: a list hardcoded here would silently stop matching after someone
+renames a role, and it would grant nothing at all on a floor whose roles were
+named differently. "Whoever can already run a command" keeps meaning the same
+thing as the chart changes.
+
+The rule is a pure exported function, `mcpGrantedForRole`, tested directly — this
+decides whether an employee can reach somebody else's infrastructure, so it is the
+one part of the integration that should not be inferred from a working happy path.
+
+### Failure is isolated and reported
+
+A server that is slow, down or misconfigured must not delay the office opening and
+must not affect the other servers. So connections are made in the background after
+the HTTP listener is open, each connection settles independently, and a failure is
+recorded as `failed` with its reason rather than thrown. `OfficeState.mcp` carries
+that status, so Settings → MCP can answer "is it working, and if not why" —
+including the last lines the server wrote to stderr, which is usually where the
+answer is.
+
+Two smaller decisions worth naming. Non-JSON on a server's stdout is logged and
+skipped rather than treated as fatal, because servers do print banners and killing
+the connection over one would be the wrong trade. And stderr is read continuously
+into a bounded ring: leaving it unread can fill the pipe and wedge the server,
+while keeping all of it would grow without bound.
 
 ---
 

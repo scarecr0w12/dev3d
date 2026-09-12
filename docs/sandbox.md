@@ -25,6 +25,13 @@ Three tools fail when child processes with piped stdio are blocked:
 - **`vite`** — `vite dev` and `vite build` both die while loading their config,
   because esbuild spawns a service worker to bundle it.
 
+Two runtime features need the same permission, and degrade honestly without it:
+
+- **`run_shell`** reports the command as failed rather than pretending it ran.
+- **MCP servers over stdio** cannot be spawned, so they appear in Settings → MCP
+  as `failed` with `spawn EPERM`. The office itself is unaffected. A server
+  reached over Streamable HTTP is not a child process and does not need this.
+
 ## Commands that work without it
 
 Each direct invocation below avoids the child process that the wrappers need.
@@ -60,7 +67,7 @@ It needs a piped child process, so under a sandbox that blocks one it reports
 itself as **skipped, with that reason**, rather than failing. It still runs, and
 still has to pass, anywhere child processes are allowed.
 
-That is why the suite reads `305 tests — 304 pass, 1 skipped`.
+That is why the suite reads `402 tests — 399 pass, 3 skipped`.
 
 ## Headless Chrome
 
