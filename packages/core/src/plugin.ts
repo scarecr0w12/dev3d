@@ -366,6 +366,41 @@ export interface PluginSystemState {
   lastCheckedAt?: number;
 }
 
+/**
+ * The state of one configured MCP server, as the console shows it.
+ *
+ * `state` is deliberately coarse — connecting, ready, failed, disabled — because
+ * the useful question an operator asks is "is it working, and if not why", and
+ * `error` carries the why.
+ */
+export interface McpServerStatus {
+  id: string;
+  state: 'connecting' | 'ready' | 'failed' | 'disabled';
+  /** How it is reached: a command line, or a URL. */
+  transport: string;
+  /** Present once the server has introduced itself. */
+  serverName?: string;
+  serverVersion?: string;
+  protocolVersion?: string;
+  /** How many tools it published. */
+  toolCount: number;
+  /** Why it is not ready, when it is not. */
+  error?: string;
+  /** Recent stderr or unparseable output, for diagnosis. */
+  notes: string[];
+}
+
+/** Every MCP server this office knows about. */
+export interface McpState {
+  /** Whether MCP connections are enabled at all. */
+  enabled: boolean;
+  /** The config file that was read, when one was. */
+  configPath: string | null;
+  /** Role ids that may call MCP tools. `['*']` means every role. */
+  grantRoles: string[];
+  servers: McpServerStatus[];
+}
+
 /** A routing hint a plugin asked for, resolved against a task class. */
 export interface RoutingHint {
   pluginId: string;

@@ -436,6 +436,7 @@ export function createRunEngine(deps: EngineDeps): RunEngine {
         workspaceId: project.id,
         workspacePath: project.path,
         objective: null,
+        plan: [],
         tags: [],
         outcome: null,
         error: null,

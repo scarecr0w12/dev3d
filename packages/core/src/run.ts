@@ -45,6 +45,23 @@ export type StageMode =
   | 'debate' // listed employees argue over N rounds, then a facilitator concludes
   | 'review-loop'; // producer revises until reviewers stop objecting
 
+export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed';
+
+/**
+ * One entry of the working plan an employee maintains while it works.
+ *
+ * This is deliberately run state rather than a scratchpad note. A multi-stage
+ * pipeline hands work between people and spans many turns, so a plan that only
+ * lived inside one turn's context would be lost exactly when it starts to
+ * matter. Keeping it on the run means it survives the handover, is persisted
+ * with everything else, and is visible to the operator while the run proceeds.
+ */
+export interface AgentPlanStep {
+  /** What this step is, phrased as an instruction to whoever picks it up. */
+  content: string;
+  status: AgentPlanStepStatus;
+}
+
 export interface StageSpec {
   kind: StageKind;
   name: string;
@@ -225,6 +242,14 @@ export interface Run {
   workspacePath: string;
   /** Structured objective produced by the intake stage. */
   objective: string | null;
+  /**
+   * The working plan the employee holding the run keeps up to date.
+   *
+   * Empty until someone calls `todo_write`. It is on the run rather than on a
+   * turn so it survives a stage handover, and it is emitted with `run.updated`
+   * so the console can show progress without a second protocol surface.
+   */
+  plan: AgentPlanStep[];
   /** Tags inferred at intake, used to decide which optional stages run. */
   tags: string[];
   /** Final answer shown at the top of the run card. */

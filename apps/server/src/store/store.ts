@@ -129,6 +129,19 @@ function createMemoryStore(reason: string, log: Log): Store {
 // sqlite
 // ---------------------------------------------------------------------------
 
+/**
+ * Bring a run read out of the database up to the current shape.
+ *
+ * Persisted runs were written by whatever version produced them, so a field
+ * added since - `plan` is the first - is simply absent from the JSON. The type
+ * says the field is there, and only this function makes that true. Defaulting is
+ * right rather than migrating: an absent working plan is exactly an empty one.
+ */
+function normalizeRun(run: Run): Run {
+  if (!Array.isArray(run.plan)) run.plan = [];
+  return run;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
   id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -278,14 +291,18 @@ export function openStore(dbPath: string, log: Log): Store {
     loadRun(id) {
       const row = db.prepare('SELECT json FROM runs WHERE id = ?').get(id) as JsonRow | undefined;
       if (!row) return undefined;
-      return parse<Run>(row.json, null) ?? undefined;
+      const run = parse<Run>(row.json, null);
+      return run === null ? undefined : normalizeRun(run);
     },
 
     recentRuns(limit) {
       const rows = db
         .prepare('SELECT json FROM runs ORDER BY created_at DESC LIMIT ?')
         .all(limit) as JsonRow[];
-      return rows.map((r) => parse<Run>(r.json, null)).filter((r): r is Run => r !== null);
+      return rows
+        .map((r) => parse<Run>(r.json, null))
+        .filter((r): r is Run => r !== null)
+        .map(normalizeRun);
     },
 
     saveTurn(turn) {

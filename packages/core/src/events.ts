@@ -9,7 +9,7 @@
 
 import type { ModelCapabilities, ModelPolicy, ModelSpec, RouteDecision, RoutingPosture } from './model.ts';
 import type { Company, Department, EmployeeState, EmployeeUsage, Role, OrgChart, OfficeSettings, WorkspaceBudget, WorkspaceSummary } from './org.ts';
-import type { PluginSystemState } from './plugin.ts';
+import type { McpState, PluginSystemState } from './plugin.ts';
 import type { Approval, Artifact, DirectMessage, Pipeline, Run, StageRun, TurnRecord } from './run.ts';
 import type { FloorLayout, OfficeBlockKind } from './block.ts';
 import type { OfficeStyle } from './style.ts';
@@ -179,6 +179,14 @@ export interface OfficeState {
   routingPosture: RoutingPosture;
   /** Installed plugins, marketplaces, and what they contribute. */
   plugins: PluginSystemState;
+  /**
+   * MCP servers, and the tools each of them published.
+   *
+   * Carried in the state rather than fetched on demand because a tool an
+   * employee can call is a capability, and the console should be able to say
+   * which capabilities exist without asking a second question.
+   */
+  mcp: McpState;
   /** Server build info, shown in the office footer. */
   version: string;
   startedAt: number;
