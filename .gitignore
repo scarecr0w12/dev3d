@@ -36,6 +36,10 @@ logs/
 *.blend2
 blender/exports/tmp/
 
+# rendered contact sheets from scripts/blender-preview.mjs: an artefact of
+# looking at a change rather than source, and a couple of megabytes each time
+blender/out/
+
 # os / editor
 .DS_Store
 Thumbs.db

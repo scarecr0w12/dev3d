@@ -16,11 +16,14 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
+    "test:core": "cd packages/core && node --test --test-isolation=none \"src/**/*.test.ts\"",
     "test:server": "cd apps/server && node --test --test-isolation=none \"src/**/*.test.ts\"",
     "test:web": "node apps/web/.verify/smoke.ts",
     "smoke": "node scripts/smoke-ws.mjs",
     "check:css": "node scripts/check-css.mjs",
     "check:failures": "node scripts/check-failure-paths.mjs",
+    "check:blocks": "node blender/scripts/verify-blocks-glb.mjs",
+    "preview:blocks": "node scripts/blender-preview.mjs",
     "inspect:glb": "node scripts/inspect-glb.mjs apps/web/public/office/office.glb",
     "shoot": "node scripts/shoot-state.mjs"
   }
