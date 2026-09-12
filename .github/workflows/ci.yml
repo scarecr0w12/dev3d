@@ -34,6 +34,11 @@ jobs:
           # unflagged `node:sqlite`. A matrix that also tested an older Node would
           # be testing a configuration the project does not support.
           node-version: '24.x'
+          # v5 caches the package manager by default, and resolves it *before*
+          # corepack has provided pnpm - so it fails with "Unable to locate
+          # executable file: pnpm" on a step that has nothing to do with pnpm.
+          # Corepack below is what decides the version, from packageManager.
+          package-manager-cache: false
 
       - name: Enable corepack
         run: corepack enable
