@@ -10,8 +10,8 @@ A release is a commit on `main` that has passed every check below, tagged
 
 The rule that matters: **nothing in the README may be aspirational.** If a
 surface is documented as working, either the suite proves it or the release notes
-say plainly that it does not. Every number in the README that a command can
-produce should be produced by that command.
+say plainly that it does not. Every number in the docs that a command can produce
+should be produced by that command.
 
 ## Pre-release checklist
 
@@ -25,7 +25,8 @@ node apps/server/node_modules/typescript/bin/tsc       -p apps/server/tsconfig.j
 node apps/web/node_modules/typescript/bin/tsc          -p apps/web/tsconfig.json --noEmit
 node apps/web/node_modules/typescript/bin/tsc          -p apps/web/.verify/tsconfig.json --noEmit
 
-# 2. The server suites
+# 2. The suites (core's is separate because core has no test runner of its own)
+cd packages/core && node --test --test-isolation=none "src/**/*.test.ts"
 cd apps/server && node --test --test-isolation=none "src/**/*.test.ts"
 
 # 3. The client store reducer
@@ -37,14 +38,20 @@ node scripts/check-failure-paths.mjs
 # 5. Every className exists in the stylesheet, and no rule is dead
 node scripts/check-css.mjs
 
-# 6. The office asset still carries the anchors the UI needs
+# 6. The office and block-kit assets still carry the anchors the UI needs
 node scripts/inspect-glb.mjs apps/web/public/office/office.glb
+node blender/scripts/verify-blocks-glb.mjs
 
-# 7. A production bundle
+# 7. A production bundle. This is the one step that cannot run in a restricted
+#    sandbox: esbuild spawns a service worker to bundle the Vite config. See
+#    docs/sandbox.md.
 cd apps/web && node node_modules/vite/bin/vite.js build
 
-# 8. Boot the built thing and drive it as a real client
-node apps/server/src/index.ts &
+# 8. Boot the built thing and drive it as a real client. The health check is not
+#    ceremony: it is the step that proves the orchestrator actually reached the
+#    point of listening, which no unit suite covers.
+DEV3D_LLM_MODE=mock node apps/server/src/index.ts &
+curl -fsS http://127.0.0.1:8787/api/health
 node scripts/smoke-ws.mjs
 ```
 
@@ -56,8 +63,11 @@ Then, by hand, because no script can judge these:
   will pass a page that threw on the way to painting.
 - **Check the release notes against Known gaps.** If a limitation was fixed, it
   should have left that section; if one was added, it should be in it.
-- **Check the README's numbers.** Every test count, check count and module count
-  is reproducible from this list. `grep -n 'tests\|checks\|modules' README.md`.
+- **Check the documented numbers.** The test and check counts live in
+  `docs/development.md` now, and every one of them is reproducible from this list.
+  `grep -n 'tests\|checks\|modules' docs/development.md`.
+- **Check the docs still describe what shipped.** If a feature gained a knob, an
+  endpoint or a contribution point, the README or `docs/` should say so.
 
 ## Cutting the release
 
