@@ -1,15 +1,18 @@
 /**
- * `git`: read-only repository inspection.
+ * `git`: repository inspection, and — behind approval — saving work.
  *
- * Every other way an employee can learn what changed in the workspace is
- * `run_shell`, which is approval-gated because it can do anything. That makes
- * the most common question in development work — "what have I actually changed?"
- * the most expensive one to ask, and it is asked constantly.
+ * Every other way an employee could reach git is `run_shell`, which is
+ * approval-gated because it can do anything. That made the most common question
+ * in development work, "what have I actually changed?", the most expensive one to
+ * ask, and it is asked constantly. So inspection is here, un-gated, because it
+ * cannot write.
  *
- * So this tool exists, and it is limited to commands that cannot write: no
- * `checkout`, no `commit`, no `stash`, no `clean`, no arguments that redirect
- * output or run a program. Anything that changes the repository still goes
- * through `run_shell` and its approval, which is the point.
+ * Saving work is the other half. An employee that writes files and cannot commit
+ * them leaves the run's product in a working tree nobody recorded, so commits are
+ * available here too — through the same human approval `run_shell` uses, because
+ * a commit is a change to the repository and the point of the gate is that a
+ * person sees those. `autoApproveShell` covers it, so an unattended run is not
+ * blocked by a question nobody is there to answer.
  *
  * Arguments are passed to git as an argv array rather than through a shell, so
  * there is no quoting or metacharacter surface at all.
@@ -18,12 +21,12 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Tool, ToolResult } from './types.ts';
+import type { Tool, ToolContext, ToolResult } from './types.ts';
 
 const TIMEOUT_MS = 20_000;
 const MAX_OUTPUT_CHARS = 20_000;
 
-/** Subcommands an employee may run. Read-only by construction. */
+/** Subcommands an employee may run without asking. Read-only by construction. */
 const READ_ONLY_SUBCOMMANDS = new Set([
   'status',
   'diff',
@@ -41,14 +44,44 @@ const READ_ONLY_SUBCOMMANDS = new Set([
 ]);
 
 /**
- * Subcommands that are in the allow-list above but have a mutating form.
+ * Subcommands that change the repository, and so ask a human first.
  *
- * `git stash` with no verb lists stashes, but `git stash push` discards the
- * working tree; `git branch -d` deletes. Rather than removing the read-only
- * value, the mutating verbs and flags are refused explicitly, which is a smaller
- * and more auditable rule than trying to enumerate everything safe.
+ * `checkout` and `restore` are deliberately absent even though they are ordinary
+ * development commands: both can throw away uncommitted work, which no approval
+ * prompt can undo. Creating a branch is here (`checkout -b`) because it discards
+ * nothing, and switching an existing branch is not.
+ */
+const WRITE_SUBCOMMANDS = new Set(['add', 'commit', 'stash', 'cherry-pick', 'tag']);
+
+/**
+ * Arguments refused even with approval.
+ *
+ * These are the ones that destroy work or evade review, as opposed to merely
+ * changing the repository. A commit is a change a person can see and revert; a
+ * `reset --hard` is not, and `--no-verify` skips the hooks a project installed
+ * precisely to run before a commit lands.
  */
 const FORBIDDEN_ARGS = new Set([
+  '--hard',
+  '--force',
+  '-f',
+  '--no-verify',
+  '--output',
+  '--exec',
+  '--upload-pack',
+  '--receive-pack',
+  'clean',
+]);
+
+/**
+ * Arguments that are only refused on the read-only path.
+ *
+ * `git stash` with no verb lists stashes; `git stash push` discards the working
+ * tree. On the write path the verb is the point, so it is allowed there and
+ * refused here — which is a smaller and more auditable rule than trying to
+ * enumerate everything safe.
+ */
+const READ_ONLY_FORBIDDEN = new Set([
   'push',
   'pop',
   'drop',
@@ -66,15 +99,8 @@ const FORBIDDEN_ARGS = new Set([
   '--set-upstream-to',
   '-u',
   '--edit-description',
-  '--force',
-  '-f',
-  '--hard',
   '--soft',
   '--mixed',
-  '--output',
-  '--exec',
-  '--upload-pack',
-  '--receive-pack',
   '--no-index',
 ]);
 
@@ -168,27 +194,41 @@ function withinRepo(root: string): boolean {
   return existsSync(join(root, '.git'));
 }
 
+/**
+ * Is this invocation something a human should see before it runs?
+ *
+ * `stash` and `tag` are in both lists because they have a read-only form and a
+ * writing one: bare `git stash` lists, `git stash push` saves and clears the
+ * working tree, bare `git tag` lists, `git tag v1` creates.
+ */
+function isWrite(command: string, extra: string[]): boolean {
+  if (command === 'stash') return extra[0] !== undefined && extra[0] !== 'list';
+  if (command === 'tag') return extra.some((a) => !a.startsWith('-')) || extra.includes('-d');
+  return WRITE_SUBCOMMANDS.has(command);
+}
+
 const gitTool: Tool = {
   name: 'git',
   description:
-    'Inspect the git repository in the workspace, read-only: status, diff, log, ' +
-    'show, branch, ls-files, blame, shortlog, describe, tag, remote, and bare ' +
-    '`stash` (list). Use this instead of run_shell for looking at what changed. ' +
-    'Anything that writes - commit, checkout, stash push, branch -d - needs ' +
-    'run_shell and its approval.',
+    'Work with the git repository in the workspace. Inspection never asks: status, ' +
+    'diff, log, show, branch, ls-files, blame, shortlog, describe, tag (list), ' +
+    'remote, stash (list). Saving work asks a human first, like run_shell: add, ' +
+    'commit, checkout -b, cherry-pick, tag, stash push/pop. Arguments that destroy ' +
+    'work or skip hooks (--hard, --force, --no-verify) are refused outright. ' +
+    'Prefer this to run_shell for anything git.',
   parameters: {
     type: 'object',
     properties: {
       command: {
         type: 'string',
-        enum: [...READ_ONLY_SUBCOMMANDS],
+        enum: [...new Set([...READ_ONLY_SUBCOMMANDS, ...WRITE_SUBCOMMANDS, 'checkout'])],
         description: 'The git subcommand to run.',
       },
       args: {
         type: 'array',
         items: { type: 'string' },
         description:
-          'Extra arguments passed to git verbatim, e.g. ["--stat"] or ["-n", "20", "--oneline"].',
+          'Extra arguments passed to git verbatim, e.g. ["--stat"] or ["-m", "the message"].',
       },
     },
     required: ['command'],
@@ -196,13 +236,6 @@ const gitTool: Tool = {
   },
   run: async (args, ctx) => {
     const command = typeof args.command === 'string' ? args.command : '';
-    if (!READ_ONLY_SUBCOMMANDS.has(command)) {
-      return fail(
-        `git: "${command}" is not available read-only. Choose one of: ${[...READ_ONLY_SUBCOMMANDS].join(', ')}. ` +
-          `To change the repository, use run_shell, which asks a human first.`,
-        'Not a read-only command',
-      );
-    }
 
     let extra: string[] = [];
     if (args.args !== undefined) {
@@ -211,13 +244,46 @@ const gitTool: Tool = {
       }
       extra = args.args as string[];
     }
-    const forbidden = extra.find((a) => FORBIDDEN_ARGS.has(a));
-    if (forbidden !== undefined) {
+
+    // `checkout` is special-cased rather than listed: creating a branch discards
+    // nothing and is a normal part of saving work, while switching to an existing
+    // branch can drop uncommitted changes on the floor. Only `-b`/`-B` is allowed.
+    const isBranchCreate =
+      command === 'checkout' && (extra[0] === '-b' || extra[0] === '-B') && extra.length >= 2;
+
+    const known =
+      READ_ONLY_SUBCOMMANDS.has(command) || WRITE_SUBCOMMANDS.has(command) || isBranchCreate;
+    if (!known) {
       return fail(
-        `git: refusing the argument ${JSON.stringify(forbidden)} - it changes the repository. ` +
-          `Use run_shell with its approval round trip instead.`,
-        'Refused a mutating argument',
+        command === 'checkout'
+          ? 'git: only `checkout -b <name>` is available, because switching to an existing branch ' +
+            'can discard uncommitted work. Use run_shell if you need more, which asks a human first.'
+          : `git: "${command}" is not available. Inspection (no approval): ${[...READ_ONLY_SUBCOMMANDS].join(', ')}. ` +
+            `Writing (approval): ${[...WRITE_SUBCOMMANDS].join(', ')}, checkout -b. ` +
+            `Anything else needs run_shell.`,
+        'Unsupported subcommand',
       );
+    }
+
+    const hardForbidden = extra.find((a) => FORBIDDEN_ARGS.has(a));
+    if (hardForbidden !== undefined) {
+      return fail(
+        `git: refusing the argument ${JSON.stringify(hardForbidden)} - it destroys work or skips the ` +
+          `hooks this repository installed. Do it deliberately in a shell if you really mean it.`,
+        'Refused a destructive argument',
+      );
+    }
+
+    const write = isWrite(command, extra) || isBranchCreate;
+    if (!write) {
+      const readOnlyForbidden = extra.find((a) => READ_ONLY_FORBIDDEN.has(a));
+      if (readOnlyForbidden !== undefined) {
+        return fail(
+          `git: refusing the argument ${JSON.stringify(readOnlyForbidden)} on the inspection path. ` +
+            `It changes the repository, so it needs approval - call git again with a subcommand that writes.`,
+          'Refused a mutating argument',
+        );
+      }
     }
 
     if (!withinRepo(ctx.workspaceRoot)) {
@@ -225,6 +291,25 @@ const gitTool: Tool = {
         `git: the workspace ${ctx.workspaceRoot} is not a git repository (no .git directory).`,
         'Not a repository',
       );
+    }
+
+    if (write && !ctx.autoApproveShell) {
+      const rendered = [command, ...extra].join(' ');
+      const approved = await ctx.requestApproval({
+        kind: 'shell',
+        summary: `git ${rendered}`,
+        detail:
+          `An employee wants to change the git repository in ${ctx.workspaceRoot}:\n\n` +
+          `    git ${rendered}\n\n` +
+          `Commits and branch changes are recorded in the repository's history and can be reverted, ` +
+          `but nothing else in this office writes to git, so this is the change a human should see.`,
+      });
+      if (!approved) {
+        return fail(
+          `git ${rendered} was not approved, so the repository is unchanged.`,
+          'Refused by the operator',
+        );
+      }
     }
 
     const run = await runGit([command, ...extra], ctx.workspaceRoot);

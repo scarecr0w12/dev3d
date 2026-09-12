@@ -9,7 +9,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -171,28 +171,163 @@ test('todo_write leaves the plan untouched when the input is invalid', async () 
 // git
 // ---------------------------------------------------------------------------
 
-test('git refuses a subcommand outside the read-only set', async () => {
+test('git refuses a subcommand that is neither inspection nor a supported write', async () => {
   const root = makeTempWorkspace();
   try {
-    const res = await git().run({ command: 'commit' }, makeContext(root));
+    const res = await git().run({ command: 'reset' }, makeContext(root));
     assert.equal(res.ok, false);
-    assert.match(res.content, /not available read-only/);
+    assert.match(res.content, /is not available/);
     assert.match(res.content, /run_shell/, 'the refusal should name the way to do it');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('git refuses a mutating argument even on an allowed subcommand', async () => {
+test('git allows only `checkout -b`, because switching branches can discard work', async () => {
   const root = makeTempWorkspace();
   try {
-    for (const args of [['push'], ['--hard'], ['--output', 'x'], ['-D', 'branch']]) {
-      const res = await git().run({ command: 'stash', args }, makeContext(root));
-      assert.equal(res.ok, false, `stash ${args.join(' ')} should be refused`);
+    const plain = await git().run({ command: 'checkout', args: ['main'] }, makeContext(root));
+    assert.equal(plain.ok, false);
+    assert.match(plain.content, /checkout -b/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('git refuses arguments that destroy work, on either path', async () => {
+  const root = makeTempWorkspace();
+  try {
+    for (const [command, args] of [
+      ['stash', ['push', '--hard']],
+      ['commit', ['-m', 'x', '--no-verify']],
+      ['add', ['--force']],
+    ] as const) {
+      const res = await git().run({ command, args: [...args] }, makeContext(root));
+      assert.equal(res.ok, false, `git ${command} ${args.join(' ')} should be refused`);
+      assert.match(res.content, /refusing the argument/);
     }
-    const hard = await git().run({ command: 'diff', args: ['--hard'] }, makeContext(root));
-    assert.equal(hard.ok, false);
-    assert.match(hard.content, /changes the repository/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A directory that passes the "is this a repository" check without being one.
+ *
+ * The tool only requires a `.git` entry to exist, so this reaches the argument
+ * and approval logic without needing child processes — which matters in a sandbox
+ * that forbids them, and keeps these tests about the rules rather than about git.
+ */
+function fakeRepo(): string {
+  const root = makeTempWorkspace();
+  mkdirSync(join(root, '.git'), { recursive: true });
+  return root;
+}
+
+test('git tells a reading stash from a destructive one by what it will ask', async () => {
+  const root = fakeRepo();
+  try {
+    // `git stash` with no verb and `git stash list` only read; they must not spend
+    // an approval. `git stash drop` destroys an entry, so it must.
+    const asked: string[] = [];
+    const ctx = makeContext(root, {
+      requestApproval: async (req) => {
+        asked.push(req.summary);
+        return false;
+      },
+    });
+
+    await git().run({ command: 'stash' }, ctx);
+    assert.deepEqual(asked, [], 'listing stashes must not ask');
+
+    await git().run({ command: 'stash', args: ['list'] }, ctx);
+    assert.deepEqual(asked, [], 'listing stashes explicitly must not ask');
+
+    const dropped = await git().run({ command: 'stash', args: ['drop'] }, ctx);
+    assert.deepEqual(asked, ['git stash drop'], 'dropping a stash is a write and must ask');
+    assert.equal(dropped.ok, false);
+    assert.match(dropped.content, /was not approved/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a git write asks a human before it runs', async () => {
+  const root = fakeRepo();
+  try {
+    const asked: string[] = [];
+    const ctx = makeContext(root, {
+      requestApproval: async (req) => {
+        asked.push(req.summary);
+        return false;
+      },
+    });
+    const res = await git().run({ command: 'commit', args: ['-m', 'save'] }, ctx);
+    assert.equal(res.ok, false);
+    assert.match(res.content, /was not approved/);
+    assert.deepEqual(asked, ['git commit -m save']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an approved git write runs', { skip: canCaptureChildOutput ? false : SKIP_REASON }, async () => {
+  const root = makeTempWorkspace();
+  try {
+    const run = (args: string[]): void => {
+      const r = spawnSync('git', args, { cwd: root, stdio: 'ignore' });
+      assert.equal(r.status, 0, `git ${args.join(' ')} should succeed`);
+    };
+    run(['init']);
+    run(['config', 'user.email', 'test@example.test']);
+    run(['config', 'user.name', 'Test']);
+    writeFileSync(join(root, 'saved.txt'), 'content\n');
+
+    const ctx = makeContext(root, { requestApproval: async () => true });
+    assert.equal((await git().run({ command: 'add', args: ['saved.txt'] }, ctx)).ok, true);
+    const committed = await git().run({ command: 'commit', args: ['-m', 'save the work'] }, ctx);
+    assert.equal(committed.ok, true, committed.content);
+
+    const log = await git().run({ command: 'log', args: ['--oneline'] }, ctx);
+    assert.match(log.content, /save the work/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a git write does not ask when shell commands are auto-approved', async () => {
+  const root = makeTempWorkspace();
+  try {
+    let asked = 0;
+    const ctx = makeContext(root, {
+      autoApproveShell: true,
+      requestApproval: async () => {
+        asked += 1;
+        return true;
+      },
+    });
+    // No repository, so it fails at that check - but only after deciding not to ask.
+    const res = await git().run({ command: 'commit', args: ['-m', 'save'] }, ctx);
+    assert.equal(asked, 0);
+    assert.match(res.content, /not a git repository/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('git inspection never asks, even when approval is denied', async () => {
+  const root = makeTempWorkspace();
+  try {
+    let asked = 0;
+    const ctx = makeContext(root, {
+      requestApproval: async () => {
+        asked += 1;
+        return false;
+      },
+    });
+    const res = await git().run({ command: 'status' }, ctx);
+    assert.equal(asked, 0, 'inspection must not consume an approval');
+    assert.match(res.content, /not a git repository/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
