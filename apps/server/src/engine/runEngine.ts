@@ -27,7 +27,7 @@ import type {
 } from '@dev3d/core';
 import { routeModel } from '../router/modelRouter.ts';
 import { executeStage, type StageContext } from './stages.ts';
-import { emptyKnowledge, type EngineDeps, type RunKnowledge } from './types.ts';
+import { emptyKnowledge, type EngineDeps, type RunKnowledge, type RunPolicy } from './types.ts';
 
 export interface SubmitInput {
   brief: string;
@@ -128,6 +128,45 @@ export function createRunEngine(deps: EngineDeps): RunEngine {
   const settleWaiters = new Map<string, Array<(run: Run | undefined) => void>>();
   /** Runs that have already cleared the soft-spend approval gate, once each. */
   const spendApproved = new Set<string>();
+  /**
+   * What each run was authorised to do without asking, fixed when it started.
+   *
+   * Held here rather than on the `Run` because it is execution state, not
+   * something a run carries: a run reloaded from the store after a restart is
+   * executed under the policy in force at *that* moment, and the transcript does
+   * not need the old value to be meaningful. Dropped when the run settles.
+   */
+  const runPolicies = new Map<string, RunPolicy>();
+
+  /**
+   * The deps every stage is executed with: the caller's, plus the pin lookup.
+   *
+   * The stages receive `EngineDeps` and cannot see this engine's own maps, so the
+   * lookup travels on the dependency bag. It is built once, because `deps` is a
+   * static object — the *config* inside it is what mutates, not the bag.
+   */
+  const stageDeps: EngineDeps = {
+    ...deps,
+    policyFor: (runId: string) => runPolicies.get(runId),
+  };
+
+  /**
+   * Describe a policy for the transcript.
+   *
+   * The review of this switch found that the blast radius was invisible at the
+   * point of decision: one boolean covers `run_shell`, every writing `git`
+   * subcommand, and unattended vendor delegation. A run log that says only
+   * "autoApproveShell=true" repeats that; naming the three gates does not.
+   */
+  function describePolicy(policy: RunPolicy): string {
+    if (!policy.autoApproveShell) {
+      return 'approval policy: every shell command, git repository write and vendor delegation asks first';
+    }
+    return (
+      'approval policy: acting unattended — shell commands, git repository writes and ' +
+      'third-party vendor delegation all run without asking'
+    );
+  }
 
   const emit = (event: ServerEvent): void => deps.sink.emit(event);
 
@@ -155,6 +194,9 @@ export function createRunEngine(deps: EngineDeps): RunEngine {
 
   function settle(run: Run): void {
     controllers.delete(run.id);
+    // The policy only governs a run that is executing, so it goes when the run
+    // does — otherwise a long-lived office accumulates one entry per run forever.
+    runPolicies.delete(run.id);
     const waiters = settleWaiters.get(run.id);
     if (waiters) {
       settleWaiters.delete(run.id);
@@ -264,7 +306,7 @@ export function createRunEngine(deps: EngineDeps): RunEngine {
       let artifacts: Artifact[] = [];
       let unresolved = false;
       try {
-        const outcome = await executeStage(deps, ctx);
+        const outcome = await executeStage(stageDeps, ctx);
         summary = outcome.summary;
         artifacts = outcome.artifacts;
         unresolved = outcome.unresolved === true;
@@ -466,6 +508,18 @@ export function createRunEngine(deps: EngineDeps): RunEngine {
       };
 
       runsById.set(runId, run);
+      // Pinned here, before the run can execute a single tool call, from the
+      // config as it is right now. Everything this run does is judged against
+      // this and not against a setting that may change under it.
+      const policy: RunPolicy = { autoApproveShell: deps.config.autoApproveShell };
+      runPolicies.set(runId, policy);
+      emit({
+        type: 'log',
+        level: 'info',
+        scope: 'engine/run',
+        message: `Run ${runId} started. ${describePolicy(policy)}`,
+        at: Date.now(),
+      });
       const controller = new AbortController();
       controllers.set(runId, controller);
       emit({ type: 'run.created', run: clone(run), at: Date.now() });

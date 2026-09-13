@@ -59,7 +59,7 @@ curl -s localhost:8787/api/runs/<runId>
 | **Run engine** | Four stage modes — `single`, `parallel`, `debate`, `review-loop` — with a tool loop, spend ceiling and cancellation |
 | **Org chart** | 13 roles across 8 departments, 3 shipped pipelines, editable live from the console |
 | **Model layer** | Provider discovery, a curated metadata overlay, learned quality from the office's own turns, pooled benchmarks, uptime, and a cost-aware router |
-| **Tools** | 15 built-in tools, every one confined to the run's workspace root — plus any tool an MCP server provides |
+| **Tools** | 14 path-taking tools confined to the run's workspace root, plus `run_shell` (approval-gated, **not** confined), plus any tool an MCP server provides (also not confined) |
 | **MCP** | Connect Model Context Protocol servers (stdio or Streamable HTTP); their tools are published to employees as `mcp__<server>__<tool>` |
 | **Vendors** | Engage third-party agent harnesses — Codex, DeepSeek Harness, Hermes, and anything you can name a command for — as read-only contractors. Each is published as `agent__<id>__delegate`, and each is docked in the 3D office as a rented terminal rather than dressed up as an employee |
 | **Knowledge** | 15 skill documents selected per turn, plus stage summaries and artifacts threaded forward |
@@ -111,11 +111,13 @@ every other surface floats over it.
   an approval is the one thing that stops the office dead.
 
 Employees are placed by **looking up the GLB node named in the role's `seatId`**,
-never by hard-coded coordinates, and avatars are built procedurally from
-`Role.appearance` — body colour, accent colour and height. They animate by status:
-idle bob, a pulse while thinking, typing while working, turning toward the room
-while talking. Clicking one raycasts and selects it, adding a pulsing floor ring
-and easing the camera in. `prefers-reduced-motion` is honoured.
+never by hard-coded coordinates, and avatars are cloned from `office/avatar.glb` and
+recoloured from `Role.appearance` — body colour, accent colour and height. The
+figure is built by `blender/scripts/06_avatar.py`; the procedural figure in
+`apps/web/src/office/avatar.ts` remains as the fallback when the asset is missing.
+They animate by status: idle bob, a pulse while thinking, typing while working,
+turning toward the room while talking. Clicking one raycasts and selects it, adding
+a pulsing floor ring and easing the camera in. `prefers-reduced-motion` is honoured.
 
 **An idle office is a lived-in one.** An employee whose status is `idle` gets up,
 walks somewhere and stands about: the lounge, the lobby, the middle of the dev
@@ -349,12 +351,19 @@ Fifteen built-in tools:
 | `web_fetch` | Fetch one URL and return its text. |
 | `recall` | Search what the office has written down: conventions, decisions, and traps that already cost somebody time. |
 
-- Every path funnels through one `resolveInWorkspace` choke point that rejects
-  `..`, absolute paths outside the root, and Windows drive-relative tricks like
-  `C:foo`.
+- Every path **a path-taking tool is given** funnels through one `resolveInWorkspace`
+  choke point that rejects `..`, absolute paths outside the root, and Windows
+  drive-relative tricks like `C:foo`. It also resolves the real path and refuses any
+  symlink or junction on the way, so a link inside the workspace is not a way out of it.
 - The root it resolves against is **the workspace of the run being served**, not a
   single global directory, so two projects can be worked on at once and neither can
   see the other's files.
+- **`run_shell` is the exception, and it is approval-gated rather than confined.**
+  `cwd` is a starting directory, not a boundary: a shell can read any file the operator
+  can, reach the network, and start other processes. That is why it is the one built-in
+  tool that asks a human before it runs, and why its child environment is stripped of
+  credentials — see `security/childEnv.ts` for exactly which, and what is deliberately
+  left through.
 - **Saving work is gated; looking is not.** `run_shell` and the writing half of
   `git` go through a human approval round trip, and both can be switched off
   safety-wise — see `DEV3D_AUTO_APPROVE_SHELL`. `git` splits by what a command can
@@ -365,6 +374,24 @@ Fifteen built-in tools:
   `checkout`, because switching branches can discard uncommitted changes.
 - Grants are enforced per employee: the org chart decides who may hold a tool, and
   anything else is refused with a message the model can act on.
+
+### Where the confinement stops
+
+Everything above is about the **built-in** tools. Extension tools are somebody else's
+program and dev3d cannot confine them:
+
+| Kind | Confined to the workspace? | Gated? |
+|---|---|---|
+| The 14 path-taking built-in tools | yes, through one `resolveInWorkspace` choke point | writing `git` asks; the rest do not |
+| **`run_shell`** | **no** — `cwd` is a starting directory, not a boundary | **yes, every command** (`DEV3D_AUTO_APPROVE_SHELL` turns that off); its child environment is stripped of credentials |
+| **MCP server tools** | **no** — the arguments go to the server's own process verbatim, and `ctx.workspaceRoot` is never consulted | **the first call to a newly connected server asks a human** (`DEV3D_MCP_REQUIRE_APPROVAL`) |
+| **Plugin tools** | no — plugin code runs inside the orchestrator's process, with its own access | the manifest's `permissions` are enforced, and the consent screen shows what it declared |
+| **Vendor delegation** (ACP, commands) | reads confined by dev3d, writes refused, every action put to you first | yes, per action |
+| `web_fetch` / `web_search` | n/a; the guard is that only *public* addresses may be reached | no |
+
+MCP tools are granted to **nobody** by default. `DEV3D_MCP_GRANT_ROLES` names the roles
+that may call them (`*` for every role, or `shell-roles` for the old behaviour of
+inheriting from `run_shell`), and the boot log states the effective policy.
 
 ### The working plan, and why it lives on the run
 
@@ -521,6 +548,11 @@ which is how nearly every published server is used) and **Streamable HTTP** for
 hosted ones. The protocol is implemented directly on Node's built-ins, so this
 adds no dependency.
 
+An `id` is published inside every tool name — `mcp__<id>__<tool>` — so it is
+restricted to letters, digits and `-`. `_` is refused because it is the separator:
+an id containing one would make two different servers able to publish the same
+tool name, and which one won would depend on which connected first.
+
 **Names cannot collide.** A remote server names its own tools, so every one is
 published as `mcp__<server-id>__<tool-name>`. A server offering `read_file`
 therefore cannot shadow the built-in of that name, and two servers may both offer
@@ -528,10 +560,12 @@ therefore cannot shadow the built-in of that name, and two servers may both offe
 
 **Grants are deliberate, and off by default.** A remote server can be a
 filesystem, a database or a deployment system — more reach than any built-in
-tool. So MCP tools are never inherited from the fact that a server is connected:
-`DEV3D_MCP_GRANT_ROLES` names the roles that may call them, and the default is
-`shell-roles`, meaning the roles that already hold `run_shell`. Connecting a
-server widens nobody's reach beyond what they already had.
+tool, and unlike `run_shell` it is neither confined nor (until a call is approved)
+gated. So MCP tools are granted to **nobody** until `DEV3D_MCP_GRANT_ROLES` names
+the roles that may call them (`*` for every role, or `shell-roles` for the old
+behaviour of inheriting from `run_shell`). Connecting a server therefore widens
+nobody's reach, and the first call to a newly connected server asks a human —
+`DEV3D_MCP_REQUIRE_APPROVAL` turns that off.
 
 **A server that is down is not a failure of the office.** Connections are made in
 the background after the HTTP listener is open, a failed server is recorded with
@@ -782,6 +816,8 @@ The ones that matter most:
 | `DEV3D_MAX_CONCURRENCY` | `4` | Parallel employees inside one company. |
 | `DEV3D_AUTO_APPROVE_SHELL` | `false` | Skip the shell approval round trip. |
 | `DEV3D_APPROVAL_TIMEOUT_MS` | `600000` | How long an approval waits before it counts as refused. |
+| `DEV3D_EVENT_RETENTION_DAYS` | `30` | Days of event log to keep, pruned once per boot. `0` keeps everything (runs, turns and artifacts are never pruned). |
+| `DEV3D_ALLOW_PRIVATE_PANEL_HOSTS` | `false` | Let a plugin panel be fetched from a private address. Off by default: the server does the fetching and the answer is drawn on your screen. |
 | `DEV3D_PLUGINS_DIR` | `./plugins` | Where plugins are discovered. Each subdirectory with a `plugin.json` is one plugin. |
 | `DEV3D_PLUGIN_INSTALL_DIR` | `./data/plugins` | Where marketplace installs land, kept apart from the shipped set. |
 | `DEV3D_ALLOW_PLUGIN_INSTALL` | `false` | Allow installing a plugin bundle from a marketplace URL. |
@@ -860,13 +896,41 @@ console says so with the remedy.
   than around a courtyard. At seventeen modules an individual desk is small and there
   is no room-by-room navigation.
 - **The regenerated office is a reconstruction.** `03_office_furniture.py` builds the
-  desks, chairs, meeting table and every anchor and asserts the contract (21 seats,
-  13 desks, 7 rooms), but it is not the asset a person made: fewer meshes, simpler
-  forms, no bespoke detail. The hand-authored original is kept at
-  `blender/reference/office.hand-authored.glb`.
-- **No avatars in the GLB.** Employees are built procedurally in the browser from
-  `Role.appearance`. That is deliberate, and it means the avatars are deliberately
-  simple.
+  desks, chairs, fixtures and every anchor and asserts the contract (21 seats,
+  13 desks, 7 rooms). It is no longer the rough one: every part is a bevelled,
+  smooth-shaded shape, both long elevations carry a ribbon of windows, and the
+  office draws 84 180 triangles from 102 shared meshes rather than 2 172 from
+  scaled cubes. The hand-authored original it replaced is kept at
+  `blender/reference/office.hand-authored.glb` for the comparison.
+- **Every room in the core has a doorway.** The corridor wall at Y 3 used to be
+  solid from X -11 to 11, which left the CEO's office, the two small offices and
+  the meeting room as separate walkable regions: their eleven seats could be
+  occupied but never left. Each now has a doorway cut in that wall, and the meeting
+  room's door is a framed opening in its glazing with a transom over it.
+  `pnpm preview:office` proves it rather than asserting it — it labels the floor
+  into regions the way the browser's nav grid does, and fails if any seat or room
+  cannot be reached from the dev floor. A *grown* building can still contain a
+  sealed room, because the layout engine places modules by the kit's own doorways.
+- **Grown rooms are glazed by the browser, not the kit.** The core's windows are
+  authored in Blender, where the outside is known. A block module cannot be: which
+  of its edges ends up against another module is decided by the layout engine at
+  placement time, so `apps/web/src/office/glazing.ts` works it out in the client —
+  hiding the blank wall and putting a sill, glass, jambs and mullions in its place.
+- **Materials are authored, not scanned.** The office is dressed with real albedo,
+  normal and roughness maps — 4.6 MB of them across seven sets — but they are
+  generated from periodic noise by `blender/scripts/07_textures.py` rather than
+  sampled from a scan library, because this machine has no HTTPS route to one. The
+  renderer does not know any material by name, so replacing them with scanned maps
+  is a file swap. Each set is 512 px over a 1–2 m tile, which is right at normal
+  viewing distance and soft at arm's length; `pnpm build:textures -- --size 1024`
+  is the knob, at four times the bytes.
+- **Avatars are an asset with a procedural fallback.** `06_avatar.py` builds
+  `avatar.glb` — 30 parts from 19 shared shapes, bevelled and smooth-shaded — and
+  the browser clones it per employee and recolours it by material name. The
+  procedural figure is still there and is what runs if the file is missing, which
+  is also the path the verification harness exercises without a filesystem. There
+  is no skeleton: the pose is driven by named nodes (`Body`, `LegL`/`LegR`,
+  `SeatedLegs`), not by animation clips.
 - **Where idle employees wander is per browser.** The liveliness layer is
   client-side and seeded per session, so two consoles watching the same floor
   agree about the work and disagree about the strolls. Nothing about a walk is a

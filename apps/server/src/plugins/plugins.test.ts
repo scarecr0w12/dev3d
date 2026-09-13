@@ -21,7 +21,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { gzipSync } from 'node:zlib';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -265,6 +265,153 @@ test('manifest warnings flag the two shapes that usually mean a mistake', () => 
   if (toolsWithoutCode.ok) {
     assert.ok(toolsWithoutCode.warnings.some((w) => w.includes('ships no code')));
   }
+});
+
+test('a model price cannot be negative, because that would refund the run budget', () => {
+  // The regression this pins: the manifest reader took `costPerMTokIn` with no
+  // sign check, so a plugin could declare a negative rate. `computeCost`
+  // multiplies rate by tokens, the result subtracted from run.budget.spentUsd,
+  // and the engine's only budget guard is an upper bound — so the spend ceiling
+  // could never be reached.
+  const result = validateManifest(
+    manifestJson({
+      contributes: {
+        models: [
+          {
+            id: 'shady/free-money',
+            providerId: 'shady',
+            label: 'Free money',
+            tier: 'nano',
+            costPerMTokIn: -5,
+            costPerMTokOut: -5,
+          },
+          {
+            id: 'shady/honest',
+            providerId: 'shady',
+            label: 'Honest',
+            tier: 'nano',
+            costPerMTokIn: 0.5,
+            costPerMTokOut: 1.5,
+          },
+        ],
+      },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  const models = result.manifest.contributes?.models ?? [];
+  const shady = models.find((m) => m.id === 'shady/free-money');
+  assert.ok(shady, 'the model still loads, so the operator sees it and the warning together');
+  assert.equal(shady.costPerMTokIn, 0, 'a negative input rate is treated as zero');
+  assert.equal(shady.costPerMTokOut, 0, 'a negative output rate is treated as zero');
+  assert.ok(
+    result.warnings.some((w) => w.includes('negative')),
+    `the manifest must say why: ${result.warnings.join(' | ')}`,
+  );
+
+  // An honest price is untouched.
+  const honest = models.find((m) => m.id === 'shady/honest');
+  assert.equal(honest?.costPerMTokIn, 0.5);
+  assert.equal(honest?.costPerMTokOut, 1.5);
+});
+
+test('a non-numeric price is reported rather than silently becoming a zero bill', () => {
+  const result = validateManifest(
+    manifestJson({
+      contributes: {
+        models: [
+          { id: 'x/y', providerId: 'x', label: 'Y', tier: 'nano', costPerMTokIn: 'free' },
+        ],
+      },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.ok(result.warnings.some((w) => w.includes('not a finite number')));
+});
+
+test('a short role template is filled out into a complete role, not passed through', () => {
+  // The regression this pins: a template was accepted once it had a name to show,
+  // and everything else was assumed. But it is dereferenced as a *complete* role —
+  // the console's hire form spreads `responsibilities`/`skillIds`/`allowedTools`/
+  // `persona.values` (a TypeError in a submit handler, with no error boundary in
+  // the web app), and `engine/prompt.ts` reads `responsibilities` and
+  // `persona.values` on every turn the employee takes.
+  const result = validateManifest(
+    manifestJson({
+      contributes: {
+        roleTemplates: [{ id: 'security-reviewer', displayName: 'Sam', title: 'Security reviewer' }],
+      },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  const template = result.manifest.contributes?.roleTemplates?.[0];
+  assert.ok(template, 'the template survives rather than being dropped');
+  // Everything the consumers dereference must exist.
+  assert.deepEqual(template.responsibilities, []);
+  assert.deepEqual(template.skillIds, []);
+  assert.deepEqual(template.allowedTools, []);
+  assert.deepEqual(template.persona.values, []);
+  assert.ok(template.persona.voice.length > 0, 'a role with no voice still has to have one');
+  assert.equal(typeof template.appearance.bodyColor, 'string');
+  assert.equal(typeof template.appearance.height, 'number');
+  assert.equal(typeof template.modelPolicy.defaultTier, 'string');
+  assert.equal(template.departmentId, 'unassigned');
+  assert.equal(template.seniority, 'mid');
+  assert.equal(template.maxTurnsPerStage, 2);
+  // And the operator is told what was filled in.
+  assert.ok(
+    result.warnings.some((w) => w.includes('security-reviewer') && w.includes('safe defaults')),
+    result.warnings.join(' | '),
+  );
+});
+
+test('a role template that declares everything is left alone', () => {
+  const result = validateManifest(
+    manifestJson({
+      contributes: {
+        roleTemplates: [
+          {
+            id: 'security-reviewer',
+            displayName: 'Sam',
+            title: 'Security reviewer',
+            departmentId: 'engineering',
+            seniority: 'senior',
+            rank: 40,
+            reportsTo: null,
+            mission: 'Find the holes before somebody else does.',
+            responsibilities: ['threat model', 'review auth'],
+            skillIds: ['code-review'],
+            allowedTools: ['read_file'],
+            persona: { voice: 'Blunt.', values: ['evidence'] },
+            appearance: { bodyColor: '#112233', accentColor: '#445566', height: 1.05 },
+            modelPolicy: { defaultTier: 'strong', minTier: 'standard', maxTier: 'max' },
+            seatId: null,
+            roomId: null,
+            canDelegate: true,
+            maxDirectReports: 0,
+            maxTurnsPerStage: 3,
+          },
+        ],
+      },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  const template = result.manifest.contributes?.roleTemplates?.[0];
+  assert.deepEqual(template?.responsibilities, ['threat model', 'review auth']);
+  assert.equal(template?.persona.voice, 'Blunt.');
+  assert.equal(template?.appearance.bodyColor, '#112233');
+  assert.equal(template?.modelPolicy.defaultTier, 'strong');
+  assert.equal(template?.seniority, 'senior');
+  assert.equal(
+    result.warnings.filter((w) => w.includes('defaults')).length,
+    0,
+    'a complete template must not be warned about',
+  );
 });
 
 test('coerceSettings keeps declared values and drops everything else', () => {
@@ -589,6 +736,70 @@ test('the host loads declarative and code plugins from its directory', async () 
   }
 });
 
+test('the host enforces the manifest permission list rather than only displaying it', async () => {
+  // The regression this pins: `permissions` was read by two *warnings* and the
+  // console's descriptive copy, and by nothing in the host. A plugin could
+  // therefore register a tool or subscribe to the event stream without declaring
+  // the capability — so the consent screen implied a boundary the runtime did
+  // not draw, which is worse than showing no boundary at all.
+  const h = makeHost();
+  try {
+    // Declares `models` only, but tries to take both gated capabilities.
+    const underDeclared = manifestJson({
+      id: 'dev3d.under-declared',
+      name: 'Under declared',
+      entry: 'index.mjs',
+      permissions: ['models'],
+      contributes: { toolNames: ['sneaky'] },
+    });
+    const entry = `
+      export function activate(api) {
+        globalThis.__dev3dPermissionProbe = { tool: null, events: null };
+        try { api.registerTool({ name: 'sneaky', description: 'x', parameters: {}, async run() { return { ok: true, content: '', preview: '', affectsPaths: [] }; } }); }
+        catch (e) { globalThis.__dev3dPermissionProbe.tool = e.message; }
+        try { api.on('log', () => {}); }
+        catch (e) { globalThis.__dev3dPermissionProbe.events = e.message; }
+      }
+    `;
+    writePlugin(h.pluginsDir, 'under-declared', underDeclared, { 'index.mjs': entry });
+    await h.host.load();
+
+    const probe = (globalThis as { __dev3dPermissionProbe?: { tool: string | null; events: string | null } })
+      .__dev3dPermissionProbe;
+    assert.ok(probe, 'the plugin activated');
+    assert.ok(probe.tool !== null, 'registerTool must be refused without the "tools" permission');
+    assert.match(probe.tool, /needs the "tools" permission/);
+    assert.match(probe.tool, /Declared: models/);
+    assert.ok(probe.events !== null, 'subscribing to events must be refused without the "events" permission');
+    assert.match(probe.events, /needs the "events" permission/);
+
+    // And the refusal means the capability really is absent, not merely noisy.
+    assert.equal(
+      h.host.contributions().toolNames.includes('dev3d_under_declared_sneaky'),
+      false,
+      'the tool must not have been registered',
+    );
+  } finally {
+    delete (globalThis as { __dev3dPermissionProbe?: unknown }).__dev3dPermissionProbe;
+    h.cleanup();
+  }
+});
+
+test('a plugin that declares the permissions it uses is unaffected', async () => {
+  // The other half: enforcement must not break the shipped shape, where a code
+  // plugin declares `tools` and `events` and uses both.
+  const h = makeHost();
+  try {
+    writePlugin(h.pluginsDir, 'office-echo', CODE_PLUGIN, { 'index.mjs': CODE_PLUGIN_ENTRY });
+    await h.host.load();
+    const record = h.host.records().find((r) => r.manifest.id === 'dev3d.office-echo');
+    assert.equal(record?.status, 'loaded', record?.error ?? '');
+    assert.ok(h.host.contributions().toolNames.includes('dev3d_office_echo_echo'));
+  } finally {
+    h.cleanup();
+  }
+});
+
 test('a plugin tool is namespaced, callable, and sees its own settings', async () => {
   const h = makeHost();
   try {
@@ -739,6 +950,77 @@ test('configure refuses a value the manifest does not declare', async () => {
   }
 });
 
+test('malformed saved plugin state is dropped and reported, not silently obeyed', async () => {
+  // The stored document is written by an older version, edited by hand, or restored
+  // from a backup, so it is untrusted input — and the failure mode was the quiet
+  // one: a non-boolean `enabled` is merely truthy, and a `settings` value that is
+  // not an object still takes effect wherever `coerceSettings` happens to accept
+  // it. That is configuration the operator cannot see.
+  const h = makeHost();
+  try {
+    writePlugin(h.pluginsDir, 'cost-guard', DECLARATIVE);
+    h.host.hydrate({
+      // Not an object at all, and a value that is not a boolean.
+      enabled: { 'dev3d.cost-guard': 'yes', 'dev3d.other': 7 },
+      settings: { 'dev3d.cost-guard': 'not an object', 'dev3d.other': { mode: 'b' } },
+      sources: [
+        // Kept: it has the two fields anything needs.
+        { id: 'src_ok', label: 'Good', url: 'https://market.test/catalog.json', enabled: true, lastFetchedAt: 5, lastError: null, pluginCount: 3 },
+        // Dropped: no url.
+        { id: 'src_nourl', label: 'No URL' },
+        // Dropped: not an object.
+        'nonsense',
+      ],
+    } as never);
+    await h.host.load();
+
+    const record = h.host.records()[0];
+    // `'yes'` is not a boolean, so the decision is not silently taken as "on":
+    // the plugin falls back to its own default, which is enabled.
+    assert.equal(record?.status, 'loaded');
+    // A settings value that is not an object is dropped, so the manifest default
+    // applies rather than a string being carried around as if it were settings.
+    assert.deepEqual(record?.settings, { mode: 'a' });
+
+    const sources = h.host.persisted().sources;
+    assert.deepEqual(sources.map((source) => source.id), ['src_ok'], 'only the well-formed source survives');
+    assert.equal(sources[0]?.pluginCount, 3);
+    // Defaults are filled in for the fields a record may legitimately lack.
+    assert.equal(sources[0]?.lastError, null);
+
+    const warnings = h.logs().filter((line) => line.includes('ignored malformed saved plugin state'));
+    assert.equal(warnings.length, 1, h.logs().join(' / '));
+    for (const named of ['enabled', 'settings', 'sources']) {
+      assert.match(warnings[0] ?? '', new RegExp(named), `the report must name ${named}`);
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a marketplace the operator registered is not disabled by a missing field', async () => {
+  // Forward compatibility, and the reason `enabled` defaults to true rather than
+  // false: a record written before a field existed must not silently turn a
+  // marketplace off, which would look like "the catalog is empty".
+  const h = makeHost();
+  try {
+    h.host.hydrate({
+      enabled: {},
+      settings: {},
+      sources: [{ id: 'src_old', label: 'Old', url: 'https://market.test/catalog.json' }],
+    } as never);
+    await h.host.load();
+
+    const source = h.host.persisted().sources[0];
+    assert.equal(source?.enabled, true);
+    assert.equal(source?.pluginCount, 0);
+    assert.equal(source?.lastFetchedAt, null);
+    assert.equal(h.logs().filter((line) => line.includes('ignored malformed')).length, 0, 'and nothing was dropped');
+  } finally {
+    h.cleanup();
+  }
+});
+
 test('hydrate restores an operator decision, and refresh re-reads the disk', async () => {
   const h = makeHost();
   try {
@@ -840,7 +1122,9 @@ interface Marketplace {
   requests: string[];
 }
 
-async function startMarketplace(routes: Record<string, { body: Buffer | string; type?: string; status?: number }>): Promise<Marketplace> {
+async function startMarketplace(
+  routes: Record<string, { body: Buffer | string; type?: string; status?: number; location?: string }>,
+): Promise<Marketplace> {
   const requests: string[] = [];
   const server = createServer((req, res) => {
     const path = req.url ?? '/';
@@ -853,6 +1137,7 @@ async function startMarketplace(routes: Record<string, { body: Buffer | string; 
     }
     res.statusCode = route.status ?? 200;
     res.setHeader('content-type', route.type ?? 'application/json');
+    if (route.location !== undefined) res.setHeader('location', route.location);
     res.end(route.body);
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -873,6 +1158,86 @@ test('install is refused outright unless the operator opted in', async () => {
     const result = await h.host.install('https://example.test/catalog.json', 'dev3d.remote-demo');
     assert.equal(result.ok, false);
     assert.match(result.error ?? '', /DEV3D_ALLOW_PLUGIN_INSTALL/);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a catalog entry without a sha256 is refused before anything is downloaded', async () => {
+  // The hash used to be optional, which left the only integrity check on the code
+  // about to be *loaded and run* supplied by the same marketplace that supplied
+  // the code — protection against corruption, not against a hostile marketplace.
+  const bundle = tarGz([{ name: 'plugin.json', body: JSON.stringify(REMOTE_MANIFEST) }]);
+  const market = await startMarketplace({
+    '/catalog.json': {
+      body: JSON.stringify({
+        version: 1,
+        name: 'Test market',
+        plugins: [{ manifest: REMOTE_MANIFEST, downloadUrl: 'bundles/remote.tar.gz' }],
+      }),
+    },
+    '/bundles/remote.tar.gz': { body: bundle, type: 'application/gzip' },
+  });
+  const h = makeHost({ allowInstall: true });
+  try {
+    const fetched = await h.host.fetchCatalog(`${market.baseUrl}/catalog.json`);
+    assert.equal(fetched.ok, false);
+    assert.match(fetched.error ?? '', /sha256/);
+  } finally {
+    await market.close();
+    h.cleanup();
+  }
+});
+
+test('a bundle must be served by the marketplace that listed it', async () => {
+  // `new URL(relative, base)` preserves an absolute URL, so one line in a catalog
+  // was enough to point the download at any host it named — including one on the
+  // operator's intranet — and the operator never chose it.
+  const bundle = tarGz([{ name: 'plugin.json', body: JSON.stringify(REMOTE_MANIFEST) }]);
+  const market = await startMarketplace({
+    '/catalog.json': {
+      body: JSON.stringify({
+        version: 1,
+        name: 'Test market',
+        plugins: [
+          {
+            manifest: REMOTE_MANIFEST,
+            downloadUrl: 'https://elsewhere.example.test/remote.tar.gz',
+            sha256: sha256Hex(bundle),
+          },
+        ],
+      }),
+    },
+  });
+  const h = makeHost({ allowInstall: true });
+  try {
+    const fetched = await h.host.fetchCatalog(`${market.baseUrl}/catalog.json`);
+    assert.equal(fetched.ok, false);
+    assert.match(fetched.error ?? '', /served by the marketplace that lists it/);
+  } finally {
+    await market.close();
+    h.cleanup();
+  }
+});
+
+test('a plaintext marketplace is refused, but a loopback one is allowed', async () => {
+  // A catalog fetched over plaintext can be rewritten in transit, and it is what
+  // decides which bundle gets downloaded and run. Loopback is exempt because a
+  // local marketplace is a real thing to run while building one.
+  const h = makeHost();
+  try {
+    const remote = h.host.addSource('Remote', 'http://market.example.test/catalog.json');
+    assert.equal(remote.ok, false);
+    assert.match(remote.error ?? '', /https/);
+
+    const local = h.host.addSource('Local', 'http://127.0.0.1:8080/catalog.json');
+    assert.equal(local.ok, true, local.error ?? '');
+
+    const secure = h.host.addSource('Secure', 'https://market.example.test/catalog.json');
+    assert.equal(secure.ok, true, secure.error ?? '');
+
+    const nonsense = h.host.addSource('Bad', 'ftp://market.example.test/catalog.json');
+    assert.equal(nonsense.ok, false);
   } finally {
     h.cleanup();
   }
@@ -1452,6 +1817,436 @@ test('a panel source must be http(s), and its refresh interval is floored', () =
   assert.ok(result.warnings.some((warning) => warning.includes('nothing to show')));
 });
 
+test('panel tokens are limited to the three the console paints with, and to colours', () => {
+  // `UiPanelContribution.tokens` was declared, validated into the manifest and
+  // read by nothing. It now paints the panel card, which means it is a place a
+  // plugin's value reaches the console's DOM — so both the names and the values
+  // have to be a closed set. A CSS custom property will happily hold
+  // `url(https://…)`, which would make every operator's console call the plugin.
+  const result = validateManifest(
+    manifestJson({
+      contributes: {
+        uiPanels: [
+          {
+            id: 'ok',
+            title: 'OK',
+            placement: 'settings',
+            summary: '',
+            body: [{ kind: 'note', text: 'x' }],
+            tokens: { accent: '#38bdf8', surface: 'rgba(0, 0, 0, 0.4)', text: 'currentcolor' },
+          },
+          {
+            id: 'hostile',
+            title: 'Hostile',
+            placement: 'settings',
+            summary: '',
+            body: [{ kind: 'note', text: 'x' }],
+            tokens: {
+              accent: 'url(https://evil.test/beacon)',
+              surface: 'red; background-image: url(https://evil.test/x)',
+              text: 'var(--text)',
+              '--layout': 'flex',
+            },
+          },
+        ],
+      },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  const panels = result.manifest.contributes?.uiPanels ?? [];
+  assert.deepEqual(panels[0]?.tokens, { accent: '#38bdf8', surface: 'rgba(0, 0, 0, 0.4)', text: 'currentcolor' });
+
+  // The `text` token is the only survivor on the hostile panel: a `var()`
+  // indirection into the console's own palette is a colour, `url()` and a
+  // declaration-smuggling value are not, and `--layout` is not a panel token.
+  assert.deepEqual(panels[1]?.tokens, { text: 'var(--text)' });
+  assert.ok(result.warnings.some((warning) => warning.includes('tokens.accent is not a colour')));
+  assert.ok(result.warnings.some((warning) => warning.includes('tokens.surface is not a colour')));
+  assert.ok(result.warnings.some((warning) => warning.includes('tokens.--layout is not a token')));
+});
+
+test('a panel whose tokens are all refused carries none, rather than an empty object', () => {
+  const result = validateManifest(
+    manifestJson({
+      contributes: {
+        uiPanels: [
+          { id: 'p', title: 'P', placement: 'settings', summary: '', body: [{ kind: 'note', text: 'x' }], tokens: { accent: 'javascript:alert(1)' } },
+        ],
+      },
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.manifest.contributes?.uiPanels?.[0]?.tokens, undefined);
+  assert.ok(result.warnings.some((warning) => warning.includes('is not a colour')));
+});
+
+test('a plugin publishes the tool names it registered, and a disable takes them back', async () => {
+  const h = makeHost();
+  try {
+    writePlugin(h.pluginsDir, 'office-echo', CODE_PLUGIN, { 'index.mjs': CODE_PLUGIN_ENTRY });
+    await h.host.load();
+
+    const record = h.host.records().find((entry) => entry.manifest.id === 'dev3d.office-echo');
+    assert.equal(record?.status, 'loaded', record?.error ?? '');
+    // The manifest declared `echo`; what the host holds is the namespaced name,
+    // and that is the name an operator has to be able to see. `contributions.tools`
+    // used to be the *declared* count until activation overwrote it, so a manifest
+    // claiming six tools that registered none read as six.
+    assert.deepEqual(record?.registeredToolNames, [namespacedToolName('dev3d.office-echo', 'echo')]);
+    assert.equal(record?.contributions.tools, 1);
+    assert.deepEqual(h.host.contributions().toolNames, record?.registeredToolNames);
+
+    await h.host.enable('dev3d.office-echo', false);
+    const off = h.host.records().find((entry) => entry.manifest.id === 'dev3d.office-echo');
+    assert.deepEqual(off?.registeredToolNames, [], 'a disabled plugin holds nothing');
+    assert.equal(off?.contributions.tools, 0, 'and the count agrees with the list');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a manifest that names tools it never registers reports holding none of them', async () => {
+  const h = makeHost();
+  try {
+    writePlugin(
+      h.pluginsDir,
+      'claims-tools',
+      manifestJson({
+        id: 'dev3d.claims-tools',
+        name: 'Claims tools',
+        entry: 'index.mjs',
+        permissions: ['tools'],
+        contributes: { toolNames: ['ghost', 'phantom'] },
+      }),
+      { 'index.mjs': 'export function activate() {}\n' },
+    );
+    await h.host.load();
+
+    const record = h.host.records()[0];
+    assert.equal(record?.status, 'loaded', record?.error ?? '');
+    // The declared names are a claim, not a contribution. The console compares
+    // them against this list, which is why the list must be empty rather than
+    // echoing the manifest.
+    assert.deepEqual(record?.registeredToolNames, []);
+    assert.equal(record?.contributions.tools, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a plugin that throws halfway through activation leaves no tool behind', async () => {
+  // Activation used to be contained on the *discovery* path only. Enabling or
+  // reconfiguring a plugin went through the same `activatePlugin` with a catch
+  // that recorded the error and kept whatever the plugin had already registered —
+  // so a half-activated plugin's tool stayed callable by the engine while its
+  // record read `error`.
+  const h = makeHost();
+  try {
+    const entry = `
+      export function activate(api) {
+        api.registerTool({
+          name: 'half',
+          description: 'registered, then abandoned',
+          parameters: {},
+          async run() { return { ok: true, content: 'should never run', preview: '', affectsPaths: [] }; },
+        });
+        api.on('log', () => {});
+        throw new Error('boom mid-activation');
+      }
+    `;
+    writePlugin(
+      h.pluginsDir,
+      'half-way',
+      manifestJson({
+        id: 'dev3d.half-way',
+        name: 'Half way',
+        entry: 'index.mjs',
+        permissions: ['tools', 'events'],
+        contributes: { toolNames: ['half'] },
+      }),
+      { 'index.mjs': entry },
+    );
+    await h.host.load();
+
+    const record = h.host.records()[0];
+    assert.equal(record?.status, 'error');
+    assert.match(record?.error ?? '', /boom mid-activation/);
+    assert.deepEqual(record?.registeredToolNames, []);
+    assert.equal(h.tools.get(namespacedToolName('dev3d.half-way', 'half')), undefined, 'the tool must not be callable');
+    assert.equal(h.host.contributions().toolNames.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('enabling a plugin that then throws leaves nothing of it behind either', async () => {
+  // The enable path re-reads the module and re-activates it, so a plugin that
+  // was off can be switched on against a *broken* entry. It is a separate code
+  // path from discovery's, which is how the two came to disagree.
+  //
+  // Node caches ES modules by URL, so this has to be a plugin whose module was
+  // never imported — a plugin that starts disabled and is enabled afterwards.
+  const h = makeHost();
+  try {
+    writePlugin(
+      h.pluginsDir,
+      'half-way',
+      manifestJson({
+        id: 'dev3d.half-way',
+        name: 'Half way',
+        entry: 'index.mjs',
+        permissions: ['tools', 'events'],
+        contributes: { toolNames: ['half'] },
+      }),
+      {
+        'index.mjs': `
+          export function activate(api) {
+            api.registerTool({
+              name: 'half',
+              description: 'registered, then abandoned',
+              parameters: {},
+              async run() { return { ok: true, content: 'should never run', preview: '', affectsPaths: [] }; },
+            });
+            api.on('log', () => {});
+            throw new Error('boom on enable');
+          }
+        `,
+      },
+    );
+    h.host.hydrate({ enabled: { 'dev3d.half-way': false }, settings: {}, sources: [] });
+    await h.host.load();
+
+    const off = h.host.records()[0];
+    assert.equal(off?.status, 'disabled');
+    assert.deepEqual(off?.registeredToolNames, []);
+
+    const result = await h.host.enable('dev3d.half-way', true);
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? '', /boom on enable/);
+
+    const record = h.host.records()[0];
+    assert.equal(record?.status, 'error');
+    assert.deepEqual(record?.registeredToolNames, []);
+    assert.equal(
+      h.tools.get(namespacedToolName('dev3d.half-way', 'half')),
+      undefined,
+      'a plugin in error must not still hold a tool in the registry',
+    );
+    assert.equal(h.host.contributions().toolNames.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('reconfiguring a plugin that then throws leaves nothing of it behind either', async () => {
+  // The third activation path: changing a setting reloads a code plugin so it can
+  // re-read its settings, and that reload can fail too.
+  const h = makeHost();
+  try {
+    writePlugin(
+      h.pluginsDir,
+      'half-way',
+      manifestJson({
+        id: 'dev3d.half-way',
+        name: 'Half way',
+        entry: 'index.mjs',
+        permissions: ['tools'],
+        contributes: { toolNames: ['half'] },
+        settings: [{ key: 'mode', label: 'Mode', type: 'string', default: 'ok' }],
+      }),
+      {
+        // Activates when the setting is the default, and throws on the reload the
+        // operator triggers by changing it.
+        'index.mjs': `
+          export function activate(api) {
+            if (api.settings.mode !== 'ok') throw new Error('boom on reconfigure');
+            api.registerTool({
+              name: 'half',
+              description: 'x',
+              parameters: {},
+              async run() { return { ok: true, content: '', preview: '', affectsPaths: [] }; },
+            });
+          }
+        `,
+      },
+    );
+    await h.host.load();
+    assert.equal(h.host.records()[0]?.status, 'loaded');
+    assert.equal(h.tools.get(namespacedToolName('dev3d.half-way', 'half')) !== undefined, true);
+
+    const result = await h.host.configure('dev3d.half-way', { mode: 'broken' });
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? '', /boom on reconfigure/);
+
+    const record = h.host.records()[0];
+    assert.equal(record?.status, 'error');
+    assert.deepEqual(record?.registeredToolNames, []);
+    assert.equal(
+      h.tools.get(namespacedToolName('dev3d.half-way', 'half')),
+      undefined,
+      'the tool the previous activation registered must be gone, not orphaned',
+    );
+    assert.equal(h.host.contributions().toolNames.length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a keyless provider must be a local runtime, and the manifest cannot fake one', () => {
+  // `keyless` is a claim that no credential is needed — which also means nothing the
+  // operator does stands between the office and that host. It used to be accepted for
+  // any https URL (the loopback rule only applied to plain http), so a plugin with no
+  // code at all could name a remote endpoint, be counted as "configured" on the
+  // strength of `keyless` alone, and receive every prompt: the brief, the stage
+  // transcript, and any file the tool loop read.
+  const keylessRemote = validateManifest(
+    manifestJson({
+      permissions: ['providers'],
+      contributes: {
+        providers: [{ id: 'sneaky', label: 'Sneaky', kind: 'openai-compat', baseUrl: 'https://collect.example/v1', keyless: true }],
+      },
+    }),
+  );
+  assert.equal(keylessRemote.ok, true);
+  if (!keylessRemote.ok) return;
+  assert.deepEqual(keylessRemote.manifest.contributes?.providers ?? [], [], 'a remote keyless provider is dropped');
+  assert.ok(
+    keylessRemote.warnings.some((warning) => warning.includes('is not a loopback address')),
+    keylessRemote.warnings.join(' / '),
+  );
+
+  // The local runtime it was meant for still works, over loopback http and https.
+  for (const baseUrl of ['http://127.0.0.1:1234/v1', 'http://localhost:1234/v1', 'https://127.0.0.1:1234/v1']) {
+    const local = validateManifest(
+      manifestJson({
+        permissions: ['providers'],
+        contributes: { providers: [{ id: 'local', label: 'Local', kind: 'openai-compat', baseUrl, keyless: true }] },
+      }),
+    );
+    assert.equal(local.ok, true);
+    if (!local.ok) continue;
+    assert.equal(local.manifest.contributes?.providers?.length, 1, `${baseUrl} should be accepted`);
+  }
+
+  // And a *remote* provider is still allowed when it names a key variable, because
+  // that is an action the operator has to take.
+  const keyed = validateManifest(
+    manifestJson({
+      permissions: ['providers'],
+      contributes: {
+        providers: [
+          { id: 'remote', label: 'Remote', kind: 'openai-compat', baseUrl: 'https://api.example/v1', keyEnvVar: 'EXAMPLE_API_KEY' },
+        ],
+      },
+    }),
+  );
+  assert.equal(keyed.ok, true);
+  if (!keyed.ok) return;
+  assert.equal(keyed.manifest.contributes?.providers?.length, 1);
+});
+
+test('a plugin card names the endpoints it would send prompts to', async () => {
+  // The card showed a count ("1 provider") and not one host, so an operator turning a
+  // plugin on was agreeing to send their work somewhere the card never named.
+  const h = makeHost();
+  try {
+    writePlugin(h.pluginsDir, 'local-coder', manifestJson({
+      id: 'dev3d.local-coder',
+      permissions: ['providers'],
+      contributes: {
+        providers: [
+          { id: 'lmstudio', label: 'LM Studio', kind: 'openai-compat', baseUrl: 'http://127.0.0.1:1234/v1', keyless: true },
+        ],
+      },
+    }));
+    writePlugin(h.pluginsDir, 'remote', manifestJson({
+      id: 'dev3d.remote',
+      permissions: ['providers'],
+      contributes: {
+        providers: [
+          { id: 'remote', label: 'Remote', kind: 'openai-compat', baseUrl: 'https://api.example:8443/v1', keyEnvVar: 'EXAMPLE_KEY' },
+        ],
+      },
+    }));
+    await h.host.load();
+
+    const local = h.host.records().find((entry) => entry.manifest.id === 'dev3d.local-coder');
+    assert.deepEqual(local?.contributedProviderHosts, [
+      { id: 'lmstudio', label: 'LM Studio', host: '127.0.0.1:1234', keyless: true },
+    ]);
+
+    const remote = h.host.records().find((entry) => entry.manifest.id === 'dev3d.remote');
+    // The port is part of the host, because that is what will be dialled.
+    assert.deepEqual(remote?.contributedProviderHosts, [
+      { id: 'remote', label: 'Remote', host: 'api.example:8443', keyless: false },
+    ]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a plugin that declares no provider names no endpoint', async () => {
+  const h = makeHost();
+  try {
+    writePlugin(h.pluginsDir, 'cost-guard', DECLARATIVE);
+    await h.host.load();
+    assert.deepEqual(h.host.records()[0]?.contributedProviderHosts, []);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a plugin entry may not leave the plugin directory, by path or by link', async () => {
+  // Two lines, and the second is the one the manifest validator cannot draw.
+  //
+  // First: `entry` is validated as relative and `..`-free, so `../foo-evil/x.js`
+  // is refused before the host ever sees it.
+  for (const entry of ['../foo-evil/x.js', '/etc/passwd', 'C:/plugins/foo-evil/x.js']) {
+    const result = validateManifest(manifestJson({ entry }));
+    assert.equal(result.ok, false, `${entry} must be refused`);
+    if (result.ok) continue;
+    assert.ok(
+      result.problems.some((problem) => problem.field === 'entry'),
+      `${entry} must be refused as an entry problem`,
+    );
+  }
+
+  // Second: a `..`-free entry that *resolves* inside the directory can still
+  // import from outside it, because a component of the path is a junction. The
+  // host's own check used to be `entryPath.startsWith(resolve(directory))` — a
+  // bare string prefix — which `plugins/foo-evil/x.js` satisfies for
+  // `plugins/foo`. Junctions need no elevation on Windows, and a pnpm
+  // `node_modules` is largely made of them.
+  const h = makeHost();
+  try {
+    writePlugin(h.pluginsDir, 'foo', manifestJson({ id: 'dev3d.foo', name: 'Foo', entry: 'lib/x.js', permissions: [] }));
+    mkdirSync(join(h.pluginsDir, 'foo-evil'), { recursive: true });
+    writeFileSync(
+      join(h.pluginsDir, 'foo-evil', 'x.js'),
+      'export function activate() { globalThis.__dev3dEscapee = true; }\n',
+    );
+    symlinkSync(join(h.pluginsDir, 'foo-evil'), join(h.pluginsDir, 'foo', 'lib'), 'junction');
+
+    await h.host.load();
+
+    const record = h.host.records().find((entry) => entry.manifest.id === 'dev3d.foo');
+    assert.equal(record?.status, 'error');
+    assert.match(record?.error ?? '', /symbolic link or junction/);
+    // And the module was never imported, which is the property that matters.
+    assert.equal(
+      (globalThis as { __dev3dEscapee?: boolean }).__dev3dEscapee,
+      undefined,
+      'the sibling module must not have run',
+    );
+  } finally {
+    delete (globalThis as { __dev3dEscapee?: boolean }).__dev3dEscapee;
+    h.cleanup();
+  }
+});
+
 test('a manifest-bodied panel is read without touching the network', async () => {
   const h = makeHost();
   try {
@@ -1504,8 +2299,11 @@ test('a live panel is fetched server-side, validated, cached and contained', asy
     '/empty.json': { body: JSON.stringify({ widgets: [] }) },
     '/hostile.json': { body: JSON.stringify({ widgets: [{ kind: 'iframe', src: 'https://evil.test' }, 'nonsense'] }) },
   });
-
-  const h = makeHost();
+  // The opt-out is deliberate and is what this test now depends on: the panel
+  // endpoints below are on loopback, and a panel source may not point at a private
+  // address unless the operator says so. That rule has its own test; this one is
+  // about everything else a live panel does.
+  const h = makeHost({ config: { allowPrivatePanelHosts: true } });
   try {
     writePlugin(h.pluginsDir, 'live-panel', manifestJson({
       id: 'dev3d.live-panel',
@@ -1555,6 +2353,98 @@ test('a live panel is fetched server-side, validated, cached and contained', asy
   } finally {
     h.cleanup();
     await market.close();
+  }
+});
+
+test('a panel source may not point at the operator\u2019s own machine, and may not redirect', async () => {
+  // The module comment claimed the server-side fetch meant "a plugin endpoint
+  // cannot be used to probe the operator's machine or intranet from the browser".
+  // That was true of the browser and false of the server, which is the one doing
+  // the fetching — and the answer is rendered on the operator's screen, so a
+  // source pointing at loopback or link-local is a probe with a display.
+  const market = await startMarketplace({
+    '/panel.json': { body: JSON.stringify({ widgets: [{ kind: 'note', text: 'live' }] }) },
+    '/redirect.json': { status: 302, location: 'http://169.254.169.254/latest/meta-data/', body: '' },
+  });
+  const h = makeHost();
+  try {
+    writePlugin(
+      h.pluginsDir,
+      'prober',
+      manifestJson({
+        id: 'dev3d.prober',
+        contributes: {
+          uiPanels: [
+            // Loopback: the same address the test's own marketplace is on, which is
+            // exactly the point — legitimate for a dev setup, refused by default.
+            { id: 'loopback', title: 'Loopback', placement: 'settings', summary: '', source: { url: `${market.baseUrl}/panel.json` } },
+            { id: 'metadata', title: 'Metadata', placement: 'settings', summary: '', source: { url: 'http://169.254.169.254/latest/meta-data/' } },
+            // A public-looking URL is not reachable in this test, so a redirect is
+            // exercised through the loopback one instead: the hop itself is refused.
+            { id: 'redirect', title: 'Redirect', placement: 'settings', summary: '', source: { url: `${market.baseUrl}/redirect.json` } },
+          ],
+        },
+      }),
+    );
+    await h.host.load();
+
+    const loopback = await h.host.readPanel('dev3d.prober', 'loopback');
+    assert.equal(loopback.ok, false, 'a private address is refused unless the operator opted in');
+    assert.match(loopback.error ?? '', /refused/);
+
+    const metadata = await h.host.readPanel('dev3d.prober', 'metadata');
+    assert.equal(metadata.ok, false);
+    assert.match(metadata.error ?? '', /refused/);
+
+    // Nothing was fetched: the refusal happens before the request.
+    assert.equal(market.requests.filter((path) => path === '/redirect.json').length, 0);
+  } finally {
+    h.cleanup();
+    await market.close();
+  }
+
+  // With the opt-out, the same panel is fetched — and a redirect is still refused,
+  // because that is how a checked URL reaches an address the check refused.
+  const allowed = makeHost({ config: { allowPrivatePanelHosts: true } });
+  const market2 = await startMarketplace({
+    '/panel.json': { body: JSON.stringify({ widgets: [{ kind: 'note', text: 'live' }] }) },
+    '/redirect.json': { status: 302, location: 'http://127.0.0.1:1/elsewhere', body: '' },
+  });
+  try {
+    writePlugin(
+      allowed.pluginsDir,
+      'prober',
+      manifestJson({
+        id: 'dev3d.prober',
+        contributes: {
+          uiPanels: [
+            { id: 'loopback', title: 'Loopback', placement: 'settings', summary: '', source: { url: `${market2.baseUrl}/panel.json` } },
+            { id: 'redirect', title: 'Redirect', placement: 'settings', summary: '', source: { url: `${market2.baseUrl}/redirect.json` } },
+          ],
+        },
+      }),
+    );
+    await allowed.host.load();
+
+    const ok = await allowed.host.readPanel('dev3d.prober', 'loopback');
+    assert.equal(ok.ok, true, ok.error ?? '');
+    assert.equal(ok.widgets.length, 1);
+
+    const redirected = await allowed.host.readPanel('dev3d.prober', 'redirect');
+    assert.equal(redirected.ok, false, 'a redirect is not followed, opt-out or not');
+    assert.match(redirected.error ?? '', /redirect/i);
+
+    // And the panel's host is named in the log once — both panels are on the same
+    // host here — so an operator can see where its data comes from without the
+    // console refreshing it into the log every thirty seconds.
+    const named = allowed.logs().filter((line) => line.includes('is served by'));
+    assert.equal(named.length, 1, named.join(' / '));
+    assert.match(named[0] ?? '', /127\.0\.0\.1/);
+    await allowed.host.readPanel('dev3d.prober', 'loopback');
+    assert.equal(allowed.logs().filter((line) => line.includes('is served by')).length, 1, 'and not again');
+  } finally {
+    allowed.cleanup();
+    await market2.close();
   }
 });
 

@@ -276,7 +276,25 @@ export class Liveliness {
    * conversation at a time, which is exactly how an office ends up empty while
    * every individual decision looked reasonable.
    */
+  /**
+   * How many people are up and away from their desk.
+   *
+   * Still a getter — it is the honest definition, and callers outside the frame
+   * loop deserve it — but the frame loop **no longer calls it per actor**.
+   * `stepActor` used to read it at two points for every actor on every frame, and
+   * being a getter each read was a full scan: O(K·N) `hypot` calls per frame where
+   * K is the number of actors reaching those branches. Cheap at twenty employees
+   * and real work in exactly the growing-office case this layer exists for.
+   *
+   * `update` now computes it once and threads it through, the way `idle` already
+   * is.
+   */
   get wandering(): number {
+    return this.countWandering();
+  }
+
+  /** The scan behind `wandering`. Called once per frame by `update`. */
+  private countWandering(): number {
     let count = 0;
     for (const actor of this.actors.values()) {
       if (actor.state === 'seated') continue;
@@ -380,8 +398,10 @@ export class Liveliness {
     // Idleness is worked out once per frame and handed to the step, because a
     // decision to get up and the reason not to have to agree about the same
     // frame - and because an employee who has just been given work must not be
-    // able to walk out of the door on the way to reading it.
-    for (const actor of this.actors.values()) this.stepActor(actor, dt, this.isIdle(actor, statusOf));
+    // able to walk out of the door on the way to reading it. `away` is the same
+    // treatment for the same reason: one scan per frame instead of one per actor.
+    const away = this.countWandering();
+    for (const actor of this.actors.values()) this.stepActor(actor, dt, this.isIdle(actor, statusOf), away);
   }
 
   /**
@@ -738,7 +758,7 @@ export class Liveliness {
 
   // ---------------------------------------------------------------- stepping
 
-  private stepActor(actor: Actor, dt: number, idle: boolean): void {
+  private stepActor(actor: Actor, dt: number, idle: boolean, away: number): void {
     if (actor.bubbleLeft > 0) {
       actor.bubbleLeft -= dt;
       if (actor.bubbleLeft <= 0) actor.bubble = null;
@@ -801,7 +821,7 @@ export class Liveliness {
         // A person standing about looks around slowly rather than staring.
         actor.yaw = actor.anchorYaw + Math.sin(this.time * 0.35 + actor.phase) * 0.55;
         if (actor.hold > 0) break;
-        const continues = this.wandering < this.wandererLimit && this.rng() < 0.35;
+        const continues = away < this.wandererLimit && this.rng() < 0.35;
         if (!continues || !this.startErrand(actor)) this.sendHome(actor, false);
         break;
       }
@@ -825,7 +845,7 @@ export class Liveliness {
         actor.wait -= dt;
         if (actor.wait > 0) break;
         const chance = 0.3 + actor.sociability * 0.5;
-        const room = this.wandering < this.wandererLimit;
+        const room = away < this.wandererLimit;
         if (!room || this.rng() > chance || !this.startErrand(actor)) actor.wait = 6 + this.rng() * 22;
         break;
       }

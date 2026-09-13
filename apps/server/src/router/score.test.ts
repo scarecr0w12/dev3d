@@ -388,6 +388,48 @@ test('a nearly-exhausted budget is treated as cheap posture', () => {
   assert.equal(ranked[0]?.model.id, 'cheap');
 });
 
+// Two providers serving the same model id. Latent rather than live today — every
+// shipped catalog id is unique — but it becomes real the moment a plugin declares a
+// provider serving an id a built-in one also serves, which is the whole point of the
+// plugin model. Every map here used to be keyed by the bare `model.id`.
+test('two providers serving one model id are scored as two candidates, not one', () => {
+  const cheap = makeModel('shared', 'standard', { providerId: 'local', costPerMTokIn: 0, costPerMTokOut: 0, quality: quality(0.5) });
+  const dear = makeModel('shared', 'standard', { providerId: 'frontier', costPerMTokIn: 40, costPerMTokOut: 40, quality: quality(0.5) });
+  const models = [cheap, dear];
+
+  // Equal quality, so the cost penalty is the only thing between them, and it has to
+  // separate them: with one shared cost entry both would score identically and the
+  // winner would be whichever the sort happened to keep.
+  const ranked = rankCandidates(models, context('coding', 'standard', 'quality', models));
+  assert.equal(ranked.length, 2);
+  const local = ranked.find((entry) => entry.model.providerId === 'local');
+  const frontier = ranked.find((entry) => entry.model.providerId === 'frontier');
+  assert.ok(local && frontier);
+  assert.ok(
+    local.score > frontier.score,
+    `the free one must beat the dear one: local ${local.score} vs frontier ${frontier.score}`,
+  );
+  assert.ok(
+    local.normalizedCost < frontier.normalizedCost,
+    `each must be scored with its own price: local ${local.normalizedCost} vs frontier ${frontier.normalizedCost}`,
+  );
+});
+
+test('a hint aimed at one provider\'s model does not move the other provider\'s', () => {
+  // The bonus map was keyed by model id, so one entry was shared by both candidates
+  // and a rule naming a model lifted every provider serving that id.
+  const cheap = makeModel('shared', 'standard', { providerId: 'local', costPerMTokIn: 0, costPerMTokOut: 0, quality: quality(0.5) });
+  const dear = makeModel('shared', 'standard', { providerId: 'frontier', costPerMTokIn: 40, costPerMTokOut: 40, quality: quality(0.5) });
+  const models = [cheap, dear];
+  const hintBonus = new Map<string, number>([['frontier/shared', 5]]);
+
+  const ranked = rankCandidates(models, { ...context('coding', 'standard', 'balanced', models), hintBonus });
+  assert.equal(ranked[0]?.model.providerId, 'frontier', 'the bonus applies to the provider it named');
+  const local = ranked.find((entry) => entry.model.providerId === 'local');
+  assert.ok(local);
+  assert.ok(local.score < 5, `and not to the other one: local scored ${local.score}`);
+});
+
 test('scoring a pool of hundreds stays linear enough to run every turn', () => {
   // A provider can legitimately report 445 models; the pool preparation must not
   // be repeated per candidate.

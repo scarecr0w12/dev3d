@@ -1,0 +1,14 @@
+{
+  "$comment": [
+    "MCP servers for the dev3d office. This file is deliberately EMPTY.",
+    "",
+    "It exists because DEV3D_MCP_CONFIG names it, and a pointed-at file that is",
+    "absent is reported at every boot. An empty `servers` array is the honest",
+    "answer: the setting is satisfied and no server is configured.",
+    "",
+    "To add one, see mcp.json.example for the full shape. Every server's tools are",
+    "published to employees as mcp__<id>__<tool>, and which roles may call them is",
+    "DEV3D_MCP_GRANT_ROLES (default: the roles that already hold run_shell)."
+  ],
+  "servers": []
+}

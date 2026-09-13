@@ -55,6 +55,22 @@ export interface Store {
   appendEvent(entry: Omit<EventLogEntry, 'id'>): void;
   eventsForRun(runId: string, limit?: number): EventLogEntry[];
   recentEvents(limit: number): EventLogEntry[];
+  /**
+   * Delete events recorded before `before`, and report how many went.
+   *
+   * The event log is append-only and nothing ever removed from it, so a
+   * long-lived office accumulates rows forever - and the rows that dominated the
+   * growth were the per-token `turn.delta` stream, which is no longer persisted
+   * at all. This is the other half of that fix: the remaining rows are
+   * turn-and-stage-level, which is exactly what an operator wants to keep, but
+   * "wants to keep" is not "unbounded".
+   *
+   * Runs, turns and artifacts are deliberately **out** of scope: an old run is
+   * still served by `GET /api/runs/:id`, and deleting the record an operator can
+   * still ask for would make that route start lying. Retention here is about the
+   * log, not the history.
+   */
+  pruneEvents(before: number): number;
 
   saveRun(run: Run): void;
   loadRun(id: string): Run | undefined;
@@ -187,6 +203,13 @@ function createMemoryStore(reason: string, log: Log): Store {
     eventsForRun: (runId, limit = 2_000) =>
       events.filter((e) => e.runId === runId).slice(-limit),
     recentEvents: (limit) => events.slice(-limit),
+    pruneEvents(before) {
+      const keep = events.filter((e) => e.at >= before);
+      const removed = events.length - keep.length;
+      events.length = 0;
+      events.push(...keep);
+      return removed;
+    },
     saveRun: (run) => {
       runs.set(run.id, structuredClone(run));
     },
@@ -640,6 +663,19 @@ export function openStore(
       return rows
         .map((r) => ({ id: r.id, runId: r.run_id, type: r.type, payloadJson: r.payload, at: r.at }))
         .reverse();
+    },
+
+    pruneEvents(before) {
+      try {
+        const result = db.prepare('DELETE FROM events WHERE at < ?').run(before) as { changes?: number | bigint };
+        // `changes` is a BigInt on this driver, and a caller that only wants a
+        // log line should not have to know that.
+        return Number(result.changes ?? 0);
+      } catch (e) {
+        // Retention is housekeeping: a failure to prune must not stop the office.
+        log('warn', 'store', `failed to prune the event log: ${e instanceof Error ? e.message : String(e)}`);
+        return 0;
+      }
     },
 
     saveRun(run) {

@@ -81,9 +81,24 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
   const [cursor, setCursor] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  /**
+   * Where focus was before the palette opened, so it can go back.
+   *
+   * The input unmounts on close and focus used to fall to `<body>`, which for a
+   * keyboard-first surface (it is reached by Ctrl/Cmd-K) means the operator loses
+   * their place in whatever they were doing.
+   */
+  const openerRef = useRef<Element | null>(null);
 
   useEffect(() => {
+    openerRef.current = document.activeElement;
     inputRef.current?.focus();
+    return () => {
+      const opener = openerRef.current;
+      // Only if it is still in the document and focusable: the element that
+      // opened the palette may itself have been unmounted by the jump it caused.
+      if (opener instanceof HTMLElement && document.contains(opener)) opener.focus();
+    };
   }, []);
 
   const entries = useMemo<JumpEntry[]>(() => {
@@ -194,9 +209,22 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
     entry.activate(store, onClose);
   };
 
-  const onKeyDown = (event: KeyboardEvent<HTMLInputElement>): void => {
+  /**
+   * Arrow keys, Enter and Escape — attached to the input *and* the list.
+   *
+   * It used to be on the input alone, so tabbing into the results — which the
+   * options allowed, being real `<button>`s — stopped the keyboard working
+   * entirely. The options are `tabIndex={-1}` now and the input is the only tab
+   * stop, which is what the combobox role promises; the container handler is the
+   * belt to that.
+   */
+  const onKeyDown = (event: KeyboardEvent<HTMLElement>): void => {
     if (event.key === 'Escape') {
       event.preventDefault();
+      // Belt to the shell's braces: `App` skips an Escape whose
+      // `defaultPrevented` is set, and stopping propagation here means the
+      // window listener never even sees this one. One Escape closes one overlay.
+      event.stopPropagation();
       onClose();
       return;
     }
@@ -223,6 +251,8 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
   }, [active]);
 
   let index = -1;
+  /** The id of the highlighted option, for `aria-activedescendant`. */
+  const activeId = flat.length > 0 ? `quick-jump-option-${Math.min(active, flat.length - 1)}` : undefined;
 
   return (
     <div className="quick-jump">
@@ -237,6 +267,10 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
           role="combobox"
           aria-expanded={flat.length > 0}
           aria-controls="quick-jump-results"
+          // Which option is highlighted was communicated *only* visually before,
+          // so a screen reader was told there was a combobox but never what was
+          // active in it.
+          {...(activeId !== undefined ? { 'aria-activedescendant': activeId } : {})}
           aria-autocomplete="list"
           value={query}
           placeholder="Jump to a person, run, artifact or event…"
@@ -252,7 +286,17 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
         </button>
       </div>
 
-      <div className="quick-jump-results" id="quick-jump-results" role="listbox" ref={listRef}>
+      {/* The key handler lives on the container as well as the input. It used to be
+          on the input alone, so tabbing into the list — which the options allowed,
+          being real buttons — stopped the arrow keys and Enter working entirely. */}
+      <div
+        className="quick-jump-results"
+        id="quick-jump-results"
+        role="listbox"
+        ref={listRef}
+        onKeyDown={onKeyDown}
+        aria-label="Jump results"
+      >
         {flat.length === 0 ? (
           <div className="dim small quick-jump-empty">
             {query.trim().length === 0
@@ -261,8 +305,15 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
           </div>
         ) : (
           grouped.map((group) => (
-            <div className="quick-jump-group" key={group.kind}>
-              <div className="quick-jump-group-title">{KIND_LABEL[group.kind]}</div>
+            <div
+              className="quick-jump-group"
+              key={group.kind}
+              role="group"
+              aria-label={KIND_LABEL[group.kind]}
+            >
+              <div className="quick-jump-group-title" aria-hidden="true">
+                {KIND_LABEL[group.kind]}
+              </div>
               {group.items.map((entry) => {
                 index += 1;
                 const position = index;
@@ -271,7 +322,11 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
                     key={entry.id}
                     type="button"
                     role="option"
+                    id={`quick-jump-option-${position}`}
                     aria-selected={position === active}
+                    // The input is the only tab stop; the options are reached by
+                    // arrow keys, which is the pattern the combobox role promises.
+                    tabIndex={-1}
                     data-index={position}
                     className={cx('quick-jump-row', position === active && 'quick-jump-row-active')}
                     onMouseEnter={() => setCursor(position)}

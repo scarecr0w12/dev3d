@@ -17,7 +17,7 @@ import { memo, useCallback, useMemo, useState } from 'react';
 
 import type { Artifact, Run, StageRun, ToolCallRecord, TurnRecord } from '@dev3d/core';
 
-import { formatDuration, formatInt, formatTokens, formatUsd, tierClassName, truncate } from '../app/format';
+import { formatDuration, formatInt, formatTokens, formatUsage, formatUsd, reasoningShare, tierClassName, truncate } from '../app/format';
 import { useAutoScroll, useNow } from '../app/hooks';
 import {
   useArtifacts,
@@ -28,26 +28,11 @@ import {
   useStore,
   useStreaming,
 } from '../app/StoreContext';
+import { planProgress, planStepMark, routeServeCopy, statusTone } from '../app/vocabulary';
 import { Markdown, plainPreview } from './markdown';
 import { Badge, Bar, Empty, Panel, ToolStatusBadge } from './ui';
 
 const NO_ARTIFACTS: Artifact[] = [];
-
-function statusTone(status: string): 'neutral' | 'info' | 'ok' | 'warn' | 'danger' {
-  switch (status) {
-    case 'running':
-      return 'info';
-    case 'done':
-      return 'ok';
-    case 'awaiting-approval':
-    case 'paused':
-      return 'warn';
-    case 'failed':
-      return 'danger';
-    default:
-      return 'neutral';
-  }
-}
 
 export function RunTranscript() {
   const store = useStore();
@@ -73,6 +58,42 @@ export function RunTranscript() {
     }
     return map;
   }, [runArtifacts]);
+
+  const artifactById = useMemo(() => {
+    const map = new Map<string, Artifact>();
+    for (const artifact of runArtifacts) map.set(artifact.id, artifact);
+    return map;
+  }, [runArtifacts]);
+
+  /**
+   * Which stage owns which artifact, preferring the server's own mapping.
+   *
+   * `StageRun.artifactIds` is maintained by the store and was read by nothing: the
+   * transcript re-derived the same association from `artifact.stageId`, which is a
+   * *less* reliable source — it depends on the artifact carrying a stage id, and an
+   * artifact the office produced for the run as a whole carries none, so those
+   * never appeared inline at all. The derived mapping stays as the fallback, for a
+   * payload that predates the ids.
+   */
+  const stageArtifacts = useCallback(
+    (stage: StageRun): Artifact[] => {
+      const claimed = stage.artifactIds
+        .map((id) => artifactById.get(id))
+        .filter((artifact): artifact is Artifact => artifact !== undefined);
+      return claimed.length > 0 ? claimed : artifactsByStage.get(stage.id) ?? NO_ARTIFACTS;
+    },
+    [artifactById, artifactsByStage],
+  );
+
+  /** Artifacts no stage claims — the run-level ones, which had no home before. */
+  const runLevelArtifacts = useMemo(() => {
+    const claimed = new Set<string>();
+    for (const stage of run?.stages ?? []) {
+      for (const id of stage.artifactIds) claimed.add(id);
+      for (const artifact of artifactsByStage.get(stage.id) ?? []) claimed.add(artifact.id);
+    }
+    return runArtifacts.filter((artifact) => !claimed.has(artifact.id));
+  }, [run?.stages, runArtifacts, artifactsByStage]);
 
   const nameById = useMemo(() => {
     const map = new Map<string, string>();
@@ -201,14 +222,13 @@ export function RunTranscript() {
           const turns = stage.turnIds
             .map((turnId) => runTurns.byId[turnId])
             .filter((turn): turn is TurnRecord => turn !== undefined);
-          const stageArtifacts = artifactsByStage.get(stage.id) ?? NO_ARTIFACTS;
           return (
             <StageBlock
               key={stage.id}
               index={index}
               stage={stage}
               turns={turns}
-              artifacts={stageArtifacts}
+              artifacts={stageArtifacts(stage)}
               nameById={nameById}
               isExpanded={isExpanded}
               onToggle={toggle}
@@ -218,6 +238,36 @@ export function RunTranscript() {
             />
           );
         })}
+
+        {runLevelArtifacts.length > 0 && (
+          <section className="stage stage-run-artifacts">
+            <header className="stage-head">
+              <span className="stage-index">{run.stages.length + 1}</span>
+              <span className="stage-name">Run-level</span>
+              <span className="stage-spacer" />
+              <Badge tone="neutral">{runLevelArtifacts.length} artifact(s)</Badge>
+            </header>
+            <div className="stage-body">
+              <div className="dim small">
+                Produced for the run as a whole rather than by one stage. These carry no stage id, so they were
+                previously shown only in the Artifacts panel.
+              </div>
+              <div className="stage-artifacts">
+                <div className="field-label">Artifacts</div>
+                {runLevelArtifacts.map((artifact) => (
+                  <details key={artifact.id} className="artifact-inline">
+                    <summary>
+                      <Badge tone="accent">{artifact.kind}</Badge>
+                      <span className="strong">{artifact.title}</span>
+                      {artifact.path !== undefined && <span className="mono small dim">{artifact.path}</span>}
+                    </summary>
+                    <Markdown text={artifact.body} idPrefix={`artifact-${artifact.id}`} />
+                  </details>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
 
         {runTurns.ordered.length > 0 && run.stages.length === 0 && (
           <div className="dim small">turns recorded but no stage index was received</div>
@@ -283,6 +333,29 @@ function RunHeader({
           <span className="strong">Run error</span>
           <span className="mono small">{run.error}</span>
         </div>
+      )}
+
+      {/*
+        The working plan the employee holding the run keeps up to date. It is run
+        state on purpose — `AgentPlanStep`'s own doc says so, "visible to the operator
+        while the run proceeds" — and until now it was persisted on every
+        `run.updated`, transmitted on every frame, and drawn nowhere.
+      */}
+      {run.plan.length > 0 && (
+        <details className="run-plan" open>
+          <summary>Working plan · {planProgress(run.plan)}</summary>
+          <ol className="plan-steps">
+            {run.plan.map((step, index) => (
+              <li key={`${index}-${step.content.slice(0, 24)}`} className={`plan-step plan-step-${step.status}`}>
+                <span className="plan-step-mark" aria-hidden="true">
+                  {planStepMark(step.status)}
+                </span>
+                <span className="plan-step-text">{step.content}</span>
+                <span className="dim small plan-step-status">{step.status.replace('_', ' ')}</span>
+              </li>
+            ))}
+          </ol>
+        </details>
       )}
 
       {run.endedAt === null && run.status !== 'running' && (
@@ -447,6 +520,7 @@ const TurnBlock = memo(function TurnBlock({
   const body = liveText.length > 0 ? liveText : turn.text;
   const thoughts = liveReasoning.length > 0 ? liveReasoning : turn.reasoning ?? '';
   const streaming = liveText.length > 0;
+  const serve = routeServeCopy(turn);
 
   return (
     <article className={`turn turn-${turn.status}`}>
@@ -456,10 +530,27 @@ const TurnBlock = memo(function TurnBlock({
           <span className="turn-who strong">{employeeName}</span>
           <span className="turn-purpose">{turn.purpose}</span>
           <span className={tierClassName(turn.route.tier)}>{turn.route.tier}</span>
-          <span className="mono small dim">{turn.route.modelId}</span>
+          {/* The model that *served* the turn, not the one the router picked. */}
+          <span className="mono small dim" title={serve.note ?? undefined}>
+            {serve.modelId}
+          </span>
+          {serve.fellBack && (
+            <Badge tone="warn" title={serve.note ?? undefined}>
+              fallback
+            </Badge>
+          )}
           <span className="mono small dim">{turn.route.taskClass}</span>
           <span className="stage-spacer" />
-          <span className="mono small dim">{formatTokens(turn.usage.tokensIn, turn.usage.tokensOut)}</span>
+          <span
+            className="mono small dim"
+            title={
+              turn.usage.estimated === true
+                ? 'Estimated from the characters sent and received: this provider reported no usage, so this is a chars/4 approximation rather than a bill.'
+                : `${reasoningShare(turn.usage) ?? 'reported by the provider'}`
+            }
+          >
+            {formatUsage(turn.usage)}
+          </span>
           <span className="mono small dim">{formatUsd(turn.usage.costUsd)}</span>
           <span className="mono small dim">{formatDuration(durationMs)}</span>
           <Badge tone={statusTone(turn.status)}>{turn.status}</Badge>
@@ -474,6 +565,17 @@ const TurnBlock = memo(function TurnBlock({
             {turn.route.fallbacks.length > 0 && ` · ${turn.route.fallbacks.length} fallbacks`}
             {turn.route.considered.length > 0 && ` · ${turn.route.considered.length} considered`}
           </div>
+
+          {/*
+            What actually answered, when that is not what was chosen. `route.modelId`
+            above is the router's *decision*; showing it alone credits the chosen
+            model with work a fallback did.
+          */}
+          {serve.fellBack && (
+            <div className="turn-route-fallback dim small" title={serve.note ?? undefined}>
+              <Badge tone="warn">fallback</Badge> {serve.note}
+            </div>
+          )}
 
           {thoughts.length > 0 && (
             <details className="turn-reasoning">

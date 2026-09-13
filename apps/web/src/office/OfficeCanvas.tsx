@@ -25,9 +25,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 import type {
+  BlockEdge,
   EmployeeState,
   EmployeeStatus,
   OfficeStyle,
@@ -45,6 +47,7 @@ import { STATUS_COLOR, STATUS_LABEL, STATUS_ORDER } from '../app/status';
 import { VENDOR_STATUS_COLOR, VENDOR_STATUS_LABEL } from '../app/status';
 import { StylePanel } from '../console/StylePanel';
 import { indexAnchors, roomLabel } from './anchors';
+import { exteriorEdges, glazingFor, lintelNodeName, wallNodeName } from './glazing';
 import { floorOffset, floorVisibility, resolveFloorId } from './floors';
 import type { AnchorStats, OfficeAnchors } from './anchors';
 import { createAvatar } from './avatar';
@@ -54,11 +57,16 @@ import { Liveliness } from './liveliness';
 import type { LivelinessMember, LivelinessSpot } from './liveliness';
 import { buildNavGrid } from './navgrid';
 import type { NavGrid, ObstacleBox } from './navgrid';
-import { applyStyle, disposeMaterials, dressMaterials, groundGridTexture } from './theme';
+import { sceneSignature } from './sceneSync';
+import type { SceneSync } from './sceneSync';
+import { applyStyle, disposeMaterials, dressMaterials, groundGridTexture, setTextureLibrary } from './theme';
 import type { AppliedStyle, FloorLighting, FloorMaterials } from './theme';
+import { TEXTURE_BASE, disposeTextureLibrary, loadTextureLibrary } from './textures';
+import type { TextureLibrary } from './textures';
 
 const OFFICE_URL = `${import.meta.env.BASE_URL}office/office.glb`;
 const KIT_URL = `${import.meta.env.BASE_URL}office/blocks.glb`;
+const AVATAR_URL = `${import.meta.env.BASE_URL}office/avatar.glb`;
 /** Camera distance when framing one employee. */
 const FOCUS_DISTANCE = 6.4;
 /**
@@ -110,26 +118,6 @@ type ScenePhase =
   | { kind: 'ready' }
   | { kind: 'error'; message: string };
 
-export interface SceneSync {
-  employees: EmployeeState[];
-  roles: Role[];
-  /** Every floor in the building, so the scene can build one per organisation. */
-  workspaces: WorkspaceSummary[];
-  activeWorkspaceId: string;
-  selectedId: string | null;
-  /**
-   * The third-party vendors docked on this floor.
-   *
-   * Installation-wide rather than per-organisation: a vendor is configured by the
-   * operator with an environment variable, not by an org chart, so the same bay
-   * appears on every floor. That is deliberate - the alternative would be a
-   * vendor charged to one team's budget, which is a business decision dev3d has
-   * no way to make on an operator's behalf.
-   */
-  vendors: VendorState[];
-  selectedVendorId: string | null;
-}
-
 interface SceneApi {
   /**
    * Brings the scene in step with the office: builds or removes floors, shows
@@ -170,6 +158,12 @@ function obstacleBoxesOf(root: THREE.Object3D, floorY: number): ObstacleBox[] {
   root.traverse((object) => {
     const mesh = object as THREE.Mesh;
     if (!mesh.isMesh) return;
+    // A hidden mesh is not there. That matters for exactly one thing today - a
+    // grown module's wall that glazing has replaced - and reading the flag is what
+    // makes "the wall is hidden" mean what a reader assumes it means. The glazing's
+    // **sill** is then what keeps that module's footprint in the grid, which is why
+    // it exists and why the smoke suite asserts it spans this band.
+    if (!mesh.visible) return;
     bounds.setFromObject(mesh);
     if (bounds.max.y < floorY + 0.25 || bounds.min.y > floorY + 1.75) return;
     boxes.push({ minX: bounds.min.x, minZ: bounds.min.z, maxX: bounds.max.x, maxZ: bounds.max.z });
@@ -245,6 +239,8 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
 
     let disposed = false;
     let frame = 0;
+    /** Why the block kit is missing, when it failed rather than being absent. */
+    let kitError: string | null = null;
     let focusTarget: { point: THREE.Vector3; distance: number } | null = null;
     let selectedId: string | null = null;
     let selectedVendorId: string | null = null;
@@ -321,6 +317,38 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
     controls.maxDistance = 60;
     controls.maxPolarAngle = Math.PI * 0.495;
     controls.target.set(0, 1.1, 0);
+
+    /**
+     * The room's own reflections, baked once into a small environment map.
+     *
+     * This is the difference between steel and a black hole. Every material in
+     * both GLBs carries a metallic factor - `M_Metal_Frame` is 0.9, and it is on
+     * every desk leg, chair post and monitor stand - and a metal surface has no
+     * diffuse term at all. With nothing to reflect it can only be lit by the
+     * punctual lights' specular highlights, so it renders as a dark hole rather
+     * than as steel. Glass is the same story from the other side.
+     *
+     * `RoomEnvironment` is three.js's own lit box: a handful of emissive panels at
+     * different intensities, which is enough for smooth, plausible reflections
+     * without shipping an HDRI or fetching one at runtime. It is baked once and
+     * shared by every floor; what a floor decides is how much of it it sees, via
+     * `scene.environmentIntensity` in `applyEnvironment`.
+     */
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const roomEnvironment = new RoomEnvironment();
+    const environmentTarget = pmrem.fromScene(roomEnvironment, 0.04);
+    scene.environment = environmentTarget.texture;
+    // The lit box has done its job once it is baked into the map above.
+    roomEnvironment.traverse((object) => {
+      const mesh = object as THREE.Mesh;
+      if (mesh.isMesh) {
+        mesh.geometry?.dispose();
+        const material = mesh.material;
+        if (Array.isArray(material)) material.forEach((entry) => entry.dispose());
+        else material?.dispose();
+      }
+    });
+    roomEnvironment.dispose();
 
     /**
      * The light rig.
@@ -431,22 +459,49 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
     /**
      * A reusable carrier for `dressMaterials`, which only reads `materials`.
      *
-     * The alternative - a fresh `AppliedStyle` per mesh set - is a full palette
-     * allocation on every module clone, and modules are cloned by the dozen.
+     * The alternative - a fresh palette object per mesh set - is an allocation on
+     * every module clone, and modules are cloned by the dozen. It is typed as the
+     * narrow shape `dressMaterials` accepts rather than cast to a whole
+     * `AppliedStyle`, which is what it used to be: a cast that made a missing field
+     * look present.
      */
-    const styleScratch = { materials: {} as FloorMaterials } as AppliedStyle;
+    const styleScratch: { materials: FloorMaterials; unmapped?: string[] } = { materials: {} as FloorMaterials };
+    /** Materials already reported as unplaceable, so a rebuild does not repeat itself. */
+    const reportedUnmapped = new Set<string>();
     /** The rig currently in force, so a floor can be re-lit without re-resolving. */
     let activeLighting: FloorLighting | null = null;
     /** The loaded model, cloned once per organisation. */
     let template: THREE.Object3D | null = null;
+    /**
+     * The employee figure every avatar is cloned from, once it has loaded.
+     *
+     * Held as the loaded scene rather than a clone: `createAvatar` clones it per
+     * employee and only the *materials* differ, so a dozen employees cost one
+     * model's worth of geometry. Null means the avatar module builds its own.
+     */
+    let avatarTemplate: THREE.Object3D | null = null;
     /** The block kit: one cloneable group per module kind, keyed by node name. */
     const kit = new Map<string, THREE.Object3D>();
 
-    /** A stable key for a layout, so a rebuild happens only when it really changed. */
+    /**
+     * A stable key for a layout, so a rebuild happens only when it really changed.
+     *
+     * The block **kit** is part of this, and that is load-bearing rather than
+     * tidiness. The builder skips any placement whose kind is not in the kit, so a
+     * floor drawn before `blocks.glb` arrived has no grown rooms at all — and this
+     * key used to derive only from the server's block list, which the kit cannot
+     * change. The rebuild branch therefore never fired when the kit landed, and the
+     * floor kept rendering without its modules (and kept reporting pre-growth
+     * anchor counts) until the layout actually changed or the floor was recreated.
+     * Both GLB requests start on the same tick and `office.glb` is the smaller
+     * file, so the office model winning that race is the *likely* order, not a
+     * corner case.
+     */
     function layoutKeyOf(workspace: WorkspaceSummary): string {
-      return workspace.layout.blocks
+      const blocks = workspace.layout.blocks
         .map((block) => `${block.id}:${block.kind}@${block.x},${block.z}r${block.rotation}`)
         .join('|');
+      return `${kit.size}#${blocks}`;
     }
 
     /**
@@ -468,6 +523,39 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
      * two pods distinguishable: without it both would offer `Seat_POD4_02` and the
      * anchor index would keep whichever loaded first.
      */
+    /**
+     * A module's footprint, measured from its geometry.
+     *
+     * `blocks.json` declares it, but the browser only loads the GLB — and the walls
+     * *are* the declared extent, because the kit's own validator refuses to export a
+     * module whose fit-out pokes outside it. Measuring is exact here and saves
+     * carrying a second copy of the same number that could drift from the first.
+     */
+    const footprints = new Map<string, { width: number; depth: number }>();
+    function footprintOf(kindId: string): { width: number; depth: number } | null {
+      const found = footprints.get(kindId);
+      if (found) return found;
+      const template = kit.get(kindId) ?? kit.get(`Kit_${kindId}`);
+      if (!template) return null;
+      const box = new THREE.Box3().setFromObject(template);
+      const size = { width: box.max.x - box.min.x, depth: box.max.z - box.min.z };
+      footprints.set(kindId, size);
+      return size;
+    }
+
+    /**
+     * Whether a module's wall on `edge` has a doorway through it.
+     *
+     * Read off the geometry rather than from `blocks.json`: a wall with a doorway is
+     * built as segments with a **lintel** over the gap, so the lintel's existence is
+     * the doorway. That keeps the browser's idea of where the doors are derived from
+     * the same file it renders.
+     */
+    function edgeHasDoor(instance: THREE.Object3D, placed: { id: string; kind: string }, edge: BlockEdge): boolean {
+      const lintel = `${placed.id}::${lintelNodeName(placed.kind, edge)}`;
+      return instance.getObjectByName(lintel) !== undefined;
+    }
+
     function buildModules(workspace: WorkspaceSummary, materials: FloorMaterials): THREE.Group {
       const group = new THREE.Group();
       group.name = `Modules_${workspace.id}`;
@@ -487,6 +575,23 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
           mesh.castShadow = true;
           mesh.receiveShadow = true;
         });
+        const shape = footprintOf(placed.kind);
+        if (shape) {
+          // The core counts as a neighbour, or a module bolted to its side would
+          // have the shared wall glazed and its own rooms left open to the lobby.
+          const core = { minX: BASE_MIN_X, maxX: BASE_MAX_X, minZ: BASE_MIN_Z, maxZ: BASE_MAX_Z };
+          for (const edge of exteriorEdges(placed, workspace.layout.blocks, footprintOf, core)) {
+            // A doorway on an outside edge is already an opening, and the layout put
+            // it there to be used; glazing over one would wall up a way through.
+            if (edgeHasDoor(instance, placed, edge)) continue;
+            const wall = instance.getObjectByName(`${placed.id}::${wallNodeName(placed.kind, edge)}`);
+            if (!wall) continue;
+            // Hidden rather than veneered: glass over a solid wall is a facade trick,
+            // and from inside the room you would be looking at a wall behind it.
+            wall.visible = false;
+            instance.add(glazingFor(placed, edge, shape));
+          }
+        }
         dressMaterials(instance, withMaterials(materials));
         group.add(instance);
       }
@@ -539,11 +644,22 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
      * material - the clone shares its material objects with the template.
      */
     function dressClone(clone: THREE.Object3D, materials: FloorMaterials): void {
-      dressMaterials(clone, withMaterials(materials));
+      // Reported rather than discarded: the list names materials this build could
+      // not place, which is how a new GLB material goes unstyled without anyone
+      // noticing. Nothing read it before — the field was documented, always empty in
+      // production, and written to a throwaway object.
+      const unmapped = dressMaterials(clone, withMaterials(materials));
+      const fresh = unmapped.filter((name) => !reportedUnmapped.has(name));
+      if (fresh.length > 0) {
+        for (const name of fresh) reportedUnmapped.add(name);
+        console.warn(
+          `[office] ${fresh.length} material(s) in the model have no style role and will render unstyled: ${fresh.join(', ')}`,
+        );
+      }
     }
 
     /** The scratch carrier with a floor's material set in it. */
-    function withMaterials(materials: FloorMaterials): AppliedStyle {
+    function withMaterials(materials: FloorMaterials): { materials: FloorMaterials; unmapped?: string[] } {
       styleScratch.materials = materials;
       return styleScratch;
     }
@@ -782,6 +898,10 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       rimLight.color.set(lighting.rimColor);
       rimLight.intensity = lighting.rimIntensity;
       renderer.toneMappingExposure = lighting.exposure;
+      // What the room reflects, and so how much of a surface's character comes
+      // from its surroundings rather than from the three directional lights. This
+      // is what makes steel read as steel; see where the map is baked above.
+      scene.environmentIntensity = environment.environmentIntensity;
 
       (scene.background as THREE.Color).set(environment.background);
       const fog = scene.fog as THREE.Fog | null;
@@ -860,6 +980,29 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
     };
 
     /**
+     * Is this object actually drawable?
+     *
+     * `intersectObjects(objects, true)` tests `object.layers` and nothing else —
+     * neither `Mesh.raycast` nor `Sprite.raycast` consults `visible` (verified in
+     * the installed three.js). So every hidden part of an avatar was pickable: the
+     * speech bubble sits above the head at ~1.84 m even when hidden, the selection
+     * ring and halo are toggled the same way, and so are the legs and the tablet.
+     * Clicking apparently empty air above somebody selected them.
+     *
+     * Walks *up* as well as checking the object itself: hiding a group hides its
+     * children visually, and three.js is no more aware of that during a raycast
+     * than it is of the object's own flag.
+     */
+    const isVisibleInScene = (object: THREE.Object3D): boolean => {
+      let cursor: THREE.Object3D | null = object;
+      while (cursor) {
+        if (!cursor.visible) return false;
+        cursor = cursor.parent;
+      }
+      return true;
+    };
+
+    /**
      * What the pointer is over.
      *
      * Tagged rather than a bare id, because an employee and a vendor can share an
@@ -878,7 +1021,8 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       for (const avatar of avatars.values()) targets.push(avatar.group);
       for (const terminal of vendorAvatars.values()) targets.push(terminal.group);
       const hits = raycaster.intersectObjects(targets, true);
-      const first = hits[0];
+      // Only what is actually on screen counts as a hit — see `isVisibleInScene`.
+      const first = hits.find((hit) => isVisibleInScene(hit.object));
       if (!first) return null;
       const id = findAvatarId(first.object);
       if (id === null) return null;
@@ -891,12 +1035,19 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
     };
 
     const onPointerDown = (event: PointerEvent): void => {
+      // Primary button only. `OrbitControls` is bound to the same element and uses
+      // the right button to pan, so a failed right-drag used to land here as a
+      // "click" and clear the operator's selection.
+      if (event.button !== 0) return;
       pointerDown = { x: event.clientX, y: event.clientY };
     };
 
     const onPointerUp = (event: PointerEvent): void => {
       const down = pointerDown;
       pointerDown = null;
+      // Matching guard: `pointerDown` is only ever set by a primary press now, but
+      // checking here as well keeps the pair obviously symmetric.
+      if (event.button !== 0) return;
       if (!down) return;
       // Ignore the pointer-up that merely ends an orbit drag.
       if (Math.hypot(event.clientX - down.x, event.clientY - down.y) > 6) return;
@@ -911,16 +1062,25 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       else store.selectEmployee(pick.id);
     };
 
+    /**
+     * The last hover position, and whether it still needs resolving.
+     *
+     * The handler used to pick on every `pointermove` — see the resolve site in
+     * `tick` for why that was the wrong place to do it.
+     */
+    let hoverX = 0;
+    let hoverY = 0;
+    let hoverDirty = false;
+
     const onPointerMove = (event: PointerEvent): void => {
-      const pick = pickAt(event.clientX, event.clientY);
-      const id = pick === null ? null : `${pick.kind}:${pick.id}`;
-      if (id === hoveredId) return;
-      hoveredId = id;
-      renderer.domElement.style.cursor = id ? 'pointer' : 'grab';
+      hoverX = event.clientX;
+      hoverY = event.clientY;
+      hoverDirty = true;
     };
 
     const onPointerLeave = (): void => {
       hoveredId = null;
+      hoverDirty = false;
       renderer.domElement.style.cursor = 'grab';
     };
 
@@ -974,16 +1134,21 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
         // before it grew is simply wrong.
         const described = floors.get(activeFloorId) ?? floors.values().next().value;
         if (described) {
-          const signature = `${activeFloorId}|${described.anchors.describe()}`;
+          // A kit that failed is said out loud. Without it, a floor that has grown
+          // rooms renders without them and the HUD describes the building as
+          // though it had them — which reads as a bug in the floor plan rather
+          // than a missing asset.
+          const withKit = kitError === null ? described.anchors.describe() : `block kit unavailable (${kitError})`;
+          const signature = `${activeFloorId}|${withKit}`;
           if (signature !== lastDescribed) {
             lastDescribed = signature;
-            setSummary(described.anchors.describe());
+            setSummary(withKit);
             onAnchorsRef.current?.({
               seats: described.anchors.seats,
               rooms: described.anchors.rooms,
               desks: described.anchors.desks,
               stats: described.anchors.stats,
-              summary: described.anchors.describe(),
+              summary: withKit,
             });
           }
         } else {
@@ -1013,7 +1178,7 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
           const role = roleById.get(employee.roleId);
           let avatar = avatars.get(employee.id);
           if (!avatar) {
-            avatar = createAvatar(employee.id, employee.displayName, appearanceFor(role));
+            avatar = createAvatar(employee.id, employee.displayName, appearanceFor(role), avatarTemplate);
             avatars.set(employee.id, avatar);
             officeRoot.add(avatar.group);
           }
@@ -1186,13 +1351,69 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
     const loader = new GLTFLoader();
 
     /**
-     * The block kit, loaded alongside the office.
+     * The real materials, fetched before anything is dressed.
      *
-     * A floor with no grown modules does not need it, so a missing or failed kit
-     * is survivable: the office renders, and only the rooms it has not built are
-     * absent. That is a better failure than a blank viewport.
+     * `applyStyle` is synchronous - it runs in the render loop and on the server -
+     * so the library cannot be awaited from inside it. It is loaded once here and
+     * handed over, and the models are only loaded afterwards, because a floor
+     * dressed before the library arrives keeps its generated pattern for the whole
+     * session. Real textures are an upgrade, not a prerequisite: if the fetch fails
+     * the office renders exactly as it did before there were any.
      */
-    loader.load(
+    let library: TextureLibrary | null = null;
+    loadTextureLibrary(TEXTURE_BASE, renderer.capabilities.getMaxAnisotropy())
+      .then((loaded) => {
+        if (disposed) {
+          disposeTextureLibrary(loaded);
+          return;
+        }
+        library = loaded;
+        setTextureLibrary(loaded);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!disposed) startLoadingModels();
+      });
+
+    function startLoadingModels(): void {
+      /**
+       * The employee figure, loaded *before* the office.
+       *
+       * Avatars are built the moment the office model arrives, so a template still
+       * in flight would leave the first floor procedural and the later ones
+       * modelled - a mixed office nobody would think to look for. It is 137 KB and
+       * it is asked for first, which is cheaper than plumbing a second ready flag
+       * through the scene sync.
+       *
+       * A missing figure is survivable in exactly the way a missing kit is: the
+       * avatar module builds its own primitives, so the office renders and the
+       * people are plainer.
+       */
+      loader.loadAsync(AVATAR_URL)
+        .then((gltf) => {
+          if (disposed) {
+            disposeObject3D(gltf.scene);
+            return;
+          }
+          avatarTemplate = gltf.scene;
+        })
+        .catch(() => {
+          avatarTemplate = null;
+        })
+        .finally(() => {
+          if (!disposed) loadOfficeAssets();
+        });
+    }
+
+    function loadOfficeAssets(): void {
+      /**
+       * The block kit, loaded alongside the office.
+       *
+       * A floor with no grown modules does not need it, so a missing or failed kit
+       * is survivable: the office renders, and only the rooms it has not built are
+       * absent. That is a better failure than a blank viewport.
+       */
+      loader.load(
       KIT_URL,
       (gltf) => {
         if (disposed) {
@@ -1209,8 +1430,16 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
         setKitReady(true);
       },
       undefined,
-      () => {
-        if (!disposed) setKitReady(true);
+      (error) => {
+        // Reported rather than swallowed. A missing kit is survivable — the office
+        // renders and only the grown rooms are absent — but it is indistinguishable
+        // from "this building has no modules" in the HUD, and the office loader
+        // logs its own failure. Being silent here meant a floor that quietly lost
+        // every room had nothing anywhere to say why.
+        if (disposed) return;
+        kitError = error instanceof Error ? error.message : String(error);
+        console.warn(`[office] block kit failed to load from ${KIT_URL}:`, error);
+        setKitReady(true);
       },
     );
 
@@ -1257,7 +1486,8 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
         const message = error instanceof Error ? error.message : String(error);
         setPhase({ kind: 'error', message: `could not load ${OFFICE_URL} — ${message}` });
       },
-    );
+      );
+    }
 
     // ------------------------------------------------------------------ loop
     const tick = (): void => {
@@ -1276,8 +1506,13 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       }
 
       if (focusTarget) {
+        // Reduced motion snaps rather than flies. The preference reached every
+        // avatar and terminal and disables liveliness outright, so the camera ease
+        // was the one animation path that ignored it — a ~1s animated flight every
+        // time somebody was selected. `k = 1` is the same code path with the
+        // interpolation removed, so there is no second behaviour to keep in step.
         const desired = focusTarget.point.clone().add(new THREE.Vector3(0, 0.95, 0));
-        const k = 1 - Math.exp(-5 * dt);
+        const k = reduced ? 1 : 1 - Math.exp(-5 * dt);
         controls.target.lerp(desired, k);
         const offset = camera.position.clone().sub(controls.target);
         const distance = offset.length();
@@ -1288,6 +1523,20 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
           camera.position.copy(controls.target).add(offset);
         }
         if (controls.target.distanceTo(desired) < 0.03) focusTarget = null;
+      }
+
+      // Hover picking is resolved once per frame rather than once per
+      // `pointermove`. A fast sweep across a full office rebuilt the `targets`
+      // array and intersected every avatar's ~20 meshes plus sprites thousands of
+      // times a second, on the same thread as the render loop.
+      if (hoverDirty) {
+        hoverDirty = false;
+        const pick = pickAt(hoverX, hoverY);
+        const id = pick === null ? null : `${pick.kind}:${pick.id}`;
+        if (id !== hoveredId) {
+          hoveredId = id;
+          renderer.domElement.style.cursor = id ? 'pointer' : 'grab';
+        }
       }
 
       for (const avatar of avatars.values()) avatar.update(dt, elapsed, reduced, liveliness.motionFor(avatar.id));
@@ -1312,6 +1561,9 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       (canvasElement as EventTarget).removeEventListener('webglcontextlost', onContextLost);
       api.dispose();
       controls.dispose();
+      // Every clone shares the avatar template's geometry, so it is released after
+      // the avatars that borrowed it rather than before them.
+      if (avatarTemplate) disposeObject3D(avatarTemplate);
       // Floors own their plates and every avatar owns its geometry, so each is
       // released before the blanket sweep of the scene graph.
       for (const floor of floors.values()) disposeFloor(floor);
@@ -1321,7 +1573,26 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
       groundMaterial.dispose();
       groundGridMesh.geometry.dispose();
       (groundGridMesh.material as THREE.Material).dispose();
+      // The texture library is the one set of textures no floor owns - every floor
+      // clones from it - so it is released here, after the floors that sampled it.
+      setTextureLibrary(null);
+      if (library) disposeTextureLibrary(library);
+      // The environment is one shared render target for the whole scene, so it is
+      // released after the floors that sampled it rather than by any of them.
+      scene.environment = null;
+      environmentTarget.dispose();
+      pmrem.dispose();
+      // The shadow map is a 2048² depth target, and `renderer.dispose()` does not
+      // touch it — `LightShadow.dispose()` is what releases `this.map`. Under
+      // `<StrictMode>` the first mount already creates two renderers and every HMR
+      // cycle adds more, so an unreleased depth target plus a live GL context per
+      // unmount is the standard route to the browser's "too many active WebGL
+      // contexts" warning.
+      keyLight.shadow.dispose();
       renderer.dispose();
+      // A separate, explicit operation in three.js: `dispose()` frees the
+      // renderer's own resources but leaves the context alive until GC.
+      renderer.forceContextLoss();
       if (canvasElement.parentNode === host) host.removeChild(canvasElement);
       apiRef.current = null;
     };
@@ -1330,31 +1601,45 @@ export function OfficeCanvas({ onAnchorsDiscovered }: OfficeCanvasProps) {
   }, [store]);
 
   // Keep the scene in step with the office without touching the renderer.
+  //
+  // Guarded by a change signature, because the arrays this reads are re-cloned on
+  // every `office` event — including ones that cannot affect the 3D scene — and an
+  // unguarded call rebuilt every floor and walked every avatar for each of them.
+  const syncInput: SceneSync = {
+    employees: employees ?? [],
+    roles: roles ?? [],
+    workspaces: office?.workspaces ?? [],
+    activeWorkspaceId: office?.activeWorkspaceId ?? '',
+    selectedId: selection.employeeId,
+    vendors: vendors ?? [],
+    selectedVendorId: selection.vendorId,
+  };
+  const syncSignature = sceneSignature(syncInput);
+  const lastSyncRef = useRef<string | null>(null);
+
   useEffect(() => {
     const api = apiRef.current;
     if (!api) return;
-    setParked(
-      api.syncScene({
-        employees: employees ?? [],
-        roles: roles ?? [],
-        workspaces: office?.workspaces ?? [],
-        activeWorkspaceId: office?.activeWorkspaceId ?? '',
-        selectedId: selection.employeeId,
-        vendors: vendors ?? [],
-        selectedVendorId: selection.vendorId,
-      }),
+    // `phase.kind` and `kitReady` are part of the guard because the scene cannot
+    // sync before the kit has loaded: the first call after it does has to run even
+    // though the office data is unchanged.
+    const key = `${syncSignature}|${phase.kind}|${kitReady}`;
+    if (lastSyncRef.current === key) return;
+    lastSyncRef.current = key;
+
+    const parkedIds = api.syncScene(syncInput);
+    // Only publish when the list actually differs. `syncScene` returns a fresh
+    // array every call, so unconditional `setParked` forced a React render for
+    // every event even when nobody had moved.
+    setParked((previous) =>
+      previous.length === parkedIds.length && parkedIds.every((id, i) => id === previous[i])
+        ? previous
+        : parkedIds,
     );
-  }, [
-    employees,
-    roles,
-    vendors,
-    office?.workspaces,
-    office?.activeWorkspaceId,
-    selection.employeeId,
-    selection.vendorId,
-    phase.kind,
-    kitReady,
-  ]);
+    // `syncInput` is rebuilt each render, so the signature is the dependency that
+    // matters; the rest are read through the ref API.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncSignature, phase.kind, kitReady]);
 
   useEffect(() => {
     apiRef.current?.setSelected(selection.employeeId);

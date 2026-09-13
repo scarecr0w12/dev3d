@@ -110,7 +110,14 @@ export function ArtifactsPanel() {
         </>
       }
     >
-      {kinds.length > 1 && (
+      {/*
+        Shown whenever there is more than one kind **or** a kind is selected. The
+        second half is the fix: the row used to appear only when `kinds.length > 1`,
+        so picking a kind and then switching scope to a run whose artifacts are all
+        a different kind hid the whole row — the list was empty, the empty state
+        said "pick another kind", and there was no kind control left on screen.
+      */}
+      {(kinds.length > 1 || kindFilter !== 'all') && (
         <div className="filter-row">
           <button type="button" className={kindFilter === 'all' ? 'chip chip-active' : 'chip'} onClick={() => setKindFilter('all')}>
             all · {scoped.length}
@@ -125,6 +132,17 @@ export function ArtifactsPanel() {
               {kind} · {count}
             </button>
           ))}
+          {/*
+            A selected kind that this scope has none of still gets a chip, so the
+            reason the list is empty is on screen next to the way out of it. Without
+            this the reader sees no active chip at all and cannot tell whether the
+            filter is set or the scope is simply empty.
+          */}
+          {kindFilter !== 'all' && !kinds.some(([kind]) => kind === kindFilter) && (
+            <button type="button" className="chip chip-active" onClick={() => setKindFilter('all')} title="No artifacts of this kind in this scope — click to clear">
+              {kindFilter} · 0
+            </button>
+          )}
         </div>
       )}
 

@@ -10,10 +10,19 @@
  * Anything it does not understand is rendered as plain text - never as markup.
  */
 
-import { Fragment } from 'react';
 import type { ReactNode } from 'react';
 
+import { safeHref } from '../app/safeHref';
+
 const INLINE_PATTERN = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\([^()\s]+\))/g;
+
+/**
+ * A link target that is safe to put in an `href`, or null.
+ *
+ * Defined in `app/safeHref.ts` so the verification harness can exercise it; the
+ * reasoning lives there.
+ */
+export { safeHref } from '../app/safeHref';
 
 function renderInline(text: string, keyPrefix: string): ReactNode[] {
   const nodes: ReactNode[] = [];
@@ -39,10 +48,24 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
     } else {
       const label = token.slice(1, token.indexOf(']'));
       const href = token.slice(token.indexOf('(') + 1, -1);
+      // The renderer's whole input is untrusted model output — transcripts,
+      // artifact bodies, stage summaries — and this is the one place it becomes a
+      // clickable navigation target. The tokenizer accepts any run of
+      // non-parenthesis, non-whitespace characters as a URL, so `javascript:`
+      // reached `<a href>` unchecked. Everything else here is safe by
+      // construction (React elements, no `dangerouslySetInnerHTML`), which makes
+      // this the single hole rather than one of many.
+      const safe = safeHref(href);
       nodes.push(
-        <a key={key} href={href} target="_blank" rel="noreferrer noopener">
-          {label}
-        </a>,
+        safe === null ? (
+          // Not a link after all: show the text as written rather than dropping
+          // it, so the reader sees what the model actually said.
+          <span key={key}>{`${label} (${href})`}</span>
+        ) : (
+          <a key={key} href={safe} target="_blank" rel="noreferrer noopener">
+            {label}
+          </a>
+        ),
       );
     }
     last = match.index + token.length;
@@ -210,16 +233,4 @@ export function plainPreview(text: string, max = 160): string {
     .replace(/\s+/g, ' ')
     .trim();
   return collapsed.length > max ? `${collapsed.slice(0, max - 1)}…` : collapsed;
-}
-
-export function MarkdownLines({ lines, className }: { lines: readonly string[]; className?: string }) {
-  return (
-    <div className={className ? `md ${className}` : 'md'}>
-      {lines.map((line, index) => (
-        <Fragment key={`line-${index}`}>
-          <p className="md-p">{renderInline(line, `l${index}`)}</p>
-        </Fragment>
-      ))}
-    </div>
-  );
 }

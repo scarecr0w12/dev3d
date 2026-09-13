@@ -21,6 +21,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { childEnv } from '../security/childEnv.ts';
 import { EventEmitter } from 'node:events';
 import type { ChildLike, JsonRpcTransport, SpawnLike } from './transport.ts';
 
@@ -41,7 +42,10 @@ export interface StdioTransportOptions {
   startTimeoutMs?: number;
   /** Called for every stderr line, so the runtime can surface it. */
   onStderr?: (line: string) => void;
-  /** Called for a stdout line that is not JSON. */
+  /**
+   * Called for a stdout line that is not JSON, or when the stream had to be
+   * resynchronised because a peer sent megabytes with no newline in them.
+   */
   onNoise?: (line: string) => void;
   /** Injected in tests. Defaults to the real `spawn`. */
   spawnFn?: SpawnLike;
@@ -49,6 +53,15 @@ export interface StdioTransportOptions {
 
 const DEFAULT_STDERR_LINES = 50;
 const DEFAULT_START_TIMEOUT_MS = 15_000;
+
+/**
+ * How much stdout may accumulate with no newline before it is discarded.
+ *
+ * A legitimate message can be large — a tool result with a file in it — so this is
+ * generous. What it bounds is the case with no legitimate answer: a peer that
+ * writes a continuous stream and never frames it.
+ */
+const MAX_UNTERMINATED_LINE = 8 * 1024 * 1024;
 
 export class StdioTransport implements JsonRpcTransport {
   readonly label: string;
@@ -77,7 +90,11 @@ export class StdioTransport implements JsonRpcTransport {
       this.options.spawnFn ?? (spawn as unknown as SpawnLike);
     const child = spawnFn(this.options.command, this.options.args ?? [], {
       cwd: this.options.cwd,
-      env: { ...process.env, ...(this.options.env ?? {}) },
+      // An MCP server is a downloaded third-party program, so it does not
+      // inherit the office's provider credentials. A server that genuinely
+      // needs a specific variable gets it through `options.env`, which the
+      // operator wrote down.
+      env: childEnv(this.options.env),
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       // No shell: the command and its arguments are passed as argv, so a server
@@ -212,9 +229,21 @@ export class StdioTransport implements JsonRpcTransport {
       if (line !== '') this.dispatch(line);
       newline = this.stdoutBuffer.indexOf('\n');
     }
-    // A server that never sends a newline must not be able to grow this buffer
-    // without bound.
-    if (this.stdoutBuffer.length > 8 * 1024 * 1024) this.stdoutBuffer = '';
+    // A peer that never sends a newline must not be able to grow this buffer
+    // without bound. Bailing out is the only option — there is nothing to parse —
+    // but it is **reported** rather than done quietly: a silent discard leaves an
+    // operator with a peer whose replies vanish and no reason why, and the bytes
+    // that were dropped are the only diagnostic there is. The stream is then
+    // treated as resynchronised, so the tail of whatever arrived lands on the
+    // newline that eventually comes.
+    if (this.stdoutBuffer.length > MAX_UNTERMINATED_LINE) {
+      const dropped = this.stdoutBuffer.length;
+      this.stdoutBuffer = '';
+      this.options.onNoise?.(
+        `discarded ${dropped} bytes with no newline in them: ${this.label} is not sending ` +
+          'newline-delimited JSON-RPC, so nothing on that stream can be parsed',
+      );
+    }
   }
 
   private dispatch(line: string): void {

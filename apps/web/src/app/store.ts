@@ -522,12 +522,18 @@ export class OfficeStore implements ClientOfficeStore {
 
   /** Selecting a run also opens its transcript: `loadRun` plus an HTTP backfill. */
   selectRun = (runId: string | null): void => {
-    if (this.sel.runId !== runId) {
+    const changed = this.sel.runId !== runId;
+    if (changed) {
       this.sel = { ...this.sel, runId };
       this.emit('selection');
     }
     if (runId) {
-      this.send({ type: 'loadRun', runId });
+      // Only ask the server to replay when the selection actually moved. Clicking
+      // the already-selected run — which is the ordinary way to "refresh" a list
+      // item — used to re-request the *entire* persisted event log, and because
+      // the delta handler appends blindly that replay concatenated the run's whole
+      // history onto the live buffer and visibly doubled its text.
+      if (changed) this.send({ type: 'loadRun', runId });
       this.ensureRunDetail(runId);
     }
   };
@@ -586,8 +592,24 @@ export class OfficeStore implements ClientOfficeStore {
     this.emit('messages');
   }
 
-  // ----------------------------------------------------- cold-start backfills
+  /**
+   * Take back an optimistic echo.
+   *
+   * Used when a direct message definitively did not go out — the HTTP fallback
+   * came back with an error. Leaving the echo would show the operator a message
+   * on screen that the office never received, and (because the waiting indicator
+   * is derived from unanswered echoes) would leave "…is thinking" on forever.
+   */
+  dropDirectMessage(employeeId: string, messageId: string): void {
+    const thread = this.messagesByEmployee[employeeId];
+    if (thread === undefined) return;
+    const next = thread.filter((message) => message.id !== messageId);
+    if (next.length === thread.length) return;
+    this.messagesByEmployee = { ...this.messagesByEmployee, [employeeId]: next };
+    this.emit('messages');
+  }
 
+  // ----------------------------------------------------- cold-start backfills
   /** Used by the `/api/state` fallback before the socket delivers `hello`. */
   applyColdState(state: OfficeState, note: string | null): void {
     if (this.officeState !== null || this.connection.hello) return;
@@ -734,6 +756,13 @@ export class OfficeStore implements ClientOfficeStore {
         break;
       case 'usage':
         this.handleUsage(event.employeeId, event.lifetime);
+        break;
+      case 'pong':
+        // The answer to our own keepalive. Deliberately inert: the socket layer
+        // already uses it to know the connection is alive, and putting it in the
+        // activity feed would fill the feed with one row every 25 seconds. It is
+        // handled explicitly rather than falling through to `default` so the
+        // exhaustiveness check above still catches a genuinely unknown frame.
         break;
       case 'log':
         this.pushFeed({
@@ -962,6 +991,16 @@ export class OfficeStore implements ClientOfficeStore {
     this.turnsByRun = { ...this.turnsByRun, [turn.runId]: { ...forRun, [turn.id]: turn } };
     this.emit('turns');
 
+    // A new turn starts with an empty buffer. Resetting here rather than only
+    // appending is what makes a replay idempotent: `loadRun` re-sends the
+    // persisted log, and without this the replayed deltas would concatenate onto
+    // whatever the live stream had already accumulated.
+    const { [turn.id]: _dropped, ...restStreaming } = this.streamingByTurn;
+    const { [turn.id]: _droppedReasoning, ...restReasoning } = this.reasoningByTurn;
+    this.streamingByTurn = restStreaming;
+    this.reasoningByTurn = restReasoning;
+    this.emit('streaming');
+
     this.updateRun(turn.runId, (run) => ({
       ...run,
       stages: run.stages.map((stage) =>
@@ -1040,7 +1079,15 @@ export class OfficeStore implements ClientOfficeStore {
     const next: EmployeeState = {
       ...employee,
       seatId: toSeatId,
-      roomId: toRoomId ?? employee.roomId,
+      // Applied as written, including a null. This used to fall back to the
+      // previous room (`toRoomId ?? employee.roomId`), so an employee moved to the
+      // bench kept the room they left — while the feed line below said "bench". The
+      // scene reads `roomId` to pick a facing, so a benched avatar went on looking
+      // at the desk it had left, and the operator's own record of the move
+      // disagreed with the state it had just written. The server emits the full
+      // `employee.updated` alongside this event, which is the authoritative record
+      // and corrects anything this event omits.
+      roomId: toRoomId,
     };
     this.setOffice({ ...state, employees: upsertById(state.employees, next) });
     this.pushFeed({
@@ -1243,7 +1290,14 @@ export class OfficeStore implements ClientOfficeStore {
     // a memory resync. Taking it here is what makes a reconnecting console - which
     // missed every `memory.created` while it was away - correct again in one step.
     this.memoryState = state.memory;
-    this.emit('office', 'selection', 'memory');
+    // Pending approvals ride along for the same reason, and it matters more: an
+    // approval blocks the office, and it was previously learned only from the two
+    // live events, so a console that refreshed or reconnected mid-approval showed
+    // nothing while the run sat waiting and its timeout ran down. Replacing
+    // rather than merging is the point — an approval decided in another tab must
+    // disappear here, not linger as a stale prompt.
+    this.approvalList = sortApprovals([...state.approvals]);
+    this.emit('office', 'selection', 'memory', 'approvals');
   }
 
   private setOffice(state: OfficeState): void {

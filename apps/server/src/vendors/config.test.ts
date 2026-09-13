@@ -134,15 +134,68 @@ test('an explicit command overrides the preset, and declared capabilities win', 
       'utf8',
     );
     const { vendors, problems } = readVendorConfigFile(path);
-    assert.deepEqual(problems, []);
     const vendor = vendors[0];
-    assert.equal(vendor?.command, '/opt/boxed/codex');
+    // A command containing a path separator is resolved against the orchestrator,
+    // not left relative — a relative path would resolve against the child's cwd,
+    // which is the run's workspace.
+    assert.equal(vendor?.command, resolve('/opt/boxed/codex'));
+    assert.ok(
+      problems.some((p) => p.includes('resolved to')),
+      `the resolution must be reported: ${problems.join(' | ')}`,
+    );
     assert.deepEqual(vendor?.args, ['exec', '-s', 'read-only']);
     assert.equal(vendor?.label, 'Boxed Codex');
     // Declared: the override wins.
     assert.equal(vendor?.capabilities.reportsFiles, false);
-    // Undeclared: the preset's value survives.
+    // Explicitly declared here, so it stands: the operator asserted it.
     assert.equal(vendor?.capabilities.readOnlyEnforcement, 'sandbox');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an override that does not declare sandbox loses the preset\u2019s sandbox claim', () => {
+  // `readOnlyEnforcement: 'sandbox'` means "the harness confines itself" and is
+  // derived from the preset's own command line (Codex's `-s read-only`). An entry
+  // that swaps the command is running something else, so inheriting the claim
+  // would present an arbitrary program to the model as "pinned to a read-only
+  // sandbox, so it cannot change any file" while the approval gate keyed off the
+  // same field stayed open.
+  const dir = mkdtempSync(join(tmpdir(), 'dev3d-vendors-'));
+  try {
+    const path = join(dir, 'vendors.json');
+    writeFileSync(
+      path,
+      JSON.stringify({
+        vendors: [{ id: 'sneaky', preset: 'codex', command: 'my-thing' }],
+      }),
+      'utf8',
+    );
+    const { vendors, problems } = readVendorConfigFile(path);
+    assert.equal(vendors[0]?.capabilities.readOnlyEnforcement, 'requested');
+    assert.ok(
+      problems.some((p) => p.includes('demoted')),
+      `the demotion must be reported, not silent: ${problems.join(' | ')}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keeping the preset command line keeps its sandbox claim', () => {
+  // The ordinary case must be unaffected: an operator who only renames a preset
+  // entry is still running the preset's sandboxed invocation.
+  const dir = mkdtempSync(join(tmpdir(), 'dev3d-vendors-'));
+  try {
+    const path = join(dir, 'vendors.json');
+    writeFileSync(
+      path,
+      JSON.stringify({ vendors: [{ id: 'boxed', preset: 'codex', label: 'Just renamed' }] }),
+      'utf8',
+    );
+    const { vendors, problems } = readVendorConfigFile(path);
+    assert.equal(vendors[0]?.capabilities.readOnlyEnforcement, 'sandbox');
+    assert.deepEqual(problems, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

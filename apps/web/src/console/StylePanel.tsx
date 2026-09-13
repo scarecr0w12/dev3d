@@ -61,6 +61,14 @@ const SCENE_COLORS: ReadonlyArray<{ key: 'background' | 'gridColor'; label: stri
   { key: 'gridColor', label: 'Ground grid' },
 ];
 
+/**
+ * Do two styles say the same thing?
+ *
+ * Defined in `app/styleEqual.ts` so the verification harness can exercise it; the
+ * reasoning lives there. Re-exported because this is where a reader looks.
+ */
+import { sameStyle } from '../app/styleEqual';
+
 export function StylePanel() {
   const store = useStore();
   const office = useOffice();
@@ -73,6 +81,24 @@ export function StylePanel() {
   const [open, setOpen] = useState(false);
   const timer = useRef<number | null>(null);
   const lastWorkspace = useRef<string>('');
+  /**
+   * The style we last sent, and the one we last *knew* the server had.
+   *
+   * `sent` is what makes an echo recognisable. The panel used to guard its
+   * "adopt the server's value" effect with `timer.current !== null` — but the
+   * timer is nulled *before* the request goes out, so for the whole round trip
+   * the guard read "not editing". Every full-state frame is a brand-new object,
+   * so any `office.updated` in that window snapped the draft back to the server's
+   * older style, and the next control the operator touched rebuilt the payload
+   * from the reset draft — a real, server-side revert of the change they had just
+   * made.
+   */
+  const sent = useRef<OfficeStyle | null>(null);
+  const lastCommitted = useRef<OfficeStyle | undefined>(committed);
+  /** Set while we are behind the server, so a genuine remote change still wins. */
+  const pending = useRef(false);
+  /** The most recent draft, for the unmount flush. */
+  const latestDraft = useRef<OfficeStyle | undefined>(committed);
 
   // Switching floors adopts that floor's style rather than keeping the draft the
   // previous one was mid-way through editing.
@@ -81,18 +107,59 @@ export function StylePanel() {
     if (lastWorkspace.current === activeId) return;
     lastWorkspace.current = activeId;
     setDraft(committed);
+    latestDraft.current = committed;
+    sent.current = null;
+    pending.current = false;
+    lastCommitted.current = committed;
   }, [activeId, committed]);
 
-  // And a style changed somewhere else - another tab, a reset - wins over a
-  // draft that is not being edited. The timer being idle is what says that.
+  /**
+   * A style changed somewhere else — another tab, a reset — wins, but only when we
+   * are not the ones it is echoing.
+   *
+   * Two things are deliberately different from the old guard: the incoming value
+   * is compared **by content** rather than by object identity, and "we have a
+   * request in flight" is tracked explicitly instead of being inferred from a
+   * debounce timer that is cleared before the send.
+   */
   useEffect(() => {
-    if (timer.current !== null) return;
+    if (committed === undefined) return;
+    const previous = lastCommitted.current;
+    lastCommitted.current = committed;
+    // Our own echo: the server now agrees with what we sent, so we are no longer
+    // behind it and the draft stays exactly as the operator left it.
+    if (sent.current !== null && sameStyle(committed, sent.current)) {
+      pending.current = false;
+      sent.current = null;
+      return;
+    }
+    // Still unacknowledged: do not snap the draft back under the operator.
+    if (pending.current) return;
+    void previous;
     setDraft(committed);
+    latestDraft.current = committed;
   }, [committed]);
 
-  useEffect(() => () => {
-    if (timer.current !== null) window.clearTimeout(timer.current);
-  }, []);
+  /**
+   * On the way out, **flush** rather than discard.
+   *
+   * Clearing a pending debounced change silently dropped a colour picked in the
+   * last few hundred milliseconds before the panel closed.
+   */
+  useEffect(() => {
+    const send = store.send;
+    return () => {
+      if (timer.current === null) return;
+      window.clearTimeout(timer.current);
+      timer.current = null;
+      const style = latestDraft.current;
+      if (style !== undefined) {
+        sent.current = style;
+        pending.current = true;
+        send({ type: 'setWorkspaceStyle', style });
+      }
+    };
+  }, [store]);
 
   /**
    * Push the draft, at most a few times a second.
@@ -103,9 +170,12 @@ export function StylePanel() {
   const commit = useCallback(
     (next: OfficeStyle) => {
       setDraft(next);
+      latestDraft.current = next;
       if (timer.current !== null) window.clearTimeout(timer.current);
       timer.current = window.setTimeout(() => {
         timer.current = null;
+        sent.current = next;
+        pending.current = true;
         store.send({ type: 'setWorkspaceStyle', style: next });
       }, COMMIT_DELAY_MS);
     },
@@ -324,6 +394,22 @@ export function StylePanel() {
                   onChange={(event) => setEnvironment('grid', event.target.checked)}
                 />
                 Ground grid
+              </label>
+              <label className="office-style-rig">
+                <span className="office-style-rig-name">Reflections</span>
+                <input
+                  type="range"
+                  className="office-style-range"
+                  min={0}
+                  max={2}
+                  step={0.05}
+                  value={resolved.environment.environmentIntensity}
+                  aria-label="Reflections"
+                  onChange={(event) => setEnvironment('environmentIntensity', Number(event.target.value))}
+                />
+                <span className="mono dim small office-style-value">
+                  {resolved.environment.environmentIntensity.toFixed(2)}
+                </span>
               </label>
             </div>
           </div>

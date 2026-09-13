@@ -84,6 +84,31 @@ function toneFor(status: VendorStatus): 'ok' | 'warn' | 'danger' | 'neutral' | '
   }
 }
 
+/**
+ * What to say when a vendor reports no activity.
+ *
+ * This was the single string "docked, nothing in flight" for every status with no
+ * activity — including `unreachable` and `errored`. For the two states an operator
+ * most needs to act on, the detail pane therefore asserted the opposite of the
+ * badge directly above it. The panel already had a total `toneFor` map; this is
+ * the same treatment for the words.
+ */
+function fallbackActivity(status: VendorStatus): string {
+  switch (status) {
+    case 'engaged':
+      return 'engaged, but it has not reported what it is doing';
+    case 'docked':
+      return 'docked, nothing in flight';
+    case 'unreachable':
+      return 'no signal — a probe did not answer';
+    case 'errored':
+      return 'faulted — see the failure below';
+    case 'offsite':
+    default:
+      return 'off site — not configured, or switched off';
+  }
+}
+
 function VendorDot({ status }: { status: VendorStatus }) {
   return <span className="dot" style={{ background: VENDOR_STATUS_COLOR[status] }} aria-hidden="true" />;
 }
@@ -106,7 +131,11 @@ function VendorRow({ vendor, selected, onSelect }: { vendor: VendorState; select
       >
         <VendorDot status={vendor.status} />
         <span className="strong">{vendor.label}</span>
-        <span className={`status status-${vendor.status}`}>{VENDOR_STATUS_LABEL[vendor.status]}</span>
+        {/* A `Badge`, not `status status-<state>`. That class matched no CSS rule
+            for any of the five vendor states, so the roster row carried no colour
+            and disagreed with the legend above it and the badge in the detail
+            pane — which is the one surface that explains a fault. */}
+        <Badge tone={toneFor(vendor.status)}>{VENDOR_STATUS_LABEL[vendor.status]}</Badge>
         <span className="dim small">{vendor.operator}</span>
         <span className="vendor-row-tail dim small mono">
           {vendor.activity !== null
@@ -297,11 +326,13 @@ export function VendorPanel() {
           <span className="mono dim">· {vendor.id}</span>
         </span>
       }
-      actions={vendor.status === 'engaged' ? <Badge tone="ok">working now</Badge> : null}
+      actions={vendor.status === 'engaged' ? <Badge tone="ok">working now</Badge> : undefined}
     >
       <div className="employee-activity">
         <div className="field-label">Current activity</div>
-        <div className="activity-line">{vendor.activity ?? <span className="dim">docked, nothing in flight</span>}</div>
+        <div className="activity-line">
+          {vendor.activity ?? <span className="dim">{fallbackActivity(vendor.status)}</span>}
+        </div>
         {vendor.detail !== null && <div className="dim small mono">{vendor.detail}</div>}
       </div>
 

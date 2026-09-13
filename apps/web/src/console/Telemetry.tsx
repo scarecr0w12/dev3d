@@ -17,16 +17,10 @@ import { api, type HealthRecordView } from '../app/api';
 import { formatAgo, formatDuration, formatInt, formatTokens, formatUsd, formatUsdExact, tierClassName } from '../app/format';
 import { useNow } from '../app/hooks';
 import { useOffice, useStore } from '../app/StoreContext';
+import { POSTURE_HINT, TIERS, modelProvenance } from '../app/vocabulary';
 import { Badge, Bar, Empty, Loading, Metric, Panel, type Tone } from './ui';
 
-const TIERS: readonly ModelTier[] = ['nano', 'small', 'standard', 'strong', 'max'];
 const POSTURES: readonly RoutingPosture[] = ['cheap', 'balanced', 'quality'];
-
-const POSTURE_HINT: Record<RoutingPosture, string> = {
-  cheap: 'always take the cheapest model that satisfies the turn',
-  balanced: 'honour each role policy, escalate only when complexity demands it',
-  quality: 'bias every turn one tier up',
-};
 
 /**
  * How a provider's model list was obtained, in words.
@@ -370,6 +364,9 @@ export function Telemetry() {
                 <th scope="col">model</th>
                 <th scope="col">best uptime</th>
                 <th scope="col">endpoints</th>
+                {/* An uptime reading is only worth what its age is worth, and the
+                    timestamp was dropped on the way to the console. */}
+                <th scope="col">read</th>
               </tr>
             </thead>
             <tbody>
@@ -388,6 +385,9 @@ export function Telemetry() {
                     {record.endpointCount > 0 && record.healthyCount === 0 && (
                       <span className="dim"> · none healthy</span>
                     )}
+                  </td>
+                  <td className="mono small dim" title={new Date(record.at).toLocaleString()}>
+                    {formatAgo(record.at, now)}
                   </td>
                 </tr>
               ))}
@@ -598,9 +598,7 @@ export function Telemetry() {
 
 /** Where a model's numbers came from, named rather than left to a colour. */
 function provenanceLabel(model: ModelSpec): string {
-  const sources = [...new Set((model.quality?.opinions ?? []).map((opinion) => opinion.source))];
-  if (sources.length === 0) return 'unrated';
-  return sources.join(' + ');
+  return modelProvenance(model);
 }
 
 function ModelRow({ model }: { model: ModelSpec }) {

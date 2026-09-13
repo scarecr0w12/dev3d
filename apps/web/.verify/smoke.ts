@@ -35,15 +35,52 @@ import type {
 import { toEmployeeState } from '@dev3d/core';
 
 import { OfficeStore } from '../src/app/store.ts';
+import { numericDraft, parseStoredNumber } from '../src/app/hooks.ts';
+import { safeHref } from '../src/app/safeHref.ts';
+import {
+  POSTURE_HINT,
+  TIERS,
+  modelProvenance,
+  planProgress,
+  planStepMark,
+  providerSourceCopy,
+  routeServeCopy,
+  statusTone,
+} from '../src/app/vocabulary.ts';
+import { sameStyle } from '../src/app/styleEqual.ts';
+import {
+  AA_NORMAL_TEXT,
+  SURFACES,
+  blendOver,
+  contrast,
+  declaredOpacity,
+  readStylesheet,
+  readTokens,
+  tokenAgainstSurfaces,
+} from './cssContrast.ts';
+import { REPLY_PATIENCE_MS, pendingEcho } from '../src/app/chat.ts';
+import { sceneSignature } from '../src/office/sceneSync.ts';
+import { toolConsent } from '../src/console/plugins/format.ts';
+import { formatUsage, reasoningShare } from '../src/app/format.ts';
+import { panelTokenStyle } from '../src/console/plugins/panelTokens.ts';
 import { paneCeiling } from '../src/app/paneGeometry.ts';
 import { FLOOR_STEP, floorOffset, floorVisibility, resolveFloorId } from '../src/office/floors.ts';
 import { Liveliness, MAX_BUBBLE_CHARS, SMALL_TALK_OPENERS, SMALL_TALK_REPLIES } from '../src/office/liveliness.ts';
 import type { LivelinessMember, LivelinessSpot } from '../src/office/liveliness.ts';
 import { buildNavGrid } from '../src/office/navgrid.ts';
 import type { ObstacleBox } from '../src/office/navgrid.ts';
-import { createAvatar } from '../src/office/avatar.ts';
-import { STYLE_ROLES, applyStyle, disposeMaterials, dressMaterials, roleForMaterial } from '../src/office/theme.ts';
-import { DEFAULT_STYLE_PRESET, STYLE_PRESETS, STYLE_PRESET_ORDER } from '@dev3d/core';
+import { createAvatar, roundRectPath } from '../src/office/avatar.ts';
+import { exteriorEdges, glazingFor, lintelNodeName, wallNodeName } from '../src/office/glazing.ts';
+import {
+  STYLE_ROLES,
+  activeTextureLibrary,
+  applyStyle,
+  disposeMaterials,
+  dressMaterials,
+  roleForMaterial,
+  setTextureLibrary,
+} from '../src/office/theme.ts';
+import { DEFAULT_STYLE_PRESET, PLUGIN_API_VERSION, STYLE_PRESETS, STYLE_PRESET_ORDER, apiCompatible, namespacedToolName } from '@dev3d/core';
 import * as THREE from 'three';
 
 let failures = 0;
@@ -123,7 +160,13 @@ const pluginRecord: PluginRecord = {
   status: 'loaded',
   error: null,
   hasCode: false,
-  contributions: { providers: 0, models: 1, skills: 1, roleTemplates: 0, pipelines: 0, routingRules: 2, tools: 0, uiPanels: 0 },
+  contributions: { providers: 0, models: 1, skills: 1, roleTemplates: 0, pipelines: 0, routingRules: 2, tools: 1, uiPanels: 0 },
+  // The host publishes the *namespaced* names it actually registered, not the
+  // bare names the manifest declared: id `dev3d.cost-guard` + tool `echo`.
+  registeredToolNames: ['dev3d_cost_guard_echo'],
+  // The host this plugin would send prompts to. A contributed provider is a
+  // destination for everything the model sees, so the card names it.
+  contributedProviderHosts: [{ id: 'local', label: 'Local runtime', host: '127.0.0.1:1234', keyless: true }],
   settings: { aggressiveness: 'balanced' },
   installedAt: 1,
 };
@@ -196,7 +239,7 @@ function turn(id: string, runId: string, stageId: string, employeeId: string): T
   };
 }
 
-function officeState(roles: Role[], runs: Run[], employees?: EmployeeState[]): OfficeState {
+function officeState(roles: Role[], runs: Run[], employees?: EmployeeState[], approvals: Approval[] = []): OfficeState {
   return {
     settings: {
       workspacesRoot: '/workspaces',
@@ -285,6 +328,7 @@ function officeState(roles: Role[], runs: Run[], employees?: EmployeeState[]): O
       vectorCoverage: 0,
     },
     vendorBay: { enabled: false, configPath: null, grantRoles: [], requireCanDelegate: true, vendors: [] },
+    approvals,
     pipelines: [
       {
         id: 'product-build',
@@ -307,6 +351,7 @@ function officeState(roles: Role[], runs: Run[], employees?: EmployeeState[]): O
         pluginId: null,
         modelSource: 'seed',
         modelSourceDetail: null,
+        local: false,
         discoveredAt: null,
       },
     ],
@@ -357,9 +402,6 @@ function apply(event: ServerEvent): void {
 function feed(...events: ServerEvent[]): void {
   for (const event of events) apply(event);
 }
-
-// TEMP: trace echo reconciliation while diagnosing.
-(globalThis as { DEV3D_TRACE?: boolean }).DEV3D_TRACE = true;
 
 console.log('office store reducer');
 
@@ -463,6 +505,29 @@ check('budget.updated applied to the run', store.state?.runs.find((entry) => ent
 check('usage applied to the employee', store.state?.employees.find((entry) => entry.id === 'frontend-dev-1')?.lifetime.tokensIn === 900);
 check('employee.moved re-seated the employee', store.state?.employees.find((entry) => entry.id === 'frontend-dev-2')?.seatId === 'Seat_Meeting_03');
 check('employee.updated applied status', store.state?.employees.find((entry) => entry.id === 'frontend-dev-1')?.status === 'blocked');
+
+// Moved to the bench, which the event spells as `toSeatId: null`. The store used to
+// keep the *previous* room in that case (`toRoomId ?? employee.roomId`) while the feed
+// line said "bench", so the record and the state it described disagreed, and the 3D
+// scene went on facing the benched avatar at the desk it had left.
+{
+  const seated = store.state?.employees.find((entry) => entry.id === 'frontend-dev-2');
+  check('the employee is in a room before the bench move', seated?.roomId === 'Anchor_Room_Meeting', seated?.roomId);
+  feed({
+    type: 'employee.moved',
+    employeeId: 'frontend-dev-2',
+    fromSeatId: 'Seat_Meeting_03',
+    toSeatId: null,
+    toRoomId: null,
+    at: 2015,
+  });
+  const benched = store.state?.employees.find((entry) => entry.id === 'frontend-dev-2');
+  check('a bench move clears the seat', benched?.seatId === null);
+  check('and clears the room, rather than keeping the one it left', benched?.roomId === null, benched?.roomId);
+  const line = store.feed.find((item) => item.kind === 'move' && item.text.includes('bench'));
+  check('the feed says bench', line !== undefined, line?.text);
+  check('and the room it moved to is not still named in the same line', (line?.text ?? '').includes('bench → bench') || (line?.text ?? '') === 'Omar moved Seat_Meeting_03 → bench', line?.text);
+}
 
 feed({
   type: 'direct.message',
@@ -583,6 +648,7 @@ const disabledPluginRecord: PluginRecord = {
   enabled: false,
   status: 'disabled',
   contributions: { providers: 0, models: 0, skills: 0, roleTemplates: 0, pipelines: 0, routingRules: 0, tools: 0, uiPanels: 0 },
+  registeredToolNames: [],
 };
 feed({
   type: 'plugins.updated',
@@ -738,6 +804,541 @@ apply({ type: 'usage', employeeId: 'frontend-dev-1', lifetime: { turns: 2, token
 check('employee state changes emit office', officeEmits === 1, officeEmits);
 offOffice();
 offStreaming();
+
+// ------------------------------------------------- approvals resync on connect
+// An approval blocks the office, and before this it could only be learned from
+// the two live events — so a refresh, a reconnect or a second tab showed nothing
+// while the run sat waiting and its timeout ran down. The state frame now
+// carries the pending list, and adopting a frame replaces it outright so an
+// approval decided elsewhere disappears here rather than lingering as a stale
+// prompt.
+{
+  const pending: Approval = {
+    id: 'approval-resync',
+    runId: 'run_1',
+    turnId: null,
+    employeeId: 'frontend-dev-1',
+    kind: 'shell',
+    summary: 'run the tests',
+    detail: '',
+    status: 'pending',
+    requestedAt: 5_000,
+    decidedAt: null,
+  };
+  const resynced = new OfficeStore();
+  resynced.apply({ type: 'hello', state: officeState([roleA], [], undefined, [pending]), at: 5_000 });
+  check(
+    'a cold console learns about a pending approval from the state frame alone',
+    resynced.approvals.length === 1 && resynced.approvals[0]?.id === 'approval-resync',
+    resynced.approvals.length,
+  );
+  // A later frame without it means it was decided elsewhere: it must vanish.
+  resynced.apply({ type: 'office.updated', state: officeState([roleA], [], undefined, []), at: 6_000 });
+  check('and a frame without it clears a stale prompt', resynced.approvals.length === 0, resynced.approvals.length);
+}
+
+// ------------------------------------------------- stored numbers and the scene guard
+// A preference read from localStorage is untrusted input. `Number.parseFloat` was
+// used, and it stops at the first unusable character — so `"420px"` read as 420
+// and `"420.5.5"` as 420.5, turning a corrupt value into one that looked
+// deliberate.
+check('a clean stored number parses', parseStoredNumber('420') === 420);
+check('and a negative one', parseStoredNumber('-1') === -1);
+check('and a decimal one', parseStoredNumber('420.5') === 420.5);
+check('and surrounding whitespace is tolerated', parseStoredNumber('  420  ') === 420);
+check('trailing garbage is refused, not truncated', parseStoredNumber('420px') === null);
+check('a doubled decimal point is refused', parseStoredNumber('420.5.5') === null);
+check('a non-number is refused', parseStoredNumber('auto') === null);
+check('an empty string is refused', parseStoredNumber('') === null);
+check('exponent notation is a number', parseStoredNumber('1e3') === 1000);
+check('and Infinity is not', parseStoredNumber('Infinity') === null);
+
+// A cleared numeric settings field must not become a zero. Emptying the
+// soft-spend box used to write `0`, which the field's own hint defines as
+// "disables the gate" — so select-all-and-delete silently turned off the control
+// that asks a human before a run keeps spending. A run budget of 0 means "no
+// ceiling", so the same guard covers it.
+check('clearing a numeric field keeps the previous value', numericDraft('', undefined, 5) === 5);
+check('and a draft already in progress wins', numericDraft('', 7, 5) === 7);
+check('a real number is taken', numericDraft('2.5', 7, 5) === 2.5);
+check('a zero the operator typed on purpose is kept', numericDraft('0', 7, 5) === 0);
+check('unparseable text keeps the previous value rather than becoming NaN', numericDraft('abc', 7, 5) === 7);
+check('and whitespace is treated as empty', numericDraft('   ', 7, 5) === 7);
+
+// Links in model output. Transcripts, artifacts and stage summaries are all
+// untrusted text, and a link is the one place that text becomes a clickable
+// navigation target — the tokenizer accepted `javascript:` straight into `<a
+// href>`, and there is no CSP behind it.
+check('https is a link', safeHref('https://example.test/x') === 'https://example.test/x');
+check('http is a link', safeHref('http://example.test/x') === 'http://example.test/x');
+check('an in-page anchor is a link', safeHref('#section') === '#section');
+check('a relative path is a link', safeHref('/docs/a.md') === '/docs/a.md');
+check('mailto is a link', safeHref('mailto:a@b.test') === 'mailto:a@b.test');
+check('javascript: is refused', safeHref('javascript:alert(1)') === null);
+check('a mixed-case javascript: is refused', safeHref('JaVaScRiPt:alert(1)') === null);
+check('data: is refused', safeHref('data:text/html,<script>x</script>') === null);
+check('vbscript: is refused', safeHref('vbscript:msgbox') === null);
+check('file: is refused', safeHref('file:///C:/Windows/win.ini') === null);
+check('a control character cannot smuggle a scheme', safeHref('java\nscript:alert(1)') === null);
+check('an empty target is not a link', safeHref('') === null);
+check('surrounding whitespace does not hide a scheme', safeHref('  javascript:alert(1)  ') === null);
+
+// Style comparison, by value. The server hands out a brand-new `office.style`
+// object on every full-state frame, so an identity check can never tell "the
+// server agreed with what I sent" from "somebody else changed this" — and the
+// style editor needs that to avoid reverting a change that is still in flight.
+{
+  const base = { preset: 'studio', environment: { exposure: 1 }, materials: { floor: { color: '#fff' } } };
+  const equal = { preset: 'studio', environment: { exposure: 1 }, materials: { floor: { color: '#fff' } } };
+  check('a structurally equal style compares equal', sameStyle(base as never, equal as never));
+  check('the same reference is equal', sameStyle(base as never, base as never));
+  check('undefined never equals a style', sameStyle(base as never, undefined) === false);
+  check('two undefineds are equal', sameStyle(undefined, undefined));
+  check(
+    'a changed scalar is a difference',
+    sameStyle(base as never, { ...base, preset: 'nordic' } as never) === false,
+  );
+  check(
+    'a changed nested field is a difference',
+    sameStyle(base as never, { ...base, environment: { exposure: 1.4 } } as never) === false,
+  );
+  check(
+    'a changed per-role material is a difference',
+    sameStyle(base as never, { ...base, materials: { floor: { color: '#000' } } } as never) === false,
+  );
+  check(
+    'an added key is a difference',
+    sameStyle(base as never, { ...base, extra: 1 } as never) === false,
+  );
+  check(
+    'a missing key is a difference',
+    sameStyle({ ...base, extra: 1 } as never, base as never) === false,
+  );
+}
+
+// The 3D scene must not re-sync for an event that cannot affect it. The store
+// hands out a fresh array on every office event, so the guard is a content
+// signature rather than an identity check.
+{
+  const base = {
+    employees: [
+      {
+        id: 'e1', roleId: 'r1', seatId: 'seat-1', status: 'working' as const,
+        displayName: 'Ada', activity: 'writing', workspaceId: 'default',
+      },
+    ],
+    roles: [{ id: 'r1', displayName: 'Dev', seatId: 'seat-1', appearance: { bodyColor: '#fff' } }],
+    workspaces: [{ id: 'default', floor: 1, layout: { updatedAt: 1 } }],
+    activeWorkspaceId: 'default',
+    selectedId: null,
+    vendors: [],
+    selectedVendorId: null,
+  } as unknown as Parameters<typeof sceneSignature>[0];
+
+  const sig = sceneSignature(base);
+  check('the same scene data gives the same signature', sceneSignature({ ...base }) === sig);
+  // A budget tick or artifact must not change it — that is the whole point.
+  const unrelated = { ...base, somethingElse: 42 } as typeof base;
+  check('an unrelated field does not change the signature', sceneSignature(unrelated) === sig);
+  // A real change must get through, or the scene would go stale.
+  const moved = {
+    ...base,
+    employees: [{ ...base.employees[0]!, status: 'blocked' as const }],
+  } as typeof base;
+  check('an employee status change does change it', sceneSignature(moved) !== sig);
+  const selected = { ...base, selectedId: 'e1' } as typeof base;
+  check('a selection change does change it', sceneSignature(selected) !== sig);
+  const otherFloor = { ...base, activeWorkspaceId: 'other' } as typeof base;
+  check('a floor switch does change it', sceneSignature(otherFloor) !== sig);
+}
+
+// ------------------------------------------------- chat waiting indicator
+// The socket path used to return before setting the "sending" flag, so the normal
+// way of sending a direct message showed no feedback at all. The indicator is now
+// derived from the thread, and these pin the derivation.
+{
+  const t = 1_000_000;
+  const user = (id: string, at: number): DirectMessage => ({
+    id, employeeId: 'e1', role: 'user', text: 'hello', at,
+  });
+  const reply = (id: string, at: number): DirectMessage => ({
+    id, employeeId: 'e1', role: 'employee', text: 'hi', at,
+  });
+
+  check('no echo means nothing is pending', pendingEcho([], t) === false);
+  check(
+    'an unanswered echo is pending',
+    pendingEcho([user('local-1', t)], t + 500) === true,
+  );
+  check(
+    'a reply after the echo settles it',
+    pendingEcho([user('local-1', t), reply('dm-2', t + 200)], t + 500) === false,
+  );
+  check(
+    'a reply *before* the echo does not settle it',
+    pendingEcho([reply('dm-0', t - 5_000), user('local-1', t)], t + 500) === true,
+  );
+  check(
+    'a server-confirmed user message with no reply is still pending',
+    pendingEcho([user('dm-1', t)], t + 500) === false,
+    'only an optimistic local echo counts as unanswered',
+  );
+  check(
+    'patience runs out rather than showing a stuck spinner',
+    pendingEcho([user('local-1', t)], t + REPLY_PATIENCE_MS + 1) === false,
+  );
+  check(
+    'and holds just inside the window',
+    pendingEcho([user('local-1', t)], t + REPLY_PATIENCE_MS - 1) === true,
+  );
+}
+
+// The HTTP fallback must be able to take back a message that never went out, or
+// the thread would show something the office never received.
+{
+  const s = new OfficeStore();
+  s.appendDirectMessage({ id: 'local-9', employeeId: 'e1', role: 'user', text: 'gone', at: 10 });
+  check('an echo can be dropped', s.directMessages['e1']?.length === 1);
+  s.dropDirectMessage('e1', 'local-9');
+  check('and it is gone afterwards', (s.directMessages['e1'] ?? []).length === 0);
+  // Dropping something that is not there is a no-op rather than an error.
+  s.dropDirectMessage('e1', 'local-9');
+  s.dropDirectMessage('nobody', 'x');
+  check('dropping an unknown message is harmless', (s.directMessages['e1'] ?? []).length === 0);
+}
+
+// The stylesheet's own palette, measured. `--text-mute` was #6c7686 — 3.56:1 on
+// the darkest surface and 4.03:1 on a panel, so below the 4.5:1 AA threshold for
+// normal text on *every* surface it is used on, at 28 sites, and on labels rather
+// than decorative chrome. Two consumers then multiplied it by `opacity`. This
+// reads the real sheet so the check cannot drift from the palette.
+{
+  const tokens = readTokens(readStylesheet());
+  check('the secondary-text token exists', tokens.has('--text-mute'), [...tokens.keys()].length);
+  check('and so do the body and panel surfaces', tokens.has('--bg') && tokens.has('--surface'));
+
+  for (const token of ['--text', '--text-dim', '--text-mute']) {
+    const rows = tokenAgainstSurfaces(tokens, token);
+    check(`${token} is measured against every surface`, rows.length === 3, rows.length);
+    for (const row of rows) {
+      check(
+        `${token} clears AA on ${row.surface}`,
+        row.ratio >= AA_NORMAL_TEXT,
+        `${row.ratio.toFixed(2)}:1`,
+      );
+    }
+  }
+  // The muted tier must stay a *dimmer* tier: equal to --text-dim would mean the
+  // palette lost a level rather than gaining contrast.
+  check(
+    'the muted token is still dimmer than the dim token',
+    (tokens.get('--text-mute') ?? '') !== (tokens.get('--text-dim') ?? ''),
+  );
+
+  // A token that passes AA on its own does not stay passing once a rule multiplies
+  // it by `opacity`. `.fact-inactive` declared `opacity: .62` over `--text-dim`,
+  // which composited to 3.55:1 — below the threshold, on text whose whole purpose
+  // is to be legible-but-historical. The declaration is read from the sheet rather
+  // than copied here, so dimming it again fails this check.
+  const sheet = readStylesheet();
+  const fadedOpacity = declaredOpacity(sheet, '.fact-inactive');
+  check('the faded-fact rule declares an opacity', fadedOpacity !== null, String(fadedOpacity));
+  if (fadedOpacity !== null) {
+    for (const surfaceToken of SURFACES) {
+      const text = tokens.get('--text-dim');
+      const surface = tokens.get(surfaceToken);
+      if (text === undefined || surface === undefined) continue;
+      const ratio = contrast(blendOver(text, surface, fadedOpacity), surface);
+      check(
+        `.fact-inactive clears AA on ${surfaceToken} at opacity ${fadedOpacity}`,
+        ratio >= AA_NORMAL_TEXT,
+        `${ratio.toFixed(2)}:1`,
+      );
+    }
+  }
+}
+
+// ------------------------------------------------- shared display vocabulary
+// These tables used to be two or three copies each, and had already drifted:
+// `POSTURE_HINT` described the same setting in two different ways, and the
+// transcript's `statusTone` had no `cancelled` case at all — it happened to be
+// right by luck, and the next status added would not have been.
+{
+  check('the tier ladder is the canonical order', TIERS.join(',') === 'nano,small,standard,strong,max');
+  check('every posture has a hint', ['cheap', 'balanced', 'quality'].every((p) => typeof POSTURE_HINT[p as 'cheap'] === 'string'));
+
+  // Every status the console can meet, including the one that was missing.
+  check('running is informational', statusTone('running') === 'info');
+  check('done is good', statusTone('done') === 'ok');
+  check('awaiting-approval warns', statusTone('awaiting-approval') === 'warn');
+  check('failed is dangerous', statusTone('failed') === 'danger');
+  check('cancelled is neutral, not a fault', statusTone('cancelled') === 'neutral');
+  check('queued is neutral', statusTone('queued') === 'neutral');
+  check('skipped is neutral', statusTone('skipped') === 'neutral');
+  // An unknown status must not throw or return undefined: `Badge` reads this.
+  check('an unknown status falls back rather than returning undefined', statusTone('whatever') === 'neutral');
+}
+
+// A provider whose model list could not be obtained reads differently depending on
+// whether it is on this machine. `local` was reported by the registry and dropped by
+// the state frame, so a local runtime that was simply not started rendered exactly
+// like a remote provider that could not be reached — an ordinary state of an install
+// presented as a fault to go and investigate.
+{
+  const base = { modelSource: 'degraded' as const, modelSourceDetail: null };
+  const local = providerSourceCopy({ ...base, local: true });
+  const remote = providerSourceCopy({ ...base, local: false });
+  check('a local runtime that is not started says so', local.label === 'not running (local)', local.label);
+  check('and warns rather than alarming', local.tone === 'warn', local.tone);
+  check('a remote provider that does not answer is a fault', remote.label === 'unreachable' && remote.tone === 'danger');
+  check('and the two are not the same wording', local.label !== remote.label);
+
+  check('a listed provider is fine', providerSourceCopy({ modelSource: 'discovered', local: false, modelSourceDetail: null }).tone === 'ok');
+  check('a never-asked provider is neutral', providerSourceCopy({ modelSource: 'seed', local: true, modelSourceDetail: null }).tone === 'neutral');
+  // The provider's own explanation wins over ours when there is one.
+  check(
+    'a detail from the server is preferred to the built-in hint',
+    providerSourceCopy({ modelSource: 'degraded', local: false, modelSourceDetail: 'connection refused' }).hint ===
+      'connection refused',
+  );
+}
+
+// Which model actually answered, as opposed to which one the router picked.
+// `servedBy`/`attemptedRoutes` were recorded by the engine (its own comment says the
+// console "should be able to say a turn ran on a fallback") and read by nothing, so
+// the transcript named the chosen model even when a different one did the work.
+{
+  const route = { modelId: 'deepseek-flash', providerId: 'deepseek' };
+
+  const plain = routeServeCopy({ route });
+  check('a turn nobody rescued names the routed model', plain.modelId === 'deepseek-flash');
+  check('and is not marked as a fallback', plain.fellBack === false);
+  check('and has nothing to explain', plain.note === null);
+
+  // A `servedBy` equal to the route is not a fallback: the field is written on every
+  // turn, so treating "present" as "fell back" would mark all of them.
+  const same = routeServeCopy({ route, servedBy: { providerId: 'deepseek', modelId: 'deepseek-flash' } });
+  check('a server that agreed is not a fallback', same.fellBack === false);
+
+  const rescued = routeServeCopy({
+    route,
+    servedBy: { providerId: 'openrouter', modelId: 'qwen/qwen3' },
+    attemptedRoutes: ['deepseek/deepseek-flash'],
+  });
+  check('the model that served the turn is the one named', rescued.modelId === 'qwen/qwen3');
+  check('and it is marked as a fallback', rescued.fellBack === true);
+  check('the reason names both models', (rescued.note ?? '').includes('deepseek-flash') && (rescued.note ?? '').includes('qwen/qwen3'), rescued.note);
+  check('and says what failed first', (rescued.note ?? '').includes('deepseek/deepseek-flash'), rescued.note);
+  check('the attempted routes are carried for the caller', rescued.attempted.length === 1);
+
+  // A fallback with no recorded attempts still explains itself rather than reading
+  // as if the first choice had simply been used.
+  const silent = routeServeCopy({ route, servedBy: { providerId: 'openrouter', modelId: 'other' } });
+  check('a fallback with no attempt list still says the first choice failed', (silent.note ?? '').includes('first choice did not answer'), silent.note);
+}
+
+// The working plan an employee keeps on a run. `AgentPlanStep`'s own doc says it is
+// run state precisely so it is "visible to the operator while the run proceeds" — and
+// it was persisted on every `run.updated`, transmitted on every frame, and drawn
+// nowhere.
+{
+  const steps = [
+    { content: 'read the parser', status: 'completed' as const },
+    { content: 'write the failing test', status: 'in_progress' as const },
+    { content: 'fix it', status: 'pending' as const },
+  ];
+  check('each status has its own mark', planStepMark('completed') !== planStepMark('in_progress') && planStepMark('in_progress') !== planStepMark('pending'));
+  check('a completed step is ticked', planStepMark('completed') === '✓', planStepMark('completed'));
+  check('progress counts only what is done', planProgress(steps) === '1 of 3 done', planProgress(steps));
+  check('an empty plan reads as none done rather than dividing by zero', planProgress([]) === '0 of 0 done', planProgress([]));
+  check(
+    'a plan where everything is finished says so',
+    planProgress(steps.map((step) => ({ ...step, status: 'completed' as const }))) === '3 of 3 done',
+  );
+}
+
+// The model provenance label, which is the *only* thing the console ever derived
+// from `quality.opinions` — an 87 kB array of a 455-model catalog that the state
+// frame no longer carries. The frame sends `quality.sources` instead, and the full
+// catalog from `GET /api/models` still has the opinions, so both shapes must
+// produce the same label.
+{
+  const base = {
+    id: 'm',
+    providerId: 'p',
+    label: 'M',
+    tier: 'standard' as const,
+    contextWindow: 1,
+    maxOutputTokens: 1,
+    costPerMTokIn: 0,
+    costPerMTokOut: 0,
+    capabilities: { tools: true, vision: false, reasoning: false, streaming: true },
+    strengths: [],
+  };
+  const opinion = (source: 'curated' | 'learned' | 'pooled') => ({ source, quality: 0.5, fitness: {}, confidence: 0.5 });
+
+  check('no quality at all reads as unrated', modelProvenance(base) === 'unrated');
+  check(
+    'the projected frame provides the label',
+    modelProvenance({ ...base, quality: { quality: 0.5, fitness: {}, sources: ['curated', 'learned'] } }) ===
+      'curated + learned',
+  );
+  check(
+    'the full catalog provides the same label',
+    modelProvenance({
+      ...base,
+      quality: { quality: 0.5, fitness: {}, opinions: [opinion('curated'), opinion('learned')] },
+    }) === 'curated + learned',
+  );
+  // The projected shape repeats a source when several opinions share one, and the
+  // label must not name it twice.
+  check(
+    'repeated sources are named once',
+    modelProvenance({ ...base, quality: { quality: 0.5, fitness: {}, sources: ['curated'] } }) === 'curated',
+  );
+  check(
+    'quality with no sources still reads as unrated',
+    modelProvenance({ ...base, quality: { quality: 0.5, fitness: {}, sources: [] } }) === 'unrated',
+  );
+}
+
+// A token count that came from the `chars/4` fallback used to be drawn exactly like
+// one the provider reported, so an estimate was indistinguishable from a bill.
+{
+  check('a reported count is drawn plain', formatUsage({ tokensIn: 1_200, tokensOut: 900 }) === '1.2K in / 900 out');
+  check(
+    'an estimated count is marked',
+    formatUsage({ tokensIn: 1_200, tokensOut: 900, estimated: true }).startsWith('~'),
+    formatUsage({ tokensIn: 1_200, tokensOut: 900, estimated: true }),
+  );
+  check('and carries the same numbers', formatUsage({ tokensIn: 1_200, tokensOut: 900, estimated: true }).slice(1) === formatUsage({ tokensIn: 1_200, tokensOut: 900 }));
+
+  // The reasoning split is only ever shown when the provider reported it: an
+  // estimate of it would be a second guess stacked on the first.
+  check('no reported split means no reasoning line', reasoningShare({ tokensIn: 1, tokensOut: 900 }) === null);
+  check('a zero split is not a line either', reasoningShare({ tokensIn: 1, tokensOut: 900, reasoningTokens: 0 }) === null);
+  check(
+    'a reported split is named with its share of the output',
+    reasoningShare({ tokensIn: 1, tokensOut: 900, reasoningTokens: 720 }) === '720 reasoning (80% of output)',
+    reasoningShare({ tokensIn: 1, tokensOut: 900, reasoningTokens: 720 }),
+  );
+  // A zero-output turn must not divide by zero into `NaN%`.
+  check(
+    'a split with no output is not a percentage',
+    reasoningShare({ tokensIn: 1, tokensOut: 0, reasoningTokens: 5 }) === '5 reasoning (0% of output)',
+  );
+}
+
+// The compatibility rule is shared with the host rather than hand-written here.
+// The console used to compare exact strings while the host compared majors, so a
+// plugin declaring `apiVersion: "1.2"` loaded perfectly and its card was painted
+// red with "host implements 1 — mismatch".
+{
+  check('the host API version is a major string', /^\d+$/.test(PLUGIN_API_VERSION));
+  check('the host is compatible with itself', apiCompatible(PLUGIN_API_VERSION));
+  check('a later minor of the same major is compatible', apiCompatible('1.2'));
+  check('an exact match is compatible', apiCompatible('1'));
+  check('a different major is not', apiCompatible('2') === false);
+  check('a different major with a minor is not', apiCompatible('2.0') === false);
+  check('an unparseable version is not compatible', apiCompatible('') === false);
+  check('nor is rubbish', apiCompatible('vNext') === false);
+}
+
+// ------------------------------------------------------ the tool consent list
+//
+// `contributes.toolNames` was documented as "for the consent screen" and read by
+// nothing, while the host tracked the real registrations and published only their
+// count. An operator deciding whether to trust a plugin needs the names of the
+// tools it now holds, and needs to see when the manifest's claim is not backed by
+// a registration.
+{
+  const backed = toolConsent(pluginRecord);
+  check('a loaded plugin reports the tools it actually holds', backed.registered.length === 1, backed.registered);
+  check('the registered name is the namespaced one, not the declared one', backed.registered[0] === 'dev3d_cost_guard_echo');
+  check('a declared tool that did register is not flagged', backed.unbacked.length === 0, backed.unbacked);
+  check('and the card is not painted as a mismatch', backed.mismatch === false);
+  check(
+    'a claim that every declared tool backed is stated, not left to be inferred',
+    (backed.hint ?? '').includes('did register'),
+    backed.hint,
+  );
+
+  // The claim with no registration behind it: the manifest names a tool, the
+  // plugin loads, and the host never sees it register. This is the whole point of
+  // comparing the two lists rather than printing the declared one.
+  const claimedOnly: PluginRecord = { ...pluginRecord, registeredToolNames: [], contributions: { ...pluginRecord.contributions, tools: 0 } };
+  const gap = toolConsent(claimedOnly);
+  check('a declared tool that never registered is flagged', gap.unbacked.join() === 'echo', gap.unbacked);
+  check('and the card is painted as a mismatch', gap.mismatch === true);
+  check('and it says what the manifest claimed', (gap.hint ?? '').includes('echo'), gap.hint);
+  check('and it still reports that it holds nothing', gap.registered.length === 0);
+
+  // A tool the host registered that the manifest never named is not a lie — the
+  // manifest's list is a claim about some tools, not a contract that it is
+  // exhaustive — so it must not be flagged in either direction.
+  const undeclared: PluginRecord = {
+    ...pluginRecord,
+    manifest: { ...pluginRecord.manifest, contributes: {} },
+    registeredToolNames: ['dev3d_cost_guard_echo', 'dev3d_cost_guard_zap'],
+  };
+  const extra = toolConsent(undeclared);
+  check('a tool the manifest did not name is still reported as held', extra.registered.length === 2);
+  check('an unnamed registration is not a mismatch', extra.mismatch === false);
+  check('with no declared names there is nothing to explain', extra.hint === null);
+
+  // A disabled plugin has registered nothing by definition. Calling that a
+  // discrepancy would put a warning on every disabled row in the console.
+  const off = toolConsent(disabledPluginRecord);
+  check('a disabled plugin is not accused of a mismatch', off.mismatch === false);
+  check('a disabled plugin is not accused of unbacked tools either', off.unbacked.length === 0);
+  check('but its manifest claim is still surfaced', (off.hint ?? '').includes('not loaded'), off.hint);
+
+  // Name matching has to survive the host's name cleaning: a declared
+  // "Echo Tool!" registers as `..._echo_tool`, which is the same tool.
+  const messy: PluginRecord = {
+    ...pluginRecord,
+    manifest: { ...pluginRecord.manifest, contributes: { toolNames: ['Echo Tool!'] } },
+    registeredToolNames: ['dev3d_cost_guard_echo_tool'],
+  };
+  check('a declared name is matched against the host-cleaned registration', toolConsent(messy).mismatch === false);
+  // Truncation: the host caps a registered name at 64 characters, so a long
+  // plugin id plus a long tool name produces a name that is *not* a suffix of the
+  // cleaned declared name. A tail-matching approximation would call this a
+  // mismatch and accuse a correct plugin of a lie.
+  const longId = `dev3d.${'department.'.repeat(4)}very-long-plugin`;
+  const longName = 'an-extremely-long-tool-name-that-will-be-cut';
+  const truncated: PluginRecord = {
+    ...pluginRecord,
+    manifest: { ...pluginRecord.manifest, id: longId, contributes: { toolNames: [longName] } },
+    registeredToolNames: [namespacedToolName(longId, longName)],
+  };
+  check('a truncated registration is still recognised as backed', toolConsent(truncated).mismatch === false);
+}
+
+// ---------------------------------------------------- plugin panel tokens
+//
+// A panel asks for its card's colours with `tokens`. The host validates them, but
+// they arrive over the socket, so the console writes only the three property
+// names it knows and never a name the payload chose.
+{
+  check('no tokens means no style attribute at all', panelTokenStyle(undefined) === undefined);
+  check('an empty token set is no style attribute either', panelTokenStyle({}) === undefined);
+  check(
+    'the three tokens map to the three custom properties',
+    JSON.stringify(panelTokenStyle({ accent: '#38bdf8', surface: '#111', text: '#eee' })) ===
+      JSON.stringify({ '--plugin-panel-accent': '#38bdf8', '--plugin-panel-surface': '#111', '--plugin-panel-text': '#eee' }),
+    panelTokenStyle({ accent: '#38bdf8', surface: '#111', text: '#eee' }),
+  );
+  // A payload key that is not a known token must not become a property name.
+  const injected = panelTokenStyle({ '--background-image': 'url(https://evil.test/beacon)', accent: 'red' });
+  check('a payload-chosen property name is not written', Object.keys(injected ?? {}).join() === '--plugin-panel-accent', injected);
+  // Only a non-empty string is a colour; anything else is left out rather than
+  // stringified into the style attribute.
+  const junk = panelTokenStyle({ accent: '' });
+  check('an empty value is not a colour', junk === undefined, junk);
+  const notString = panelTokenStyle({ accent: undefined, text: 'red' });
+  check('an absent value is skipped rather than written as "undefined"', JSON.stringify(notString) === JSON.stringify({ '--plugin-panel-text': 'red' }));
+}
 
 // ----------------------------------------------------------- cold fallback
 const cold = new OfficeStore();
@@ -910,6 +1511,7 @@ const ASSET_MATERIALS = [
   'M_Floor_Concrete', 'M_Carpet_DevFloor', 'M_Wall_Paint', 'M_Wall_Accent', 'M_Glass_Partition',
   'M_Metal_Frame', 'M_Accent_Orange', 'M_Desk_Oak', 'M_Desk_Top', 'M_Table_Meeting',
   'M_Chair_Shell', 'M_Chair_Pad', 'M_Soft_Furnishing', 'M_Rug', 'M_Plant', 'M_Screen_Emissive',
+  'M_Light_Panel',
 ];
 const unmappedNames = ASSET_MATERIALS.filter((name) => roleForMaterial(name) === null);
 check('every material in both GLBs maps to a role', unmappedNames.length === 0, unmappedNames);
@@ -930,6 +1532,25 @@ check(
 const strayMesh = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial({ name: 'Not_A_Real_Material' }));
 const strayLeftover = dressMaterials(strayMesh, styledFloor);
 check('an unrecognised material is named in the report', strayLeftover.includes('Not_A_Real_Material'), strayLeftover);
+check(
+  'and the report also lands on the style object it was handed',
+  styledFloor.unmapped.includes('Not_A_Real_Material'),
+  styledFloor.unmapped,
+);
+
+// The canvas keeps a scratch carrier holding only a palette — it re-uses one object
+// across dozens of module clones rather than allocating a whole style per clone. That
+// carrier used to be fabricated with `{ materials } as AppliedStyle`, a cast that made
+// the missing `unmapped` field look present, and the report was written into the
+// throwaway instead of anywhere real. `dressMaterials` now takes only what it reads
+// and writes the list back only when there is somewhere to write it.
+{
+  const scratch: { materials: typeof styledFloor.materials; unmapped?: string[] } = { materials: styledFloor.materials };
+  const stray = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial({ name: 'Also_Not_Real' }));
+  const reported = dressMaterials(stray, scratch);
+  check('a scratch carrier gets the report returned', reported.includes('Also_Not_Real'), reported);
+  check('and the list is written onto it too, so a caller can read it back later', scratch.unmapped?.includes('Also_Not_Real') === true, scratch.unmapped);
+}
 
 // Materials are owned per floor, so releasing one must not disturb a sibling.
 const otherFloor = applyStyle({ preset: 'nordic' });
@@ -937,6 +1558,172 @@ disposeMaterials(styledFloor.materials);
 check('releasing a floor keeps a sibling floor intact',
   otherFloor.materials.wall.color.getHexString() === 'e9e6df',
   otherFloor.materials.wall.color.getHexString());
+
+// ------------------------------------------------------------- surface relief
+//
+// A pattern used to do nothing but tint the surface it was on. It now also bakes
+// a normal map and a roughness map from the same height field, which is what
+// stops a floor reading as a *photograph* of a floor: the seams are drawn, but
+// nothing about the surface answers the light.
+//
+// That baking is pure arithmetic over 16 384 texels, which is exactly the kind of
+// thing that is wrong invisibly - a transposed axis or a mis-signed slope still
+// produces a perfectly plausible-looking normal map, and only shows up as relief
+// that is lit from the wrong side in a viewport nobody is looking at.
+
+/** The bytes behind a DataTexture, so one can be inspected without a GPU. */
+function texelBytes(texture: THREE.Texture | null): Uint8Array | null {
+  if (texture === null) return null;
+  const image = texture.image as { data?: Uint8Array } | undefined;
+  return image?.data ?? null;
+}
+
+const reliefFloor = defaultApplied.materials.floor;
+const floorTint = reliefFloor.map;
+const floorNormal = reliefFloor.normalMap;
+
+check(
+  'a patterned role is given relief, not only a tint',
+  floorTint !== null && floorNormal !== null && reliefFloor.roughnessMap !== null,
+);
+check(
+  'a plain surface is given none, because paint over plaster is flat',
+  defaultApplied.materials.wall.normalMap === null,
+  String(defaultApplied.materials.wall.normalMap),
+);
+check(
+  'the relief tiles in step with the tint it belongs to',
+  floorTint !== null && floorNormal !== null
+    && floorNormal.repeat.x === floorTint.repeat.x
+    && floorNormal.repeat.y === floorTint.repeat.y,
+);
+check('the relief maps are linear data, not colour', floorNormal?.colorSpace === THREE.NoColorSpace);
+
+// The strong one: decode the encoded normals and check they are actually normals.
+// A unit vector is what the shader assumes, and a z that has gone negative is a
+// texel lit as though the surface were inside out.
+const normalBytes = texelBytes(floorNormal);
+let offUnit = 0;
+let facingIn = 0;
+if (normalBytes) {
+  for (let at = 0; at < normalBytes.length; at += 4) {
+    const x = ((normalBytes[at] ?? 0) / 255) * 2 - 1;
+    const y = ((normalBytes[at + 1] ?? 0) / 255) * 2 - 1;
+    const z = ((normalBytes[at + 2] ?? 0) / 255) * 2 - 1;
+    // 8-bit quantisation of each channel is worth about 0.007 of length, so this
+    // is a tolerance on the encoding rather than on the maths.
+    if (Math.abs(Math.hypot(x, y, z) - 1) > 0.02) offUnit += 1;
+    if (z <= 0) facingIn += 1;
+  }
+}
+check('every baked normal is a unit vector', normalBytes !== null && offUnit === 0, `${offUnit} texels off the unit sphere`);
+check('every baked normal faces out of the surface', normalBytes !== null && facingIn === 0, `${facingIn} texels point inward`);
+
+// A roughness map *multiplies* the style's roughness, so anything above 1 would
+// silently make a surface rougher than the editor says it is.
+const roughBytes = texelBytes(reliefFloor.roughnessMap);
+let roughOutOfRange = 0;
+if (roughBytes) {
+  for (let at = 0; at < roughBytes.length; at += 4) {
+    const value = roughBytes[at + 1] ?? 0;
+    if (value < 191 || value > 255) roughOutOfRange += 1;
+  }
+}
+check(
+  'the roughness map only ever softens the style roughness',
+  roughBytes !== null && roughOutOfRange === 0,
+  `${roughOutOfRange} texels outside 0.75..1`,
+);
+
+// Relief is a knob rather than a consequence of picking a pattern, so a style can
+// ask for a patterned surface that is still flat.
+const flatFloor = applyStyle({ preset: 'studio', materials: { floor: { relief: 0 } } });
+check(
+  'a relief of zero leaves a patterned surface flat',
+  flatFloor.materials.floor.map !== null && flatFloor.materials.floor.normalMap === null,
+);
+disposeMaterials(flatFloor.materials);
+
+// ------------------------------------------------------- real material sets
+//
+// A role can be dressed with a real PBR set instead of a generated pattern -
+// albedo, normal and roughness maps at a real world scale. The library is loaded
+// by the canvas and handed in, so what is checked here is the wiring: that a set
+// is used, that it is tiled by the size the set declares rather than by the
+// pattern's guess, and that a role with no set keeps the pattern it always had.
+
+function stubTexture(name: string): THREE.Texture {
+  const texture = new THREE.Texture();
+  texture.name = name;
+  return texture;
+}
+
+setTextureLibrary({
+  floor: {
+    tileMetres: 2,
+    // A mean of 1 makes the colour division a no-op, so these checks are about the
+    // wiring; the division has a check of its own below.
+    albedoMean: [1, 1, 1],
+    map: stubTexture('stub-albedo'),
+    normalMap: stubTexture('stub-normal'),
+    roughnessMap: stubTexture('stub-rough'),
+  },
+});
+const textured = applyStyle({ preset: 'studio' });
+check(
+  'a role with a real material wears its albedo',
+  textured.materials.floor.map?.name === 'stub-albedo',
+  textured.materials.floor.map?.name,
+);
+check(
+  'and its normal and roughness maps',
+  textured.materials.floor.normalMap?.name === 'stub-normal'
+    && textured.materials.floor.roughnessMap?.name === 'stub-rough',
+);
+// tileMetres 2 means one tile per two metres, and the assets carry UVs in metres,
+// so the repeat is 1/2 - an exact figure rather than the pattern's per-module one.
+check(
+  'tiled at the real-world size the set declares',
+  Math.abs((textured.materials.floor.map?.repeat.x ?? 0) - 0.5) < 1e-6,
+  textured.materials.floor.map?.repeat.x,
+);
+check(
+  'a role with no real material keeps its generated pattern',
+  textured.materials.desk.map?.name !== 'stub-albedo',
+  textured.materials.desk.map?.name,
+);
+check('the theme reports the library it is dressing with', activeTextureLibrary() !== null);
+disposeMaterials(textured.materials);
+
+// An albedo carries a colour of its own, so the style's colour is divided by the
+// material's average rather than multiplied by it. Without that, a preset colour of
+// 0.44 lighting a concrete that already averages 0.44 renders at 0.19 - every
+// textured surface darker than the Look panel says, and a dark preset black.
+setTextureLibrary({
+  floor: {
+    tileMetres: 2,
+    albedoMean: [0.5, 0.5, 0.5],
+    map: stubTexture('mean-albedo'),
+    normalMap: stubTexture('mean-normal'),
+    roughnessMap: stubTexture('mean-rough'),
+  },
+});
+const divided = applyStyle({ preset: 'studio' });
+const wantedColour = new THREE.Color(STYLE_PRESETS['studio']?.materials.floor.color ?? '#ffffff');
+const gotColour = divided.materials.floor.color;
+check(
+  'the preset colour is divided by the albedo mean, not multiplied by it',
+  Math.abs(gotColour.r - wantedColour.r / 0.5) < 1e-4 && Math.abs(gotColour.b - wantedColour.b / 0.5) < 1e-4,
+  [gotColour.r, wantedColour.r / 0.5],
+);
+disposeMaterials(divided.materials);
+
+setTextureLibrary(null);
+check(
+  'clearing the library goes back to generated patterns',
+  applyStyle({ preset: 'studio' }).materials.floor.map?.name !== 'stub-albedo',
+  activeTextureLibrary() === null ? 'library cleared' : 'library still set',
+);
 
 // ------------------------------------------------------------ walking around
 //
@@ -1007,6 +1794,40 @@ check(
   'and it is a different region, so nobody is sent looking',
   shutRoom.regionAt(0, 0) !== shutRoom.regionAt(0, 8),
 );
+// `regions` is the count `regionAt` summarises, and nothing read it: written on
+// every build and never consulted. What is asserted here is the invariant that
+// makes the count mean something — the ids are dense from zero, and one is
+// assigned per connected piece — plus the relation sealing a room must produce.
+// (The absolute counts are not asserted: the grid is dilated by the walker's
+// radius, so an "open" room legitimately has pockets a person cannot squeeze
+// between, and hardcoding today's number would pin the furniture, not the logic.)
+{
+  const idsIn = (grid: { bounds: { minX: number; maxX: number; minZ: number; maxZ: number }; cell: number; regionAt(x: number, z: number): number }): Set<number> => {
+    const seen = new Set<number>();
+    for (let x = grid.bounds.minX; x <= grid.bounds.maxX; x += grid.cell) {
+      for (let z = grid.bounds.minZ; z <= grid.bounds.maxZ; z += grid.cell) {
+        const id = grid.regionAt(x, z);
+        if (id >= 0) seen.add(id);
+      }
+    }
+    return seen;
+  };
+
+  for (const [label, grid] of [['the open room', openRoom], ['the sealed room', shutRoom]] as const) {
+    const ids = idsIn(grid);
+    check(
+      `${label} assigns region ids densely from zero`,
+      ids.size === grid.regions && [...ids].every((id) => id >= 0 && id < grid.regions),
+      `${grid.regions} regions, ids ${[...ids].sort((a, b) => a - b).join(',')}`,
+    );
+  }
+  check('an empty floor has no regions at all', buildNavGrid([]).regions === 0);
+  check(
+    'sealing a room can only add regions, never remove one',
+    shutRoom.regions > openRoom.regions,
+    `${openRoom.regions} → ${shutRoom.regions}`,
+  );
+}
 
 // Bounds are the built extent by default. A margin here is how a walker ends up
 // strolling around the outside of the building.
@@ -1205,6 +2026,27 @@ check('a different seed is a different office', trace(5, 45) !== trace(6, 45));
   check('and its occupant gets up and walks out of it anyway', escaped);
 }
 
+// The away-count is computed once per frame now, rather than once per actor per
+// frame — it was O(N²) `hypot` calls in the growing-office case this layer is
+// built for. The optimisation is only safe if it is still the same number, so
+// this recomputes it from the published motion and compares.
+{
+  const director = new Liveliness({ seed: 5, maxWanderers: 6 });
+  const members = floor();
+  director.configure({ members, spots: SPOTS, nav: openRoom, enabled: true });
+  let mismatches = 0;
+  for (let step = 0; step < 30 * 120; step += 1) {
+    director.update(1 / 30, () => 'idle');
+    const recomputed = members.filter((member) => {
+      const motion = director.motionFor(member.id);
+      if (motion === null || motion.mode === 'seated') return false;
+      return Math.hypot(motion.x - member.home.x, motion.z - member.home.z) >= 0.4;
+    }).length;
+    if (recomputed !== director.wandering) mismatches += 1;
+  }
+  check('the away-count matches the definition it replaced', mismatches === 0, `${mismatches} mismatched frames`);
+}
+
 // A seat that moves takes its person with it, which is what sending somebody to
 // the meeting room looks like from here.
 {
@@ -1269,6 +2111,57 @@ const scope = globalThis as { document?: { createElement: (tag: string) => HTMLC
 const previousDocument = scope.document;
 scope.document = { createElement: () => stubCanvas(1, 1) };
 
+// The rounded plate both avatar kinds draw. It existed twice, and the vendor copy
+// had two corners wrong — one aimed at a diagonal control point, one passed the same
+// point twice (a degenerate `arcTo`, which draws a straight line and silently leaves
+// that corner square). It is shared now, and this pins the geometry the sharing is
+// supposed to guarantee: four arcs, each with two *distinct* control points, each
+// tangent to the edges it joins.
+{
+  type Op = { op: string; args: number[] };
+  const ops: Op[] = [];
+  const recorder = {
+    beginPath: () => ops.push({ op: 'beginPath', args: [] }),
+    moveTo: (...args: number[]) => ops.push({ op: 'moveTo', args }),
+    lineTo: (...args: number[]) => ops.push({ op: 'lineTo', args }),
+    arcTo: (...args: number[]) => ops.push({ op: 'arcTo', args }),
+    closePath: () => ops.push({ op: 'closePath', args: [] }),
+  } as unknown as CanvasRenderingContext2D;
+
+  roundRectPath(recorder, 0, 0, 100, 40, 10);
+  const arcs = ops.filter((entry) => entry.op === 'arcTo');
+  check('a rounded plate is drawn with four arcs', arcs.length === 4, arcs.length);
+  check(
+    'and every arc has two distinct control points',
+    arcs.every((arc) => arc.args[0] !== arc.args[2] || arc.args[1] !== arc.args[3]),
+    JSON.stringify(arcs.map((arc) => arc.args)),
+  );
+  check('and every arc has a positive radius', arcs.every((arc) => (arc.args[4] ?? 0) > 0));
+
+  // Each corner is tangent to the two edges it joins: the first control point sits
+  // on one edge, the second on the other. A diagonal control point — the vendor
+  // avatar's bug — fails this.
+  const corners = [
+    { p: [100, 0], edges: ['x=100', 'y=0'] },
+    { p: [100, 40], edges: ['x=100', 'y=40'] },
+    { p: [0, 40], edges: ['x=0', 'y=40'] },
+    { p: [0, 0], edges: ['x=0', 'y=0'] },
+  ];
+  arcs.forEach((arc, index) => {
+    const corner = corners[index];
+    if (corner === undefined) return;
+    const [x1, y1, x2, y2] = arc.args;
+    const onEdge = (x: number, y: number, edge: string): boolean =>
+      edge === 'x=0' ? x === 0 : edge === 'x=100' ? x === 100 : edge === 'y=0' ? y === 0 : y === 40;
+    check(
+      `corner ${index + 1} is tangent to both edges it joins`,
+      corner.edges.every((edge) => onEdge(x1 ?? 0, y1 ?? 0, edge) || onEdge(x2 ?? 0, y2 ?? 0, edge)) &&
+        (x1 === x2) !== (y1 === y2),
+      JSON.stringify(arc.args),
+    );
+  });
+}
+
 const testAvatar = createAvatar('harness-1', 'Nadia', { bodyColor: '#38bdf8', accentColor: '#075985', height: 1 });
 const avatarBody = testAvatar.group.getObjectByName('Body');
 const avatarLeg = testAvatar.group.getObjectByName('LegR');
@@ -1305,12 +2198,174 @@ check(
 check('and it settles back down at its desk', (avatarBody?.position.y ?? 1) < 0.05, avatarBody?.position.y);
 check('the legs are put away and the seat is back', avatarLeg?.visible === false && avatarSeat?.visible === true);
 check('and the bubble has faded off the screen', avatarBubble?.visible === false);
+
+// The director produces a `yaw` on every path it drives — the direction of
+// travel, the angle of a body standing about, and the turn towards a
+// conversation partner — and nothing read it. `setFacing` is only called for
+// employees the director does *not* know about, so after the first
+// `applyLiveliness()` every body kept its seat's yaw for the whole session:
+// walkers strafed sideways and two people in conversation never turned to face
+// each other, which is the opposite of what the liveliness module promises.
+{
+  const directed = createAvatar('facing-1', 'Facing', { bodyColor: '#38bdf8', accentColor: '#075985', height: 1 });
+  const targetYaw = Math.PI / 2;
+  const directedPose = { x: 0, y: 0, z: 0, yaw: targetYaw, mode: 'walking' as const, speed: 1, phase: 0, bubble: null };
+  for (let frame = 0; frame < 400; frame += 1) directed.update(1 / 30, frame / 30, false, directedPose);
+  check(
+    'a directed body faces the yaw the director produced',
+    Math.abs(directed.group.rotation.y - targetYaw) < 0.01,
+    directed.group.rotation.y,
+  );
+  // A change of direction is followed, not ignored.
+  const turned = { ...directedPose, yaw: -targetYaw };
+  for (let frame = 0; frame < 400; frame += 1) directed.update(1 / 30, frame / 30, false, turned);
+  check(
+    'and turns when the director changes it',
+    Math.abs(directed.group.rotation.y + targetYaw) < 0.01,
+    directed.group.rotation.y,
+  );
+  directed.dispose();
+}
+
 check('the pose survives being handed no motion at all', (() => {
   testAvatar.update(1 / 30, 1, false, null);
   return avatarBody?.position.y !== undefined;
 })());
 
 testAvatar.dispose();
+
+// The same figure can come from the asset pipeline instead of the primitives in
+// here, and the thing that has to hold either way is the *names*: `06_avatar.py`
+// exports a `Body`, a `LegL`/`LegR`, a `SeatedLegs`, arms and a tablet, and the
+// pose logic finds every one of them by name. So the contract is asserted against
+// a stand-in template - no filesystem, no loader - and the pose is then driven
+// exactly as it is above.
+function stubAvatarTemplate(): THREE.Object3D {
+  const root = new THREE.Group();
+  const body = new THREE.Group();
+  body.name = 'Body';
+  root.add(body);
+  const surface = new THREE.MeshStandardMaterial();
+  surface.name = 'A_Body';
+  body.add(new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 0.2), surface));
+  for (const name of ['SeatedLegs', 'LegL', 'LegR', 'ArmL', 'ArmR', 'Tablet']) {
+    const node = new THREE.Group();
+    node.name = name;
+    if (name.startsWith('Leg')) node.position.set(0, 0.5, 0);
+    body.add(node);
+  }
+  return root;
+}
+
+const modelled = createAvatar(
+  'model-1',
+  'Modelled',
+  { bodyColor: '#ff0000', accentColor: '#00ff00', height: 1 },
+  stubAvatarTemplate(),
+);
+const modelledBody = modelled.group.getObjectByName('Body');
+const modelledLeg = modelled.group.getObjectByName('LegR');
+const modelledSeat = modelled.group.getObjectByName('SeatedLegs');
+check(
+  'an avatar built from the model keeps every named part the pose needs',
+  modelledBody !== undefined && modelledLeg !== undefined && modelledSeat !== undefined,
+);
+let recoloured = false;
+modelled.group.traverse((object) => {
+  const mesh = object as THREE.Mesh;
+  if (mesh.isMesh && mesh.material instanceof THREE.MeshStandardMaterial
+    && mesh.material.color.getHexString() === 'ff0000') recoloured = true;
+});
+check('and takes the employee’s colour rather than the model’s', recoloured);
+
+const modelledWalk = { x: 1, y: 0, z: 1, yaw: 0, mode: 'walking' as const, speed: 1, phase: 0, bubble: null };
+for (let frame = 0; frame < 60; frame += 1) modelled.update(1 / 30, frame / 30, false, modelledWalk);
+check('a modelled body rises onto its legs', (modelledBody?.position.y ?? 0) > 0.4, modelledBody?.position.y);
+check(
+  'and swaps its seat for legs, the same as a procedural one',
+  modelledLeg?.visible === true && modelledSeat?.visible === false,
+);
+modelled.dispose();
+
+// ------------------------------------------------------- glazing a grown wing
+//
+// Which of a module's walls face outside is decided by the layout engine, not by
+// the kit, so the browser is the first place that knows — and this is planar
+// geometry that a screenshot cannot check: a wing with windows on it looks the same
+// whether the right walls were chosen or not. Hence the arithmetic, asserted.
+
+const glazingSizes = new Map([
+  ['pod4', { width: 8, depth: 6 }],
+  ['duo2', { width: 4, depth: 6 }],
+]);
+const glazingSizeOf = (kind: string) => glazingSizes.get(kind) ?? null;
+const farCore = { minX: 500, maxX: 520, minZ: 500, maxZ: 520 };
+
+const lone = { id: 'a', kind: 'pod4', x: 0, z: 0, rotation: 0 };
+check(
+  'a module standing on its own has four outside walls',
+  exteriorEdges(lone, [lone], glazingSizeOf, farCore).join(',') === 'n,e,s,w',
+  exteriorEdges(lone, [lone], glazingSizeOf, farCore).join(','),
+);
+
+// Two 8 m modules meeting at x = 4. They share corners on their long walls, which
+// is the case that a naive "is any sample blocked" test gets wrong.
+const west = { id: 'a', kind: 'pod4', x: 0, z: 0, rotation: 0 };
+const east = { id: 'b', kind: 'pod4', x: 8, z: 0, rotation: 0 };
+const pair = [west, east];
+check(
+  'a wall shared with the next module is not an outside wall',
+  !exteriorEdges(west, pair, glazingSizeOf, farCore).includes('e')
+    && !exteriorEdges(east, pair, glazingSizeOf, farCore).includes('w'),
+  `${exteriorEdges(west, pair, glazingSizeOf, farCore).join(',')} / ${exteriorEdges(east, pair, glazingSizeOf, farCore).join(',')}`,
+);
+check(
+  'and the walls that merely share a corner still are',
+  exteriorEdges(west, pair, glazingSizeOf, farCore).sort().join(',') === 'n,s,w',
+  exteriorEdges(west, pair, glazingSizeOf, farCore).join(','),
+);
+
+// A module bolted to the core: the core is a neighbour, so the shared wall is not
+// glazed and its rooms are not left open to the lobby.
+const onCore = { id: 'a', kind: 'duo2', x: 13.3, z: 0, rotation: 0 };
+const core = { minX: -11.3, maxX: 11.3, minZ: -8.3, maxZ: 8.3 };
+check(
+  'a wall against the core is not an outside wall',
+  !exteriorEdges(onCore, [onCore], glazingSizeOf, core).includes('w'),
+  exteriorEdges(onCore, [onCore], glazingSizeOf, core).join(','),
+);
+
+// The glazing itself. The sill is the load-bearing part: hiding a wall deletes an
+// obstacle, so without something in the nav band a window becomes a way out.
+const glazing = glazingFor(west, 'e', { width: 8, depth: 6 });
+const sill = glazing.getObjectByName('a::Glaze_Sill') as THREE.Mesh | undefined;
+const glass = glazing.getObjectByName('a::Glaze_Glass') as THREE.Mesh | undefined;
+check('glazing a wall builds a sill, glass and frame', sill !== undefined && glass !== undefined);
+if (sill) {
+  sill.geometry.computeBoundingBox();
+  const box = sill.geometry.boundingBox as THREE.Box3;
+  check(
+    'and the sill spans the band the walkability grid samples',
+    box.min.y < 0.25 && box.max.y > 0.25,
+    [box.min.y, box.max.y],
+  );
+  check(
+    'and reaches the full length of the wall it replaced',
+    Math.abs((box.max.z - box.min.z) - 6) < 1e-6,
+    box.max.z - box.min.z,
+  );
+}
+check(
+  'the glazing is named so the floor can dress it by role',
+  (glass?.material as THREE.Material | undefined)?.name === 'W_Glass',
+  (glass?.material as THREE.Material | undefined)?.name,
+);
+check(
+  'and the wall it replaces can be found by name',
+  wallNodeName('pod4', 'e') === 'Block_pod4_Wall_E_0'
+    && lintelNodeName('pod4', 'e') === 'Block_pod4_Wall_E_Lintel_0',
+);
+
 if (previousDocument === undefined) delete scope.document;
 else scope.document = previousDocument;
 

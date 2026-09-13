@@ -43,6 +43,16 @@ export interface ProviderStatus {
   modelSource: 'discovered' | 'degraded' | 'seed';
   /** Why discovery failed, when it did. */
   modelSourceDetail: string | null;
+  /**
+   * Whether this provider's endpoint is on this machine.
+   *
+   * The registry has always known this and the console never did, so a local
+   * runtime that simply was not started rendered exactly like a remote provider
+   * that could not be reached — an expected state of an install (Ollama is off)
+   * presented as a fault to investigate. The point of the flag, in the registry's
+   * own words, is to "tell an expected downtime from an actionable one".
+   */
+  local: boolean;
   /** When the model list was last obtained, in epoch milliseconds. */
   discoveredAt: number | null;
 }
@@ -212,6 +222,17 @@ export interface OfficeState {
    * vendor is not given an `EmployeeState`.
    */
   vendorBay: VendorBay;
+  /**
+   * Approvals waiting on a human right now.
+   *
+   * Carried in the state frame because an approval is the one thing that stops
+   * the office dead, and it had no way back into a console that did not watch it
+   * arrive: `approvalList` was written only by the two live events, so a
+   * refresh, a reconnect or a second tab showed nothing while the run sat
+   * blocked and its timeout counted down. The server already had the data
+   * (`runtime.pendingApprovals()`); only the transport was missing.
+   */
+  approvals: Approval[];
   /** Server build info, shown in the office footer. */
   version: string;
   startedAt: number;
@@ -219,6 +240,17 @@ export interface OfficeState {
 
 export type ServerEvent =
   | { type: 'hello'; state: OfficeState; at: number }
+  /**
+   * Liveness, and nothing else.
+   *
+   * The client pings every 25 seconds to keep the socket alive. That ping used
+   * to be answered with a full `office.updated` carrying the entire office state
+   * — ~293 KB, of which the model catalog is 240 KB — so one open console pulled
+   * ~42 MB an hour, re-rendered every subscriber including the 3D canvas, and
+   * appended a junk lifecycle row to its own activity feed, forever. A heartbeat
+   * should carry a heartbeat.
+   */
+  | { type: 'pong'; at: number }
   | { type: 'office.updated'; state: OfficeState; at: number }
   /** The active organisation's chart changed. Carries which one. */
   | { type: 'org.updated'; workspaceId: string; org: OrgChart; at: number }

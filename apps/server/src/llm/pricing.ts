@@ -10,7 +10,15 @@ import type { ModelSpec } from '@dev3d/core';
 
 /** USD for a call of `tokensIn` input and `tokensOut` output tokens. */
 export function computeCost(model: ModelSpec, tokensIn: number, tokensOut: number): number {
-  return (model.costPerMTokIn * tokensIn + model.costPerMTokOut * tokensOut) / 1_000_000;
+  const cost = (model.costPerMTokIn * tokensIn + model.costPerMTokOut * tokensOut) / 1_000_000;
+  // Clamped at zero, and finite. A cost is money spent, so a negative total is
+  // never a truth to propagate: it would subtract from `run.budget.spentUsd` and
+  // let the spend ceiling — the control that is supposed to always halt a run —
+  // be refunded away. The manifest validator rejects a negative rate up front;
+  // this is the second line, because `pricing.ts` is the one place every adapter
+  // and the router agree on.
+  if (!Number.isFinite(cost) || cost < 0) return 0;
+  return cost;
 }
 
 /**

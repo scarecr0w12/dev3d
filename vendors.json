@@ -1,0 +1,17 @@
+{
+  "$comment": [
+    "Third-party agent harnesses for the dev3d office. This file is deliberately",
+    "EMPTY.",
+    "",
+    "It exists because DEV3D_VENDORS_CONFIG names it, and a pointed-at file that",
+    "is absent is reported at every boot. An empty `vendors` array is the honest",
+    "answer: the setting is satisfied and no harness is configured.",
+    "",
+    "For one or two presets, DEV3D_VENDORS in .env is usually enough -",
+    "DEV3D_VENDORS=\"codex;dsh;hermes\". Use this file (see vendors.json.example)",
+    "for anything that needs a different binary, extra arguments, a longer",
+    "timeout, or a vendor with no preset at all. It wins on an id collision with",
+    "DEV3D_VENDORS, because it is the richer source."
+  ],
+  "vendors": []
+}

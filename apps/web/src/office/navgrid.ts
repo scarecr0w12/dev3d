@@ -98,8 +98,13 @@ const DEFAULT_CELL = 0.2;
 const DEFAULT_RADIUS = 0.26;
 const DEFAULT_SNAP = 1.2;
 
-/** The extent a set of obstacles covers, or null when there are none. */
-export function navBoundsOf(boxes: readonly ObstacleBox[]): NavBounds | null {
+/**
+ * The extent a set of obstacles covers, or null when there are none.
+ *
+ * Not exported: nothing outside this module has ever called it, and an `export`
+ * with no reader is a promise to other code that this is a supported entry point.
+ */
+function navBoundsOf(boxes: readonly ObstacleBox[]): NavBounds | null {
   let minX = Number.POSITIVE_INFINITY;
   let minZ = Number.POSITIVE_INFINITY;
   let maxX = Number.NEGATIVE_INFINITY;
@@ -367,16 +372,25 @@ export function buildNavGrid(boxes: readonly ObstacleBox[], options: NavGridOpti
     closed.fill(0);
     gScore[startIndex] = 0;
 
-    const endX = endPoint.x;
-    const endZ = endPoint.z;
-    /** Octile distance: the real cost of moving on an eight-way grid. */
+    /**
+     * Octile distance in **cells**, which is the unit the accumulated cost is in.
+     *
+     * This used to be computed in metres — `Math.abs(centreX(col) - endX)` — while
+     * `gScore` accumulates cell steps (`1` or `Math.SQRT2`). One cell is `cell`
+     * metres, so the heuristic was under-scaled by that factor: at the shipped
+     * 0.2 m cell it was 5× too small, which makes A* degenerate towards Dijkstra
+     * and expand far more nodes than it needs to (and is what made the pop guard
+     * reachable at all). For a caller passing a *larger* cell it became
+     * inadmissible, which can return a non-optimal route — and `cell` is public
+     * API, with the harness already exercising 0.25.
+     */
     const heuristic = (index: number): number => {
       const col = index % cols;
       const row = (index - col) / cols;
-      const dx = Math.abs(centreX(col) - endX);
-      const dz = Math.abs(centreZ(row) - endZ);
+      const dx = Math.abs(col - endCell.col);
+      const dz = Math.abs(row - endCell.row);
       const diagonal = Math.min(dx, dz);
-      return (dx + dz - diagonal) + diagonal * Math.SQRT2;
+      return dx + dz - diagonal + diagonal * Math.SQRT2;
     };
 
     const open = new CellHeap();

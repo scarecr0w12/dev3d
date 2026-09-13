@@ -16,6 +16,7 @@ import type { ClientCommand, Run, RunStatus } from '@dev3d/core';
 import { formatElapsed, formatPercent, formatUsd, truncate } from '../app/format';
 import { useNow } from '../app/hooks';
 import { useOffice, useSelection, useStore } from '../app/StoreContext';
+import { statusTone } from '../app/vocabulary';
 import { Badge, cx } from './ui';
 import type { Tone } from './ui';
 
@@ -29,24 +30,6 @@ const FILTERS: readonly { id: Filter; label: string }[] = [
 ];
 
 const ACTIVE: ReadonlySet<RunStatus> = new Set<RunStatus>(['queued', 'running', 'awaiting-approval', 'paused']);
-
-function statusTone(status: RunStatus): Tone {
-  switch (status) {
-    case 'running':
-      return 'info';
-    case 'done':
-      return 'ok';
-    case 'awaiting-approval':
-    case 'paused':
-      return 'warn';
-    case 'failed':
-      return 'danger';
-    case 'cancelled':
-    case 'queued':
-    default:
-      return 'neutral';
-  }
-}
 
 export function RunSwitcher() {
   const store = useStore();

@@ -188,29 +188,6 @@ export function useMemory(): MemoryState {
 
 // ------------------------------------------------------------- derived slices
 
-export interface EmployeeView {
-  employee: EmployeeState | null;
-  role: Role | null;
-  department: Department | null;
-}
-
-export function useEmployeeView(employeeId: string | null): EmployeeView {
-  const office = useOffice();
-  return useMemo<EmployeeView>(() => {
-    if (!office || !employeeId) return { employee: null, role: null, department: null };
-    const employee = office.employees.find((candidate) => candidate.id === employeeId) ?? null;
-    const roleId = employee ? employee.roleId : employeeId;
-    const role = office.roles.find((candidate) => candidate.id === roleId) ?? null;
-    const department = role ? office.departments.find((candidate) => candidate.id === role.departmentId) ?? null : null;
-    return { employee, role, department };
-  }, [office, employeeId]);
-}
-
-export function useSelectedEmployeeView(): EmployeeView {
-  const selection = useSelection();
-  return useEmployeeView(selection.employeeId);
-}
-
 export function useRun(runId: string | null): Run | null {
   const office = useOffice();
   return useMemo(() => {
@@ -262,16 +239,4 @@ export function useRunTurns(run: Run | null): RunTurns {
 export interface StageTurns {
   stage: StageRun;
   turns: TurnRecord[];
-}
-
-export function useStageTurns(run: Run | null, runTurns: RunTurns): StageTurns[] {
-  return useMemo(() => {
-    if (!run) return [];
-    return run.stages.map((stage) => ({
-      stage,
-      turns: stage.turnIds
-        .map((turnId) => runTurns.byId[turnId])
-        .filter((turn): turn is TurnRecord => turn !== undefined),
-    }));
-  }, [run, runTurns]);
 }

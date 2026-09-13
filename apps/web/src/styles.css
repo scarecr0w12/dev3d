@@ -23,7 +23,16 @@
 
   --text: #e6e9ef;
   --text-dim: #9aa4b5;
-  --text-mute: #6c7686;
+  /*
+   * Secondary text — labels, hints, metric captions — at 28 sites.
+   *
+   * Was `#6c7686`, which measured 4.36:1 on the body background, 4.03:1 on a
+   * panel and 3.56:1 on surface-3: below the 4.5:1 AA threshold for normal text on
+   * *every* surface it is used on, and these are labels rather than decorative
+   * chrome. `#8b95a5` is the lightest value that is no longer a second `--text-dim`
+   * while clearing AA everywhere (5.40:1 at worst).
+   */
+  --text-mute: #8b95a5;
 
   --accent: #38bdf8;
   --accent-soft: rgba(56, 189, 248, 0.14);
@@ -38,6 +47,10 @@
 
   --radius: 10px;
   --radius-sm: 6px;
+  /* Between the two. `--radius-md` was *used* in `.office-style-body` with no
+     definition and no fallback, so the declaration was invalid and the radius
+     computed to 0 — a silent visual regression with no error anywhere. */
+  --radius-md: 8px;
   --gap: 10px;
 
   --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
@@ -754,15 +767,50 @@ textarea {
   border-color: rgba(248, 113, 113, 0.5);
 }
 
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 1px 7px;
-  border-radius: 999px;
-  border: 1px solid var(--border-strong);
-  font-size: 11px;
-  color: var(--text-dim);
+/* The two employee states that had no rule. `offline` is deliberately the
+   quietest thing on the floor: an employee who is switched off should not draw
+   the eye, and the palette already uses slate for "absent". */
+.status-offline {
+  color: #b6c2d4;
+  border-color: rgba(51, 65, 85, 0.75);
+}
+
+.status-idle {
+  color: #bfe9ff;
+  border-color: rgba(56, 189, 248, 0.45);
+}
+
+/*
+ * The vendor vocabulary. None of the five matched before, so a vendor that was
+ * `errored` and one that was `offsite` rendered identically — the bay lost its
+ * entire colour language, and the *data* for it (VENDOR_STATUS_COLOR in
+ * app/status.ts) was correct all along. These mirror that table, and the colours
+ * are shared with the employee variants above wherever the meaning is the same,
+ * so a legend stays readable.
+ */
+.status-offsite {
+  color: #b6c2d4;
+  border-color: rgba(71, 85, 105, 0.7);
+}
+
+.status-unreachable {
+  color: #ffdca8;
+  border-color: rgba(245, 158, 11, 0.5);
+}
+
+.status-docked {
+  color: #bfe9ff;
+  border-color: rgba(56, 189, 248, 0.45);
+}
+
+.status-engaged {
+  color: #d5f5a8;
+  border-color: rgba(163, 230, 53, 0.45);
+}
+
+.status-errored {
+  color: #ffc4c4;
+  border-color: rgba(248, 113, 113, 0.5);
 }
 
 .tier {
@@ -1347,10 +1395,19 @@ textarea {
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 }
 
-/* A fact that stopped being true stays legible but stops competing for
-   attention with the ones that are current. Dimmed, never hidden. */
+/*
+ * A fact that stopped being true stays legible but stops competing for attention
+ * with the ones that are current. Dimmed, never hidden.
+ *
+ * The value is 0.8 because 0.62 was below AA: it composited `--text-dim` to 3.55:1
+ * on `--surface` and 3.36:1 on `--surface-3`, against the 4.5:1 that text needs —
+ * for text whose whole purpose is to be *legible* but historical. 0.8 is the
+ * smallest step that clears AA on the darkest panel (`--surface-3`, 4.68:1) while
+ * still reading as faded; `smoke.ts` recomputes it from this declaration so
+ * dimming it further fails a test rather than a reader.
+ */
 .fact-inactive {
-  opacity: 0.62;
+  opacity: 0.8;
 }
 
 .fact-head {
@@ -2218,13 +2275,18 @@ textarea {
   line-height: 1.45;
 }
 
+/*
+ * The two hints used to stack `opacity` on top of the muted token — .7 here and
+ * .75 below — which composited the contrast back down to roughly 2.6:1 and 2.9:1
+ * and undid the whole point of `--text-mute` clearing AA. The token is the
+ * dimmer tier now, so the multiplication is gone.
+ */
 .kbd-hint {
   margin-left: 5px;
   padding: 0 3px;
   border: 1px solid var(--border-strong);
   border-radius: 3px;
   font-size: 9.5px;
-  opacity: 0.75;
 }
 
 .header-jump {
@@ -2394,6 +2456,7 @@ textarea {
 
 .run-objective,
 .run-outcome,
+.run-plan,
 .stage-summary,
 .stage-instruction {
   margin-top: 6px;
@@ -2401,6 +2464,53 @@ textarea {
   border-radius: var(--radius-sm);
   padding: 6px 8px;
   background: rgba(255, 255, 255, 0.012);
+}
+
+/* The working plan: a checklist, so progress and the next step read at a glance. */
+.plan-steps {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.plan-step {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+/* Done steps stop competing for attention; the step in hand is the one that stands out. */
+.plan-step-completed .plan-step-text {
+  text-decoration: line-through;
+  opacity: 0.8;
+}
+
+.plan-step-in_progress .plan-step-text {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.plan-step-mark {
+  width: 10px;
+  flex: 0 0 auto;
+  color: var(--text-mute);
+}
+
+.plan-step-in_progress .plan-step-mark {
+  color: #38bdf8;
+}
+
+.plan-step-text {
+  flex: 1 1 auto;
+}
+
+.plan-step-status {
+  flex: 0 0 auto;
 }
 
 .run-outcome {
@@ -2500,6 +2610,15 @@ details > summary::-webkit-details-marker {
   margin: 6px 0;
 }
 
+/*
+ * Artifacts the run produced as a whole, which carry no stage id and therefore had
+ * no stage to be listed under. Drawn as a stage card so it reads as part of the same
+ * record, with a dashed edge to mark it as not being one of the pipeline's stages.
+ */
+.stage-run-artifacts {
+  border-style: dashed;
+}
+
 .artifact-inline {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -2563,6 +2682,17 @@ details > summary::-webkit-details-marker {
 
 .turn-route-reason {
   border-left: 2px solid var(--border-strong);
+  padding-left: 6px;
+  margin-bottom: 6px;
+}
+
+/*
+ * "a fallback answered". Marked, because the model named in the turn header is the
+ * one that *served* the turn and the router's own choice is different whenever this
+ * is on screen — an operator reading only the model name would credit the wrong one.
+ */
+.turn-route-fallback {
+  border-left: 2px solid #f59e0b;
   padding-left: 6px;
   margin-bottom: 6px;
 }
@@ -2889,7 +3019,9 @@ details > summary::-webkit-details-marker {
      fallbacks for the first paint and for anything rendering outside the stage. */
   --inspector-width: var(--popout-width);
   --inspector-height: auto;
-  --inspector-bottom-inset: 112px;
+  /* `--inspector-bottom-inset` was declared here and read by nothing — the
+     inspector's bottom edge comes from `--popout-bottom` and the dock height. A
+     custom property with no reader is a knob that looks adjustable and is not. */
 }
 
 .stage {
@@ -3727,7 +3859,7 @@ body.is-resizing {
 }
 
 .dock-hint {
-  opacity: 0.7;
+  /* See `.kbd-hint`: the opacity was undoing the contrast the token now carries. */
 }
 
 .dock-detail {
@@ -4253,6 +4385,32 @@ body.is-resizing {
   padding-top: 6px;
 }
 
+/*
+ * Where a plugin would send the office's prompts. Same shape as the tool and
+ * permission blocks: this is the third thing an operator has to weigh before
+ * enabling a plugin, and it was the one the card never showed at all.
+ */
+.plugin-endpoints {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
+/*
+ * The live tool list, as opposed to the manifest's claim. Same shape as the
+ * permissions block on purpose: both are "what this plugin can do to you", read
+ * together, so they should not look like different kinds of thing.
+ */
+.plugin-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
 .plugin-perm-list {
   display: flex;
   flex-direction: column;
@@ -4360,14 +4518,20 @@ body.is-resizing {
   gap: 8px;
 }
 
+/*
+ * A panel a plugin painted with `tokens.accent` / `.surface` / `.text`. The
+ * fallbacks are this card's original look, so an untokened panel is unchanged.
+ */
 .plugin-panel {
   display: flex;
   flex-direction: column;
   gap: 6px;
   padding: 10px 12px;
   border: 1px solid var(--border);
+  border-left: 3px solid var(--plugin-panel-accent, var(--border));
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.012);
+  background: var(--plugin-panel-surface, rgba(255, 255, 255, 0.012));
+  color: var(--plugin-panel-text, inherit);
 }
 
 .plugin-panel-head {
@@ -4378,6 +4542,7 @@ body.is-resizing {
 
 .plugin-panel-title {
   font-weight: 600;
+  color: var(--plugin-panel-accent, inherit);
 }
 
 .plugin-panel-summary {

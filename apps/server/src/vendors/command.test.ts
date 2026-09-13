@@ -200,6 +200,74 @@ test('an already-aborted signal kills the process without waiting for the event'
   assert.equal(child.killSignal, 'SIGKILL');
 });
 
+test('a kill that never produces a close still ends the delegation', async () => {
+  // The wedge this pins: `settle` was reachable only from `error` and `close`,
+  // and `close` fires when the child's stdio closes — which is not the same as
+  // the process exiting. A harness that leaves a grandchild holding the pipes
+  // (the `npx` case the module comment names) never emits `close` at all, so the
+  // promise never settled: the turn hung and, because the runtime had already
+  // marked the vendor `engaged`, every later delegation to it was refused until
+  // the office restarted. The timeout is a ceiling on the delegation, so it has
+  // to actually end it.
+  class NeverCloses extends FakeChild {
+    override kill(): boolean {
+      this.killCount += 1;
+      this.killSignal = 'SIGKILL';
+      // Deliberately never closes.
+      return true;
+    }
+  }
+  const child = new NeverCloses({ stdin: false });
+  const { spawnFn } = spawnReturning(child);
+
+  const started = Date.now();
+  const result = await runVendorCommand({
+    command: 'npx',
+    args: ['-y', 'some-harness'],
+    prompt: 'task',
+    promptTransport: 'argv',
+    cwd: CWD,
+    timeoutMs: 30,
+    spawnFn,
+  });
+  const elapsed = Date.now() - started;
+
+  assert.equal(result.outcome, 'timeout', 'the delegation must settle as a timeout, not hang');
+  assert.match(result.detail, /did not finish within 30ms/);
+  assert.equal(child.killSignal, 'SIGKILL');
+  // Bounded by the kill grace, not by a client timeout somewhere far above.
+  assert.ok(elapsed < 10_000, `settled after ${elapsed}ms`);
+});
+
+test('an abort that never produces a close still ends the delegation', async () => {
+  class NeverCloses extends FakeChild {
+    override kill(): boolean {
+      this.killCount += 1;
+      this.killSignal = 'SIGKILL';
+      return true;
+    }
+  }
+  const child = new NeverCloses({ stdin: false });
+  const { spawnFn } = spawnReturning(child);
+  const controller = new AbortController();
+
+  const pending = runVendorCommand({
+    command: 'npx',
+    args: ['-y', 'some-harness'],
+    prompt: 'task',
+    promptTransport: 'argv',
+    cwd: CWD,
+    timeoutMs: 60_000,
+    signal: controller.signal,
+    spawnFn,
+  });
+  controller.abort();
+  const result = await pending;
+
+  assert.equal(result.outcome, 'aborted', 'a Cancel must end the delegation even if the child never closes');
+  assert.equal(child.killSignal, 'SIGKILL');
+});
+
 test('a process that cannot start is unstartable, with the EPERM hint when that is why', async () => {
   const missing = new FakeChild({ stdin: false });
   missing.failToStart('ENOENT', 'spawn codex ENOENT');

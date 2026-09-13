@@ -44,6 +44,7 @@ import * as THREE from 'three';
 import type { VendorStatus } from '@dev3d/core';
 
 import type { Avatar } from './avatar.ts';
+import { roundRectPath } from './avatar.ts';
 import { VENDOR_STATUS_COLOR, VENDOR_STATUS_LABEL, VENDOR_STATUS_STYLE } from '../app/status.ts';
 
 /** The screen's canvas, in pixels. Roughly the panel's own aspect. */
@@ -64,20 +65,14 @@ export function defaultVendorColor(index: number): string {
   return VENDOR_PALETTE[safe] ?? '#38bdf8';
 }
 
-function roundRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
-  const radius = Math.min(r, h / 2, w / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + radius, y);
-  ctx.lineTo(x + w - radius, y);
-  ctx.arcTo(x + w, y, x + w - radius, y + radius, radius);
-  ctx.lineTo(x + w, y + h - radius);
-  ctx.arcTo(x + w, y + h - radius, x + w, y + h - radius, radius);
-  ctx.lineTo(x + radius, y + h);
-  ctx.arcTo(x, y + h, x, y + h - radius, radius);
-  ctx.lineTo(x, y + radius);
-  ctx.arcTo(x, y, x, y + radius, radius);
-  ctx.closePath();
-}
+/*
+ * A local `roundRectPath` used to sit here, copied from the employee avatar's and
+ * subtly wrong: its top-right corner aimed at a diagonal control point, and its
+ * bottom-right passed the same point twice — a degenerate `arcTo`, which draws a
+ * straight line, so that corner was square while the other three were round. The
+ * plate is small and the difference reads as "slightly off" rather than as a bug,
+ * which is exactly why nobody reported it. The shared one is imported instead.
+ */
 
 export interface VendorAvatarOptions {
   /** The vendor's own colour, or one derived from its position in the bay. */

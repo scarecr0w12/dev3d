@@ -25,7 +25,6 @@ import { SettingsPanel } from './SettingsPanel';
 import { SkillsPanel } from './SkillsPanel';
 import { Telemetry } from './Telemetry';
 import { VendorsBayPanel } from './VendorsPanel';
-import { Badge } from './ui';
 
 /** Two independently scrolling columns, which is what a dense page wants. */
 function Columns({ left, right }: { left: ReactNode; right: ReactNode }) {
@@ -179,10 +178,4 @@ export function PluginsPage() {
       <PluginsPanels />
     </Single>
   );
-}
-
-/** Small helper used by the shell to badge a tab. */
-export function CountBadge({ count, tone }: { count: number; tone?: 'warn' | 'info' }) {
-  if (count <= 0) return null;
-  return <Badge tone={tone ?? 'neutral'}>{count}</Badge>;
 }

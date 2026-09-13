@@ -106,8 +106,23 @@ export interface QualityOpinion {
 export interface ModelQuality {
   quality: number;
   fitness: Partial<Record<TaskClass, number>>;
-  /** Every opinion that produced the blend, so any number can be explained. */
-  opinions: QualityOpinion[];
+  /**
+   * Every opinion that produced the blend, so any number can be explained.
+   *
+   * Optional, and **absent from the state frame**: it is 87 kB of the 455-model
+   * catalog, 30% of the whole initial payload, and the console reads exactly one
+   * thing out of it — the set of source names behind the number, which is what
+   * `sources` carries. The full list is served by `GET /api/models` for anything
+   * that wants to explain a score rather than name it.
+   */
+  opinions?: QualityOpinion[];
+  /**
+   * The distinct sources that contributed an opinion, in no particular order.
+   *
+   * The projection of `opinions` that the console actually displays, so a model's
+   * provenance survives the state frame's size budget.
+   */
+  sources?: string[];
 }
 
 /**
@@ -155,6 +170,16 @@ export interface ModelSpec {
    * instead of presenting a guess as a fact.
    */
   unrated?: boolean;
+  /**
+   * True when the operator has switched this model off for the installation.
+   *
+   * It stays in the catalog and carries this flag rather than being filtered out,
+   * because the console has to be able to show it in order to switch it back on:
+   * filtering it here removed the only row with the Enable button on it, which
+   * made Disable a one-way door reachable only by editing the settings file by
+   * hand. The **routing pool** is what excludes it.
+   */
+  disabled?: boolean;
 }
 
 /**
@@ -296,6 +321,26 @@ export interface UsageRecord {
   tokensIn: number;
   tokensOut: number;
   costUsd: number;
+  /**
+   * True when the numbers were **estimated** rather than reported by the provider.
+   *
+   * This exists because the two are drawn identically. A provider that reports
+   * usage gives a bill; a local runtime that reports nothing gives a `chars/4`
+   * estimate — and the console showed both as an exact-looking figure, so an
+   * estimate was indistinguishable from a measurement everywhere downstream. It is
+   * still directionally right and still the documented fallback, but it now says
+   * which one it was.
+   */
+  estimated?: boolean;
+  /**
+   * The portion of `tokensOut` the provider attributed to reasoning.
+   *
+   * Reasoning tokens are billed at the output rate and are routinely the majority
+   * of a completion, so a bill without this split is one an operator cannot
+   * explain. Present only when the provider reports it (OpenAI-compatible
+   * endpoints put it in `completion_tokens_details.reasoning_tokens`).
+   */
+  reasoningTokens?: number;
 }
 
 /** Mirrors the OpenAI chat-completions message shape so adapters stay thin. */

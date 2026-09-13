@@ -14,7 +14,7 @@
  * "untangle this concurrency bug" does not get a nano one.
  */
 
-import type { Role, StageKind, TaskClass } from '@dev3d/core';
+import type { Role, StageKind } from '@dev3d/core';
 
 /** Baseline difficulty of each stage kind, before any text is read. */
 const STAGE_BASE: Record<StageKind, number> = {
@@ -63,8 +63,15 @@ const EASY_SIGNALS = ['typo', 'rename', 'copy change', 'label', 'comment', 'form
 
 export interface ComplexityInput {
   stageKind: StageKind;
-  taskClass: TaskClass;
-  /** The text this turn must act on: brief + purpose + upstream summaries. */
+  /**
+   * The text this turn must act on: brief + purpose + upstream summaries.
+   *
+   * Note what is *not* here: a task class. This used to accept one and never read
+   * it, which told every caller that a signal was being weighed when nothing was.
+   * Difficulty that belongs to a kind of task is priced where it belongs — by the
+   * router, through `ModelPolicy.byTaskClass` and the routing hints — and adding it
+   * here as well would count the same fact twice.
+   */
   text: string;
   role: Role;
   /** Turns already taken inside this stage; late revisions are harder. */
@@ -106,15 +113,20 @@ export function estimateComplexity(input: ComplexityInput): number {
   if (input.involvesFiles) score += 0.08;
   score += Math.min(0.1, input.fileCount * 0.01);
 
-  // A junior doing the same work is not the same risk as an executive doing it:
-  // the role's own policy bounds are the last word, but seniority shifts the
-  // estimate slightly so escalation happens for the people who need it.
+  // Seniority shifts the estimate slightly so that escalation happens for the
+  // people who need it — and "who needs it" runs *against* seniority, not with it.
+  // The ladder was `junior: 0.01, mid: 0, senior: 0.01, lead: 0.02,
+  // executive: 0.03`, which rated a mid-level employee's work as easier than a
+  // junior's and gave the largest nudge to the person with the most experience:
+  // a transcription error in the one term whose entire purpose is to be ordered
+  // correctly. A role's own `maxTier` still clamps whatever this asks for, so a
+  // junior escalates sooner but never past what their policy allows.
   const seniorityShift: Record<Role['seniority'], number> = {
-    executive: 0.03,
-    lead: 0.02,
-    senior: 0.01,
-    mid: 0,
-    junior: 0.01,
+    junior: 0.04,
+    mid: 0.03,
+    senior: 0.02,
+    lead: 0.01,
+    executive: 0,
   };
   score += seniorityShift[input.role.seniority];
 

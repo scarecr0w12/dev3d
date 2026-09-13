@@ -105,8 +105,18 @@ export function MemoryPanel() {
         },
       });
       if (!sent) {
-        store.notify('error', 'the socket is down, so that was not saved');
+        // `store.send` returns false only when no transport is attached at all,
+        // and it already emitted its own warning — so this says what actually
+        // happened rather than claiming the socket is down. While the socket *is*
+        // down a command is queued and flushed on reconnect, which is a different
+        // situation with a different answer.
+        store.notify('error', 'the office is not connected, so that was not recorded');
         return;
+      }
+      if (!store.connected) {
+        // Queued rather than lost — but the form is about to be cleared, so say
+        // so instead of implying it landed.
+        store.notify('warn', 'queued: it will be recorded when the office reconnects');
       }
       setDraft('');
       setDraftTags('');
@@ -321,8 +331,17 @@ export function MemoryPanel() {
               now={now}
               onCorrect={beginCorrection}
               onRetract={(fact) => {
+                // Same shape as the record path above, and for the same reason:
+                // `store.send` returns false only when no transport is attached —
+                // while the socket is *down* the command is queued and flushed on
+                // reconnect — so the old message named a condition it could not
+                // detect, and duplicated the warning `send` had already emitted.
                 if (!store.send({ type: 'retractFact', factId: fact.id })) {
-                  store.notify('error', 'the socket is down, so that was not saved');
+                  store.notify('error', 'the office is not connected, so that was not recorded');
+                  return;
+                }
+                if (!store.connected) {
+                  store.notify('warn', 'queued: the retraction will be recorded when the office reconnects');
                 }
               }}
             />

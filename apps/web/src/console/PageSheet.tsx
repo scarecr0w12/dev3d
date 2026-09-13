@@ -12,14 +12,20 @@ import type { ReactNode } from 'react';
 export interface PageSheetProps {
   title: string;
   subtitle?: ReactNode;
-  actions?: ReactNode;
-  /** Rendered on the close control's accessible label. */
-  closeLabel?: string;
   onClose: () => void;
   children: ReactNode;
 }
 
-export function PageSheet({ title, subtitle, actions, closeLabel, onClose, children }: PageSheetProps) {
+/**
+ * `actions` and `closeLabel` used to be props here. The only call site
+ * (`App.tsx`) never passed either, so `actions` rendered an empty
+ * `.sheet-actions` flex item and `closeLabel` always fell through to its
+ * default — an extension point nobody had extended, presented as if it were in
+ * use. Removed rather than kept "just in case": the accessible label and the
+ * close control are this component's business, and a caller that wants
+ * something else in the header can pass it as part of `subtitle`.
+ */
+export function PageSheet({ title, subtitle, onClose, children }: PageSheetProps) {
   return (
     <section className="sheet" aria-label={title}>
       <header className="sheet-head">
@@ -28,12 +34,11 @@ export function PageSheet({ title, subtitle, actions, closeLabel, onClose, child
           {subtitle !== undefined && <div className="sheet-sub">{subtitle}</div>}
         </div>
         <div className="sheet-actions">
-          {actions}
           <button
             type="button"
             className="btn btn-ghost btn-sm"
             onClick={onClose}
-            aria-label={closeLabel ?? 'Back to the office'}
+            aria-label="Back to the office"
             title="Back to the office (Esc)"
           >
             ✕

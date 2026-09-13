@@ -8,6 +8,7 @@
  * learn a second spelling of "this runs code in the server".
  */
 
+import { apiCompatible, namespacedToolName } from '@dev3d/core';
 import type {
   PluginContributionCounts,
   PluginPermission,
@@ -16,7 +17,10 @@ import type {
   PluginStatus,
 } from '@dev3d/core';
 
-import { formatInt } from '../../app/format';
+// The explicit `.ts` matters: this module is imported by the verify harness,
+// which runs under plain `node`, where an extensionless specifier does not
+// resolve. Vite is happy either way.
+import { formatInt } from '../../app/format.ts';
 
 // --------------------------------------------------------------- permissions
 
@@ -162,6 +166,74 @@ export function contributionLine(counts: PluginContributionCounts): string {
   return rows.map((row) => `${formatInt(row.count)} ${row.label}`).join(' · ');
 }
 
+// ------------------------------------------------------------- tool consent
+
+export interface ToolConsent {
+  /** The names the host actually registered. Authoritative — from the host, not the manifest. */
+  registered: string[];
+  /**
+   * Names the manifest *declared* that the host has no registration for.
+   *
+   * Empty while the plugin is not loaded: a disabled plugin has registered
+   * nothing by definition, and calling that a discrepancy would put a warning on
+   * every disabled row.
+   */
+  unbacked: string[];
+  /** True when the manifest's claim and the host's observation disagree. */
+  mismatch: boolean;
+  /** One line for the tooltip, or `null` when there is nothing to say. */
+  hint: string | null;
+}
+
+/**
+ * What a plugin has *actually* registered, against what its manifest claimed.
+ *
+ * `contributes.toolNames` was documented as being for the consent screen and was
+ * read by nothing, while the host separately tracked the real registrations and
+ * published only their count. An operator deciding whether to trust a plugin
+ * needs the names of the tools it now holds — the bare count of "3 tools" cannot
+ * tell a file reader from a shell wrapper.
+ *
+ * The comparison uses `namespacedToolName` from `@dev3d/core`, the same function
+ * the host registers with. A hand-written approximation here would silently
+ * accuse a correct plugin of claiming a tool it never registered whenever the two
+ * spellings of "clean a name" disagreed.
+ */
+export function toolConsent(record: PluginRecord): ToolConsent {
+  const declared = record.manifest.contributes?.toolNames ?? [];
+  const registered = [...record.registeredToolNames].sort();
+  const loaded = record.status === 'loaded';
+
+  if (!loaded) {
+    return {
+      registered,
+      unbacked: [],
+      mismatch: false,
+      hint:
+        declared.length === 0
+          ? null
+          : `Its manifest names ${formatInt(declared.length)} tool(s), but it is not loaded, so it holds none.`,
+    };
+  }
+
+  const held = new Set(registered);
+  const unbacked = declared.filter((name) => !held.has(namespacedToolName(record.manifest.id, name)));
+
+  const mismatch = unbacked.length > 0;
+  return {
+    registered,
+    unbacked,
+    mismatch,
+    hint:
+      declared.length === 0
+        ? null
+        : mismatch
+          ? `Its manifest names ${unbacked.map((name) => `"${name}"`).join(', ')}, which the host did not see register. ` +
+            'A declared tool name is a claim, not a registration: what it holds is the list above.'
+          : 'Every tool its manifest named did register.',
+  };
+}
+
 // ------------------------------------------------------------------ api version
 
 export interface ApiVersionCheck {
@@ -172,19 +244,24 @@ export interface ApiVersionCheck {
 }
 
 /**
- * The host refuses a plugin whose `apiVersion` it does not implement, so the
- * comparison has to be visible rather than silently boolean: a mismatch is a
- * refusal to load, not a note about version drift.
+ * Whether the host would load this plugin.
+ *
+ * The rule is `apiCompatible` from `@dev3d/core` — the *same* function the host
+ * gates on. This used to compare exact strings (`plugin === hostApiVersion`) while
+ * the host compared major versions, so a plugin declaring `apiVersion: "1.2"`
+ * loaded perfectly and the console painted its card red with "host implements 1 —
+ * mismatch". A console that accuses a correct plugin of an incompatibility it does
+ * not have is worse than one that says nothing.
  */
 export function checkApiVersion(record: PluginRecord, hostApiVersion: string): ApiVersionCheck {
   const plugin = record.manifest.apiVersion;
-  const matches = plugin === hostApiVersion;
+  const matches = apiCompatible(plugin, hostApiVersion);
   return {
     matches,
     plugin,
     host: hostApiVersion,
     detail: matches
-      ? `built against plugin API ${plugin}, which is what this host implements`
+      ? `built against plugin API ${plugin}, which this host implements`
       : `built against plugin API ${plugin}; this host implements ${hostApiVersion}`,
   };
 }

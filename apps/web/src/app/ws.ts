@@ -31,9 +31,15 @@ export interface OfficeSocketOptions {
   url: string;
   onEvent: (event: ServerEvent) => void;
   onStatus: (update: SocketStatusUpdate) => void;
-  /** `resumed` is true for any open after the first, so the app can resync. */
-  onOpen?: (resumed: boolean) => void;
-  /** Frames that could not be understood; surfaced as a console warning. */
+  /**
+   * Frames that could not be understood; surfaced as a console warning.
+   *
+   * There used to be an `onOpen(resumed)` here as well, and the app used it to send
+   * `{type:'resync'}` after a reconnect "so nothing is missed". Nothing was being
+   * missed: the server pushes a full `hello` to *every* new connection, so the
+   * resync produced a second identical snapshot of the largest frame on the wire.
+   * `onStatus` already reports the open transition, so the hook had no other use.
+   */
   onProtocolError?: (message: string) => void;
 }
 
@@ -61,7 +67,6 @@ export class OfficeSocket {
   private reconnectTimer: number | null = null;
   private pingTimer: number | null = null;
   private disposed = false;
-  private opened = false;
   private currentStatus: SocketStatus = 'idle';
   private attempt = 0;
   private lastError: string | null = null;
@@ -92,13 +97,10 @@ export class OfficeSocket {
 
     socket.onopen = () => {
       if (this.disposed) return;
-      const resumed = this.opened;
-      this.opened = true;
       this.attempt = 0;
       this.setStatus('open', 0, null);
       this.flushQueue();
       this.startPing();
-      this.options.onOpen?.(resumed);
     };
 
     socket.onmessage = (message: MessageEvent<unknown>) => {

@@ -26,7 +26,7 @@ import type {
   SkillSummary,
 } from '@dev3d/core';
 import { toSkillSummary } from '@dev3d/core';
-import { loadConfig, detectConfigDrift } from './config.ts';
+import { loadConfig, detectConfigDrift, describeMcpGrant } from './config.ts';
 import type { ProviderConfig } from './config.ts';
 import { createRunEngine } from './engine/runEngine.ts';
 import type { ChatTurn } from './engine/runEngine.ts';
@@ -37,9 +37,10 @@ import { createBenchmarkService } from './llm/benchmarks.ts';
 import { createHealthService } from './llm/health.ts';
 import { createPluginHost, type PluginHost } from './plugins/host.ts';
 import { loadMcpConfig, McpManager } from './mcp/index.ts';
-import { createRuntime, type LogFn, type Runtime } from './server/runtime.ts';
+import { createRuntime, STREAM_ONLY_EVENTS, type LogFn, type Runtime } from './server/runtime.ts';
 import { loadSkills, loadSkillsWithReport } from './skills/loader.ts';
 import { openStore } from './store/store.ts';
+import { isPathInside } from './tools/paths.ts';
 import { createDefaultTools, createToolRegistry } from './tools/registry.ts';
 import { createVendorTools } from './tools/vendor.ts';
 import { loadVendorConfig, parseVendorGrantPolicy } from './vendors/config.ts';
@@ -60,6 +61,39 @@ function makeLogger(min: keyof typeof LEVELS): LogFn {
 }
 
 const MAX_BODY_BYTES = 256 * 1024;
+
+/**
+ * Whether a request's `Origin` is this machine.
+ *
+ * The office is unauthenticated, so the only thing standing between "the UI I am
+ * running" and "a page I happened to visit" is where the request came from. A
+ * browser always attaches `Origin` to a cross-origin request and cannot be
+ * talked out of it, so refusing a non-loopback origin on a state-changing method
+ * closes the drive-by case:
+ *
+ *   - `http://127.0.0.1:5273` (the dev UI), `http://localhost:8787`, `[::1]` —
+ *     allowed, because these are the operator's own two ports.
+ *   - `https://evil.example`, or a DNS-rebinding name that resolves to loopback
+ *     but is *spelled* as somebody's domain — refused, because the comparison is
+ *     on the origin's host, not on what it resolves to.
+ *   - absent (curl, a script, a test) — not a browser, so not this threat, and
+ *     the caller is left to pass.
+ *
+ * A non-loopback `Host` header is a related case this deliberately does not
+ * police: `HOST=0.0.0.0` is an explicit operator decision to expose the office,
+ * documented in the README as requiring a reverse proxy.
+ */
+function isLoopbackOrigin(origin: string | undefined): boolean {
+  if (origin === undefined || origin === '') return false;
+  let host: string;
+  try {
+    host = new URL(origin).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  const bare = host.replace(/^\[|\]$/g, '');
+  return bare === 'localhost' || bare === '127.0.0.1' || bare === '::1' || bare.endsWith('.localhost');
+}
 
 async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
@@ -135,6 +169,29 @@ async function main(): Promise<void> {
   const log = makeLogger(config.logLevel);
 
   const store = openStore(config.dbPath, log, { vectors: config.memoryVectors });
+
+  /**
+   * Retention for the event log, applied once per boot.
+   *
+   * The log is append-only, so without this a long-lived office grows a table
+   * nobody ever reads the far end of. Doing it at boot rather than on a timer is
+   * deliberate: pruning is housekeeping, it costs one indexed DELETE, and a
+   * background interval in the orchestrator would be another thing to reason
+   * about for a job that has no deadline. Zero days means "keep everything", which
+   * is also what a store that fell back to memory reports - it holds one session.
+   */
+  if (config.eventRetentionDays > 0) {
+    const cutoff = Date.now() - config.eventRetentionDays * 24 * 60 * 60 * 1_000;
+    const pruned = store.pruneEvents(cutoff);
+    if (pruned > 0) {
+      log(
+        'info',
+        'store',
+        `pruned ${pruned} event(s) older than ${config.eventRetentionDays} day(s) ` +
+          '(DEV3D_EVENT_RETENTION_DAYS=0 keeps everything)',
+      );
+    }
+  }
   // Reported rather than thrown: a malformed skill is a typo in a markdown file,
   // and it must not be the reason the office refuses to open. The loader logs
   // each file it skips with its reason; this is the one-line summary.
@@ -343,6 +400,7 @@ async function main(): Promise<void> {
     log: (level, scope, message) => log(level, scope, message),
     clientName: 'dev3d',
     clientVersion: config.version,
+    requireApproval: config.mcpRequireApproval,
   });
   mcpRef = mcp;
   if (mcpConfig.servers.length > 0) {
@@ -351,6 +409,11 @@ async function main(): Promise<void> {
       'mcp',
       `${mcpConfig.servers.length} server(s) configured${mcpConfig.file === null ? '' : ` from ${mcpConfig.file}`}; connecting in the background`,
     );
+    // The effective grant policy, said out loud, for the same reason the
+    // auto-approve warning is: an MCP server's tools are somebody else's program
+    // with reach dev3d cannot confine, and "who may call them" was previously
+    // visible only by reading the config.
+    log('info', 'mcp', describeMcpGrant(config));
     void mcp.start(mcpConfig.servers).catch((e: unknown) => {
       log('error', 'mcp', `start failed: ${e instanceof Error ? e.message : String(e)}`);
     });
@@ -743,14 +806,12 @@ async function main(): Promise<void> {
             return;
           }
           // Replaying the persisted events rebuilds the transcript exactly as it
-          // was streamed the first time, with no extra protocol surface.
-          const entries = store.eventsForRun(cmd.runId);
-          for (const entry of entries) {
-            try {
-              push(ws, JSON.parse(entry.payloadJson) as ServerEvent);
-            } catch {
-              /* skip an unreadable row rather than aborting the replay */
-            }
+          // was streamed the first time, with no extra protocol surface. The runtime
+          // owns the filter that keeps the token stream out of it — see
+          // `replayableEvents` for why a replayed delta must not be sent.
+          const entries = runtime.replayableEvents(cmd.runId);
+          for (const event of entries) {
+            push(ws, event);
           }
           log('debug', 'ws', `replayed ${entries.length} event(s) for ${cmd.runId}`);
           return;
@@ -783,7 +844,11 @@ async function main(): Promise<void> {
         }
 
         case 'ping': {
-          push(ws, { type: 'office.updated', state: runtime.state(), at: Date.now() });
+          // The heartbeat is answered with a heartbeat. It used to reply with a
+          // full `office.updated`, which meant every open console downloaded the
+          // whole office state — model catalog included — every 25 seconds, and
+          // re-rendered itself off it.
+          push(ws, { type: 'pong', at: Date.now() });
           return;
         }
 
@@ -822,7 +887,9 @@ async function main(): Promise<void> {
     if (!existsSync(webDist)) return false;
     const rel = normalize(decodeURIComponent(urlPath)).replace(/^([/\\])+/, '');
     const target = resolve(webDist, rel === '' ? 'index.html' : rel);
-    if (!target.startsWith(webDist)) return false;
+    // Boundary-aware: `startsWith(webDist)` also accepts a sibling such as
+    // `apps/web/dist.bak`, which is outside the directory being served.
+    if (!isPathInside(webDist, target)) return false;
     const file = existsSync(target) && !target.endsWith('index.html') ? target : join(webDist, 'index.html');
     if (!existsSync(file)) return false;
     const body = readFileSync(file);
@@ -839,14 +906,47 @@ async function main(): Promise<void> {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       const path = url.pathname;
 
-      // The UI talks to the orchestrator from a different origin in dev (Vite on
-      // 5273), so the read API has to be reachable cross-origin.
-      res.setHeader('access-control-allow-origin', '*');
+      /**
+       * Who may read this API, and who may change it.
+       *
+       * The office is unauthenticated by design and bound to loopback, but
+       * `access-control-allow-origin: *` on **every** method meant the API was
+       * also reachable *from any web page the operator happened to have open*:
+       * with a wildcard origin and no `Origin` check, a script on any site could
+       * `DELETE /api/plugins/:id` (which removes files from disk), rewrite
+       * settings, or start a run. Combined with DNS rebinding — where an
+       * attacker's hostname re-resolves to `127.0.0.1` — a page could also read
+       * responses, including the whole office state.
+       *
+       * Reads stay cross-origin, because the dev UI legitimately talks to the
+       * orchestrator from Vite on another port. **Writes must come from a
+       * same-origin page or from a non-browser client**, which is what an
+       * `Origin` check distinguishes: a browser always sends `Origin` on a
+       * cross-origin write, while `curl` and the office's own scripts do not.
+       */
+      const requestOrigin = req.headers.origin;
+      const originAllowed = isLoopbackOrigin(requestOrigin);
+      res.setHeader('access-control-allow-origin', originAllowed ? (requestOrigin ?? '*') : 'null');
       res.setHeader('access-control-allow-headers', 'content-type');
       res.setHeader('access-control-allow-methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+
       if (req.method === 'OPTIONS') {
         res.writeHead(204);
         res.end();
+        return;
+      }
+
+      const mutating =
+        req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE';
+      // A browser sends `Origin` on every cross-origin write. A tool that is not
+      // a browser does not, and is not what this defends against — the threat is
+      // a page the operator visited, which cannot suppress the header.
+      if (mutating && requestOrigin !== undefined && !originAllowed) {
+        sendJson(res, 403, {
+          error:
+            'Cross-origin writes are refused: this request came from a page on another origin. ' +
+            'The office API is unauthenticated and only accepts changes from its own UI or a direct client.',
+        });
         return;
       }
 
@@ -875,7 +975,10 @@ async function main(): Promise<void> {
       }
 
       if (path === '/api/runs') {
-        sendJson(res, 200, engine.runs().sort((a, b) => b.createdAt - a.createdAt));
+        // The engine holds only this process's runs, so a restarted office
+        // reported zero here while `GET /api/runs/:id` happily served any of
+        // them. The runtime unions memory with the store.
+        sendJson(res, 200, runtime.runs());
         return;
       }
 
@@ -1136,6 +1239,10 @@ async function main(): Promise<void> {
       }
 
       if (path === '/api/models') {
+        // The **full** catalog, opinions included. The state frame deliberately
+        // carries the projected shape (`server/stateProjection.ts`) because the
+        // catalog is 80% of it and the opinion arrays are 87 kB of that; anything
+        // wanting to explain a score rather than name it asks here.
         sendJson(res, 200, registry.models());
         return;
       }
@@ -1644,7 +1751,17 @@ async function main(): Promise<void> {
   log('info', 'boot', `store: ${store.backend}`);
   if (config.dotEnvCount > 0) log('info', 'boot', `loaded ${config.dotEnvCount} value(s) from .env`);
   if (config.autoApproveShell) {
-    log('warn', 'boot', 'DEV3D_AUTO_APPROVE_SHELL is on: employees may run shell commands without asking.');
+    // Enumerated, because one switch opens three unrelated gates. Saying only
+    // "shell commands" was not true: the same flag also covers git writes and
+    // unconfined third-party delegation, and an operator who set it because a
+    // build kept asking about `pnpm test` had authorised all three.
+    log(
+      'warn',
+      'boot',
+      'DEV3D_AUTO_APPROVE_SHELL is on — no human is asked before: run_shell (arbitrary commands), ' +
+        'git writes (commits, branches, cherry-picks, stash push), and agent__*__delegate (third-party ' +
+        'harnesses whose read-only mode is requested rather than enforced).',
+    );
   }
   if (registry.mock) {
     // The reason, not a guess at it. This line used to read "no provider keys
@@ -1687,9 +1804,13 @@ async function main(): Promise<void> {
         try {
           const reports = await registry.discovery.discoverAll({ onlyConfigured: true });
           registry.discovery.saveCache();
+          // Read once: a local runtime that is simply not started is the ordinary
+          // state of an install, so it must not be reported as a fault at every
+          // boot. A remote provider that cannot be reached still is one.
+          const local = new Map(registry.status().map((provider) => [provider.id, provider.local]));
           for (const report of reports) {
             log(
-              report.ok ? 'info' : 'warn',
+              report.ok ? 'info' : local.get(report.providerId) === true ? 'debug' : 'warn',
               'discovery',
               report.ok
                 ? `${report.providerId}: ${report.models.length} model(s) in ${report.durationMs}ms`

@@ -27,14 +27,39 @@ import type {
   UsageRecord,
 } from '@dev3d/core';
 import { routeModel } from '../router/modelRouter.ts';
+import { fenceUntrusted, stripControlSequences } from '../security/text.ts';
 import { selectSkills } from '../skills/loader.ts';
 import type { ToolContext, ToolResult } from '../tools/types.ts';
 import { estimateComplexity } from './complexity.ts';
 import { buildTurnMessages, MEMORY_PROMPT_LIMIT, taskClassForStage } from './prompt.ts';
-import type { EngineDeps, RunKnowledge, StageUtterance } from './types.ts';
+import type { EngineDeps, RunKnowledge, RunPolicy, StageUtterance } from './types.ts';
 
 /** Hard ceiling on model<->tool round trips inside a single turn. */
-const MAX_TOOL_ITERATIONS = 8;
+export const MAX_TOOL_ITERATIONS = 8;
+/**
+ * Round trips allowed for stages that are open-ended by nature.
+ *
+ * `research` gathers evidence, and gathering evidence is unbounded work: the
+ * live office's first real run spent all eight round trips on searches and
+ * fetches, and both research-flavoured turns came back with nothing. `debate` and
+ * `integrate` reconcile several inputs rather than one, so they get headroom
+ * too. Everything else keeps the tight budget, because converging on a bounded
+ * task should not take many round trips and an unbounded loop is a real failure
+ * mode with a real bill.
+ */
+export const OPEN_ENDED_TOOL_ITERATIONS = 16;
+
+/** How many round trips this turn may use, by what the stage is for. */
+export function toolIterationsFor(stage: StageRun): number {
+  switch (stage.spec.kind) {
+    case 'research':
+    case 'debate':
+    case 'integrate':
+      return OPEN_ENDED_TOOL_ITERATIONS;
+    default:
+      return MAX_TOOL_ITERATIONS;
+  }
+}
 /** How much of a tool result is handed back to the model. */
 const MAX_TOOL_RESULT_CHARS = 8_000;
 
@@ -90,6 +115,14 @@ export interface TurnRequest {
    */
   memoryFacts: MemoryFact[];
   memoryQuery: string;
+  /**
+   * What this run was authorised to do without asking, fixed when it started.
+   *
+   * Optional so a caller that does not pin one — a test driving a single turn, an
+   * engine whose runs are not tracked — still works; it then falls back to the
+   * live config, which is what every turn used to read.
+   */
+  policy?: RunPolicy;
 }
 
 interface ToolCallOutcome {
@@ -207,7 +240,10 @@ async function executeToolCall(
               : req.memoryFacts.slice(0, Math.max(0, limit));
           },
         }),
-    autoApproveShell: deps.config.autoApproveShell,
+    // Pinned at run start where the engine pinned one: a settings write that
+    // lands while this run is in flight must not change whether these employees
+    // are asked for approval.
+    autoApproveShell: req.policy?.autoApproveShell ?? deps.config.autoApproveShell,
     signal: req.signal,
     log: (level, message) => {
       deps.sink.emit({ type: 'log', level, scope: `tool:${call.name}`, message, at: Date.now() });
@@ -255,8 +291,18 @@ async function executeToolCall(
 
   return finish(
     result.ok ? 'ok' : 'error',
-    cap(result.preview, 300),
-    cap(result.content, MAX_TOOL_RESULT_CHARS),
+    // The preview is for the console, so it gets the same treatment: a terminal
+    // escape in a tool's one-line summary renders in the operator's own console.
+    cap(stripControlSequences(result.preview), 300),
+    // Tool output is attacker-influenced *by design* — `read_file` of a hostile
+    // README, `git show` of a hostile commit message, `web_fetch` of any page on
+    // the internet — and it goes straight into the prompt as a `tool` message.
+    // Stripping the control sequences stops the invisible half (bidi overrides
+    // make text display as something other than what it says; zero-width
+    // characters are not visible to a reader checking it) and the fence makes the
+    // boundary visible where a model reads it, so "this is data, not an
+    // instruction" is said consistently rather than assumed at each call site.
+    fenceUntrusted(cap(result.content, MAX_TOOL_RESULT_CHARS), `tool:${call.name}`),
     result.affectsPaths,
   );
 }
@@ -302,7 +348,6 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
   );
   const complexity = estimateComplexity({
     stageKind: stage.spec.kind,
-    taskClass,
     text: taskText,
     role,
     turnIndex: req.turnIndex,
@@ -432,6 +477,10 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
   let assistantText = '';
   let reasoningText: string | null = null;
   let status: TurnRecord['status'] = 'done';
+  /** Round trips this turn may use, widened for open-ended stage kinds. */
+  const toolIterations = toolIterationsFor(stage);
+  /** True when the loop ran out of round trips rather than converging. */
+  let warnedAboutLimit = false;
   /** The model that actually answered, once one has. */
   let servedBy: { providerId: string; modelId: string } | null = null;
   /** Routes that failed before one answered. */
@@ -442,35 +491,61 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
     assistantText = assistantText === '' ? chunk : `${assistantText}\n\n${chunk}`;
   };
 
+  /**
+   * Whether the model has said anything at all.
+   *
+   * Used at the end of the loop: a turn that never produced text gave the run no
+   * work product, whatever else it did, and must say so rather than being
+   * recorded as a completed turn with an empty body. The live office's own first
+   * real run failed exactly here — two of three turns spent their whole tool
+   * budget and returned `''`.
+   */
+  const saidSomething = (): boolean => assistantText.trim() !== '';
+
   try {
     if (route.modelId === '') {
       throw new Error(route.reason !== '' ? route.reason : 'No model could be routed for this turn.');
     }
 
-    for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
+    /**
+     * The last round trip is made **with tools withheld**.
+     *
+     * Without this the loop simply stops when the budget runs out, the model is
+     * never asked to summarise what it found, and the turn ends with empty text
+     * and an error — money spent, nothing produced. Withholding the tools for one
+     * final call is what turns "I ran out of round trips" into "here is what I
+     * have", which is the answer the operator actually wanted.
+     */
+    const lastRound = toolIterations - 1;
+
+    for (let iteration = 0; iteration < toolIterations; iteration += 1) {
       if (req.signal.aborted) {
         status = 'cancelled';
         error = 'Cancelled by the operator.';
         break;
       }
 
+      // `exactOptionalPropertyTypes` is on, so the properties are spread in
+      // rather than assigned undefined.
+      const turnChatOptions = {
+        messages,
+        ...(iteration === lastRound || schemas.length === 0 ? {} : { tools: schemas }),
+        ...(role.modelPolicy.maxOutputTokens !== undefined
+          ? { maxOutputTokens: role.modelPolicy.maxOutputTokens }
+          : {}),
+        onDelta: (text: string) => {
+          deps.sink.emit({ type: 'turn.delta', runId: run.id, turnId, text, at: Date.now() });
+        },
+        onReasoning: (text: string) => {
+          deps.sink.emit({ type: 'turn.reasoning', runId: run.id, turnId, text, at: Date.now() });
+        },
+        signal: req.signal,
+      };
+
       const { result, used, attempted } = await deps.registry.chat(
         { providerId: route.providerId, modelId: route.modelId },
         route.fallbacks.map((f) => ({ providerId: f.providerId, modelId: f.modelId })),
-        {
-          messages,
-          ...(schemas.length > 0 ? { tools: schemas } : {}),
-          ...(role.modelPolicy.maxOutputTokens !== undefined
-            ? { maxOutputTokens: role.modelPolicy.maxOutputTokens }
-            : {}),
-          onDelta: (text) => {
-            deps.sink.emit({ type: 'turn.delta', runId: run.id, turnId, text, at: Date.now() });
-          },
-          onReasoning: (text) => {
-            deps.sink.emit({ type: 'turn.reasoning', runId: run.id, turnId, text, at: Date.now() });
-          },
-          signal: req.signal,
-        },
+        turnChatOptions,
       );
 
       // Which model actually answered, and what was tried before it. Kept on the
@@ -511,8 +586,11 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
         messages.push({ role: 'tool', content, toolCallId: record.id, name: record.name });
       }
 
-      if (iteration === MAX_TOOL_ITERATIONS - 1) {
-        error = `Stopped after ${MAX_TOOL_ITERATIONS} tool round trips without a final answer.`;
+      if (iteration === lastRound) {
+        // The tools were withheld for exactly this call, so an answer ought to
+        // have arrived. If the model asked for a tool anyway, there is nothing
+        // left to withhold and the turn ends without one.
+        warnedAboutLimit = true;
       }
     }
   } catch (e) {
@@ -523,6 +601,22 @@ export async function runTurn(deps: EngineDeps, req: TurnRequest): Promise<TurnR
       status = 'failed';
       error = errMsg(e);
     }
+  }
+
+  /**
+   * A turn that never produced text produced no work product.
+   *
+   * This is why the loop above makes one final tools-withheld call: so that
+   * "the budget ran out" and "there is no answer" stop being the same outcome.
+   * Reaching here with nothing said means the last call *still* asked for a
+   * tool, so the turn is recorded as failed with the reason and the caller keeps
+   * whatever was gathered — rather than as a completed turn with an empty body,
+   * which is how a spent run used to look like a finished one.
+   */
+  if (status === 'done' && error === null && !saidSomething()) {
+    error = warnedAboutLimit
+      ? `Stopped after ${toolIterations} tool round trips without ever producing an answer.`
+      : 'The model returned no text and asked for no tools.';
   }
 
   // --- settle --------------------------------------------------------------

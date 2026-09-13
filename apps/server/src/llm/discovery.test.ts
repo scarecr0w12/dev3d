@@ -95,6 +95,52 @@ test('a failed discovery keeps the curated catalog instead of emptying it', asyn
   assert.equal(service.modelsFor('p'), null);
 });
 
+test('a local runtime that is not running is not reported as a warning', async () => {
+  // LM Studio and friends are keyless endpoints that are simply not up most of
+  // the time. Nothing is misconfigured when one refuses a connection, so the
+  // curated fallback is recorded at debug and the boot stays quiet. The report
+  // is otherwise identical, so routing behaves exactly as it does for a remote
+  // outage.
+  const levels: string[] = [];
+  const service = createDiscoveryService({
+    providers: () => [
+      fakeProvider('lmstudio', async () => {
+        throw new Error('fetch failed');
+      }),
+    ],
+    isLocal: (providerId) => providerId === 'lmstudio',
+    ttlMs: 60_000,
+    cachePath: null,
+    log: (level) => levels.push(level),
+  });
+
+  const report = await service.discover('lmstudio');
+  assert.equal(report?.ok, false);
+  assert.equal(service.modeFor('lmstudio'), 'degraded');
+  assert.equal(service.modelsFor('lmstudio'), null, 'the curated seed must still stand in');
+  assert.deepEqual(levels, ['debug'], 'a local runtime that is down must not warn');
+});
+
+test('an unreachable remote provider is still a warning', async () => {
+  // The other half of the distinction: this one is actionable, so it keeps the
+  // level it had before.
+  const levels: string[] = [];
+  const service = createDiscoveryService({
+    providers: () => [
+      fakeProvider('openrouter', async () => {
+        throw new Error('HTTP 503 Service Unavailable');
+      }),
+    ],
+    isLocal: () => false,
+    ttlMs: 60_000,
+    cachePath: null,
+    log: (level) => levels.push(level),
+  });
+
+  await service.discover('openrouter');
+  assert.deepEqual(levels, ['warn'], 'a remote provider outage must stay visible');
+});
+
 test('a provider with no list endpoint is recorded, not treated as empty', async () => {
   const service = createDiscoveryService({
     providers: () => [fakeProvider('legacy')],

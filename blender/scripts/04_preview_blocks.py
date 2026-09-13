@@ -60,6 +60,11 @@ IMAGE_W = int(arg("--width", "2400"))
 # Modules to draw, by id ("attention" only): `--only pod4,lounge3` renders the
 # sheet with everything else hidden, which is how a single room gets inspected.
 ONLY = [part for part in arg("--only", "").split(",") if part]
+# How much air to leave around the grid, as a fraction of the default. The margins
+# below are sized for a full sheet of twenty-four modules and are absurd for one:
+# `--only pod4` framed an 8 m room inside a 50 m shot, which made the detail this
+# script exists to show invisible. `--margin 0.25` fills the frame with the module.
+MARGIN = float(arg("--margin", "1.0"))
 SPACING_X, SPACING_Y = 19.0, 15.0
 
 # Build the kit. `exec` on a file read here is ordinary Python: this script is
@@ -123,8 +128,8 @@ floor.data.materials.append(floor_material)
 # Frame the grid by arithmetic rather than by guessing a distance: take a box
 # around every module - its declared footprint plus a small margin - and pull
 # back until that box fits both the horizontal and the vertical field of view.
-span_box_x = max(1.0, (min(COLS, len(names)) - 1) * SPACING_X) + 18.0
-span_box_y = max(1.0, (rows - 1) * SPACING_Y) + 10.0
+span_box_x = max(1.0, (min(COLS, len(names)) - 1) * SPACING_X) + 18.0 * MARGIN
+span_box_y = max(1.0, (rows - 1) * SPACING_Y) + 10.0 * MARGIN
 half_diagonal = math.sqrt((span_box_x / 2.0) ** 2 + (span_box_y / 2.0) ** 2 + 1.6 ** 2)
 centre = Vector((span_x / 2.0, -span_y / 2.0, 0.8))
 
@@ -144,7 +149,11 @@ scene.camera = camera
 sensor = camera.data.sensor_width
 fov_x = 2.0 * math.atan(sensor / (2.0 * camera.data.lens))
 fov_y = 2.0 * math.atan((sensor / aspect) / (2.0 * camera.data.lens))
-elevation = math.radians(52.0)
+# How far above the floor the camera looks from. The default reads the *plan* of a
+# module, which is what a sheet of twenty-four wants; `--elevation 25` looks into a
+# room instead, which is the only way to see anything standing inside one - at 52
+# degrees a module's own walls hide its contents from you.
+elevation = math.radians(float(arg("--elevation", "52")))
 # `direction` points from the subject toward the camera, so it has to be *added*:
 # subtracting it puts the camera under the floor, looking at nothing.
 direction = Vector((0.0, -math.cos(elevation), math.sin(elevation)))

@@ -12,12 +12,14 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties } from 'react';
 import type { PanelWidget, PluginRecord, UiPanelContribution } from '@dev3d/core';
 
 import { api } from '../../app/api';
 import { useOffice } from '../../app/StoreContext';
 import { Badge } from '../ui';
 import { PanelSourceBadge, PanelWidgets } from './PanelWidgets';
+import { panelTokenStyle } from './panelTokens.ts';
 
 interface PanelRead {
   widgets: PanelWidget[];
@@ -79,9 +81,10 @@ function PanelCard({ record, panel }: { record: PluginRecord; panel: UiPanelCont
   const pluginId = record.manifest.id;
   const read = usePanelRead(pluginId, panel);
   const stale = read.error !== null && read.widgets.length === 0;
+  const style = panelTokenStyle(panel.tokens) as CSSProperties | undefined;
 
   return (
-    <section className="plugin-panel" title={panel.summary}>
+    <section className="plugin-panel" title={panel.summary} style={style}>
       <header className="plugin-panel-head">
         <span className="plugin-panel-title">{panel.title}</span>
         <PanelSourceBadge live={read.live} stale={stale} />

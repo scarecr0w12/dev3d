@@ -273,6 +273,9 @@ async function runOneTurn(
     // defaults it fills in; nothing here may depend on them being populated.
     memoryFacts: [],
     memoryQuery: `${ctx.run.brief}\n${purpose}`.trim(),
+    // Absent when the engine has not pinned one, which is the case for a caller
+    // driving a turn directly; the turn then reads the live config.
+    policy: deps.policyFor?.(ctx.run.id),
   });
   ctx.stage.turnIds.push(turn.id);
   absorb(knowledge, turn, role.displayName);

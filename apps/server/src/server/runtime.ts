@@ -77,6 +77,7 @@ import type { Store } from '../store/store.ts';
 import { resolveInWorkspace } from '../tools/paths.ts';
 import type { ApprovalBroker, EmployeeTracker, EventSink, OrgAccess } from '../engine/types.ts';
 import { createMemoryService, scopesFor, type MemoryService } from './memory.ts';
+import { projectModelsForState } from './stateProjection.ts';
 
 export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error', scope: string, message: string) => void;
 
@@ -84,6 +85,25 @@ export type LogFn = (level: 'debug' | 'info' | 'warn' | 'error', scope: string, 
 function emptyPluginState(): PluginPersistedState {
   return { enabled: {}, settings: {}, sources: [] };
 }
+
+/**
+ * Events that are **transport, not record**: one per streamed token.
+ *
+ * They are emitted so a console can watch an employee think, and deliberately not
+ * persisted — persisting them made the office's durable history almost entirely
+ * deliberation (a measured 3,483 `turn.reasoning` rows of ~110 bytes each in a single
+ * run, 96% of every event in the database) at the cost of one synchronous SQLite
+ * INSERT per token while the same event loop was driving the stream.
+ *
+ * Exported because a **replay must not carry them either**, and that filter cannot be
+ * left implicit in the persistence rule: `turn.delta` is a blind append on the client,
+ * so replaying one onto a console that already holds the live buffer doubles the text.
+ * Two places depend on the same fact, so the fact is named once.
+ */
+export const STREAM_ONLY_EVENTS: ReadonlySet<ServerEvent['type']> = new Set([
+  'turn.delta',
+  'turn.reasoning',
+]);
 
 /**
  * The narrow slice of the plugin host the runtime needs: its public state, and
@@ -156,8 +176,27 @@ export interface Runtime {
   setWorkspaceStyle(workspaceId: string, style: OfficeStyle | null): { ok: boolean; error?: string };
 
   state(): OfficeState;
+  /**
+   * Run summaries, newest first: in flight and on disk.
+   *
+   * Separate from `state()` because a caller that wants the run list — the
+   * `GET /api/runs` route — should not have to build a 293 KB office frame to get
+   * it.
+   */
+  runs(): Run[];
   subscribe(fn: (event: ServerEvent) => void): () => void;
   emit(event: ServerEvent): void;
+  /**
+   * The events a `loadRun` replay should send: the run's record, without its token
+   * stream.
+   *
+   * The filter belongs here rather than at the socket because the *reason* for it
+   * lives here — `STREAM_ONLY_EVENTS` is this module's rule — and because a replay
+   * that carries a `turn.delta` makes the client append it to a live buffer and
+   * double the visible text. Rows written before the token stream stopped being
+   * persisted are still on disk, so this cannot rely on that alone.
+   */
+  replayableEvents(runId: string): ServerEvent[];
 
   // ------------------------------------------------------------------- memory
   /**
@@ -643,6 +682,39 @@ export function createRuntime(opts: {
     activeRunIds: () => [],
   };
 
+  /** How many persisted runs are considered when rebuilding the list. */
+  const RUN_HISTORY_LIMIT = 50;
+
+  /**
+   * Every run this office knows about: what is in flight, plus what is on disk.
+   *
+   * The engine holds only the runs it started in *this* process, and both
+   * consumers of the list read from it — the `hello` frame and `GET /api/runs`.
+   * So a restart made every earlier run disappear from the Runs page and the
+   * lifetime spend figure reset to zero, even though the runs, their turns and
+   * their artifacts were all in SQLite and still individually retrievable by id.
+   *
+   * Read on demand rather than cached: a run list is asked for on connect and on
+   * page load, not in a hot loop, and a stale cache would reintroduce exactly the
+   * "the office forgot" symptom this fixes.
+   */
+  function allRuns(): Run[] {
+    const live = engineAccessor.runs();
+    const liveIds = new Set(live.map((run) => run.id));
+    let persisted: Run[] = [];
+    try {
+      persisted = store.recentRuns(RUN_HISTORY_LIMIT);
+    } catch {
+      // A store that cannot be read is a store that cannot answer; the live runs
+      // are still the truth about what is happening now.
+      persisted = [];
+    }
+    // A run in memory is newer than its last persisted snapshot, so it wins.
+    const merged = [...live, ...persisted.filter((run) => !liveIds.has(run.id))];
+    merged.sort((a, b) => b.createdAt - a.createdAt);
+    return merged.slice(0, RUN_HISTORY_LIMIT);
+  }
+
   const startedAt = Date.now();
 
   // ------------------------------------------------------------- workspaces
@@ -726,7 +798,9 @@ export function createRuntime(opts: {
   }
 
   function summaries(): WorkspaceSummary[] {
-    const runs = engineAccessor.runs();
+    // Includes persisted runs, so a floor's recorded spend and run count survive a
+    // restart instead of reading as zero until something new is submitted.
+    const runs = allRuns();
     const active = new Set(engineAccessor.activeRunIds());
     return [...office.workspaces]
       .sort((a, b) => a.floor - b.floor)
@@ -919,14 +993,37 @@ export function createRuntime(opts: {
     return null;
   }
 
+  /**
+   * Events that are broadcast but not written to the log.
+   *
+   * `turn.delta` and `turn.reasoning` are *transport*, not record: one event per
+   * streamed token, emitted so a console can watch an employee think. Persisting
+   * them made the office's durable history almost entirely deliberation — a
+   * measured 3,483 `turn.reasoning` rows of ~110 bytes each in a single run, 96%
+   * of every event in the database, against exactly one `turn.delta` row — and
+   * cost one synchronous SQLite INSERT per token while the same event loop was
+   * driving the stream.
+   *
+   * Nothing is lost by keeping them out. The assembled text lives on the
+   * `turn.finished` record, which *is* persisted, and that is what both `loadRun`
+   * replay and a reconnecting console build a transcript from. What is dropped is
+   * the per-token retelling of something already stored in full.
+   */
+  /**
+   * Events that are broadcast but not written to the log — see `STREAM_ONLY_EVENTS`,
+   * which is declared at module scope because the `loadRun` replay needs the same
+   * fact (a replayed delta would double the client's live buffer).
+   */
   function emit(event: ServerEvent): void {
     // 1. persist first, so the log is never behind the broadcast
-    store.appendEvent({
-      runId: runIdOf(event),
-      type: event.type,
-      payloadJson: JSON.stringify(event),
-      at: event.at,
-    });
+    if (!STREAM_ONLY_EVENTS.has(event.type)) {
+      store.appendEvent({
+        runId: runIdOf(event),
+        type: event.type,
+        payloadJson: JSON.stringify(event),
+        at: event.at,
+      });
+    }
 
     // 2. keep the durable projections current
     switch (event.type) {
@@ -1208,9 +1305,15 @@ export function createRuntime(opts: {
       // cannot tell a provider that was asked from one that never was.
       modelSource: status.modelSource,
       modelSourceDetail: status.modelSourceDetail,
+      // Carried through so the console can tell a local runtime that is simply not
+      // started from a remote provider that cannot be reached. Dropping it here was
+      // the whole reason an expected state read as a fault.
+      local: status.local,
       discoveredAt: status.discoveredAt,
     }));
-    const runs = engineAccessor.runs().filter((run) => run.workspaceId === workspaceId);
+    // In-memory runs plus the ones on disk. Reading only the engine here is what
+    // made every earlier run vanish from the console after a restart.
+    const runs = allRuns().filter((run) => run.workspaceId === workspaceId);
     const activeRunIds = engineAccessor.activeRunIds().filter((id) => runs.some((run) => run.id === id));
 
     return {
@@ -1242,6 +1345,11 @@ export function createRuntime(opts: {
         vendors: opts.vendorStatus?.() ?? [],
       },
       workspaces: summaries(),
+      // An approval stops the office until a human answers, so a console that
+      // arrives after the `approval.requested` frame — a refresh, a reconnect, a
+      // second tab — must still be told one is waiting. This is the only path by
+      // which it can find out.
+      approvals: [...pending.values()].map((entry) => structuredClone(entry.approval)),
       company: structuredClone(workspace?.org.company ?? defaultCompany()),
       departments: structuredClone(workspace?.org.departments ?? []),
       roles: structuredClone(workspace?.org.roles ?? []),
@@ -1264,7 +1372,11 @@ export function createRuntime(opts: {
       pipelines: structuredClone(enabledPipelines(workspace)),
       runs,
       activeRunIds,
-      models: structuredClone(registry.models()),
+      // Projected for the wire: the catalog is 80% of this frame, and 87 kB of it
+      // is per-model opinion detail that only one console page reads — and that
+      // page only reads the source names out of it. The full specs are served by
+      // `GET /api/models`, and the registry keeps them either way.
+      models: projectModelsForState(registry.models()),
       providers,
       // Coverage of the quality signals, so the console can say "31 of 445
       // benchmarked" rather than implying a thin signal is a complete one.
@@ -1603,7 +1715,23 @@ export function createRuntime(opts: {
     },
 
     state,
+    runs: allRuns,
     emit,
+    replayableEvents(runId) {
+      const out: ServerEvent[] = [];
+      for (const entry of store.eventsForRun(runId)) {
+        let parsed: ServerEvent;
+        try {
+          parsed = JSON.parse(entry.payloadJson) as ServerEvent;
+        } catch {
+          // An unreadable row is skipped rather than aborting the replay.
+          continue;
+        }
+        if (STREAM_ONLY_EVENTS.has(parsed.type)) continue;
+        out.push(parsed);
+      }
+      return out;
+    },
     subscribe(fn) {
       subscribers.add(fn);
       return () => {

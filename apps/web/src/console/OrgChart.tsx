@@ -567,7 +567,12 @@ function ModelPolicyEditor({ role, onApply }: { role: Role; onApply: (policy: Mo
 
   const apply = useCallback(() => {
     const parsedComplexity = Number.parseFloat(escalateAt);
-    const parsedTokens = Number.parseInt(maxOutputTokens, 10);
+    // `Number`, not `parseInt`. A number input legitimately reports exponent
+    // notation as its string, and `Number.parseInt('1e3', 10)` is `1` — so typing
+    // `1e3`, a natural way to say a thousand, silently capped the role's output at
+    // one token. `Number('1e3')` is 1000, and `Number('')` is 0 (dropped by the
+    // `> 0` guard below) while `Number('abc')` is `NaN`.
+    const parsedTokens = Number(maxOutputTokens);
     const next: ModelPolicy = {
       defaultTier,
       minTier,

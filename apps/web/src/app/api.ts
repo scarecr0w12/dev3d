@@ -100,6 +100,14 @@ export interface HealthRecordView {
   uptime: number | null;
   endpointCount: number;
   healthyCount: number;
+  /**
+   * When this reading was taken.
+   *
+   * The server has always sent it and this type dropped it, so a reading from last
+   * week rendered exactly like one taken a second ago — an uptime figure whose
+   * whole value is that it is current, presented without its age.
+   */
+  at: number;
 }
 
 /** What `POST /api/models/benchmarks` answers with. */
@@ -381,8 +389,3 @@ export const api = {
   /** Role templates plugins offer, for the hire form. */
   roleTemplates: () => request<RoleTemplate[]>('/api/plugins/role-templates'),
 };
-
-/** Narrows an unknown JSON payload to an array without trusting its contents. */
-export function asArray<T>(value: unknown): T[] {
-  return Array.isArray(value) ? (value as T[]) : [];
-}

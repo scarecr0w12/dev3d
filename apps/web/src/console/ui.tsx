@@ -7,7 +7,8 @@
  * panels stay about data and this file stays about looking right.
  */
 
-import type { ReactNode } from 'react';
+import { useRef } from 'react';
+import type { KeyboardEvent, ReactNode } from 'react';
 
 import type { EmployeeStatus } from '@dev3d/core';
 
@@ -96,15 +97,6 @@ export function Badge({ children, tone = 'neutral', mono = false, title }: { chi
   );
 }
 
-export function StatusPill({ status, label }: { status: EmployeeStatus; label?: string }) {
-  return (
-    <span className={cx('pill', `pill-${status}`)}>
-      <span className="dot" style={{ background: STATUS_COLOR[status] }} aria-hidden="true" />
-      {label ?? STATUS_LABEL[status]}
-    </span>
-  );
-}
-
 export function Dot({ color, pulse = false }: { color: string; pulse?: boolean }) {
   return <span className={cx('dot', pulse && 'pulse')} style={{ background: color }} aria-hidden="true" />;
 }
@@ -159,26 +151,68 @@ export interface TabItem<T extends string> {
   tone?: Tone;
 }
 
+/**
+ * A tab list, with the behaviour the `tablist` role promises.
+ *
+ * The markup declared `role="tablist"`/`role="tab"` from the start, but none of
+ * the behaviour: every tab was a tab stop (12 of them in the top bar, so twelve
+ * presses of Tab just to get past the header), and the arrow keys did nothing —
+ * the opposite of what the role leads an assistive-technology user to expect.
+ *
+ * This implements the WAI-ARIA pattern rather than downgrading the roles, because
+ * these *are* tabs: they switch which panel is shown, and `aria-selected` is a
+ * truer statement than `aria-current="page"` for a surface that is not a page.
+ *
+ * Roving `tabIndex` is the property that matters: only the selected tab is
+ * tabbable, and Arrow/Home/End move the selection, which is also what makes the
+ * top bar one tab stop instead of twelve.
+ */
 export function Tabs<T extends string>({ items, active, onChange }: { items: Array<TabItem<T>>; active: T; onChange: (id: T) => void }) {
+  const listRef = useRef<HTMLDivElement>(null);
+
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    const index = items.findIndex((item) => item.id === active);
+    if (index === -1) return;
+    let next = -1;
+    if (event.key === 'ArrowRight') next = (index + 1) % items.length;
+    else if (event.key === 'ArrowLeft') next = (index - 1 + items.length) % items.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = items.length - 1;
+    if (next === -1) return;
+    event.preventDefault();
+    const target = items[next];
+    if (target === undefined) return;
+    onChange(target.id);
+    // Move focus with the selection, so the next arrow press continues from here
+    // rather than from wherever focus happened to be left.
+    const button = listRef.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next];
+    button?.focus();
+  };
+
   return (
-    <div className="tabs" role="tablist">
-      {items.map((item) => (
-        <button
-          key={item.id}
-          type="button"
-          role="tab"
-          aria-selected={item.id === active}
-          className={cx('tab', item.id === active && 'tab-active')}
-          onClick={() => onChange(item.id)}
-        >
-          {item.label}
-          {item.badge !== undefined && item.badge !== null && item.badge !== 0 && (
-            <span className={cx('tab-badge', item.tone === 'warn' && 'tab-badge-warn', item.tone === 'danger' && 'tab-badge-danger')}>
-              {item.badge}
-            </span>
-          )}
-        </button>
-      ))}
+    <div className="tabs" role="tablist" ref={listRef} onKeyDown={onKeyDown}>
+      {items.map((item) => {
+        const selected = item.id === active;
+        return (
+          <button
+            key={item.id}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            // Roving: only the selected tab is in the tab sequence.
+            tabIndex={selected ? 0 : -1}
+            className={cx('tab', selected && 'tab-active')}
+            onClick={() => onChange(item.id)}
+          >
+            {item.label}
+            {item.badge !== undefined && item.badge !== null && item.badge !== 0 && (
+              <span className={cx('tab-badge', item.tone === 'warn' && 'tab-badge-warn', item.tone === 'danger' && 'tab-badge-danger')}>
+                {item.badge}
+              </span>
+            )}
+          </button>
+        );
+      })}
     </div>
   );
 }

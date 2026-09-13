@@ -340,3 +340,76 @@ test('an operator correction changes what the router sees, not just what the UI 
     'clearing the override restores the catalog',
   );
 });
+
+test('a provider is classified as local or remote from its own endpoint', () => {
+  // The classification only decides how loudly an unreachable provider is
+  // reported, but getting it wrong makes every boot of an install with a local
+  // runtime look like a fault. This reads `status()` only - no discovery runs, so
+  // there is no network here.
+  const config = { ...loadConfig(), llmMode: 'mock' as const };
+  const contributed = (id: string, baseUrl: string): ProviderConfig => ({
+    id,
+    label: id,
+    kind: 'openai-compat',
+    baseUrl,
+    apiKey: null,
+    hint: 'contributed by the test',
+    keyless: true,
+  });
+
+  const registry = createProviderRegistry(config, {
+    extraProviders: () => [
+      contributed('lmstudio', 'http://127.0.0.1:1234/v1'),
+      contributed('remote-gateway', 'https://gateway.example.test/v1'),
+      contributed('ipv6-local', 'http://[::1]:11434/v1'),
+    ],
+  });
+
+  const local = (id: string): boolean | undefined =>
+    registry.status().find((provider) => provider.id === id)?.local;
+
+  assert.equal(local('lmstudio'), true, 'a loopback endpoint is local');
+  assert.equal(local('ipv6-local'), true, 'an IPv6 loopback endpoint is local');
+  assert.equal(local('remote-gateway'), false, 'a remote endpoint is not');
+  // The built-in local runtime is loopback too, and the one remote default is not.
+  assert.equal(local('local'), true);
+  assert.equal(local('deepseek'), false);
+});
+
+test('a switched-off model stays visible in the catalog but leaves the routing pool', () => {
+  // The regression this pins: `modelsFor` filtered disabled models out of the
+  // catalog, and the console's model table renders from that catalog — so
+  // clicking Disable removed the only row carrying the Enable button, and the
+  // setting could only be undone by editing the settings file by hand.
+  const config = { ...loadConfig(), llmMode: 'mock' as const };
+  const off = ['deepseek-flash'];
+  const registry = createProviderRegistry(config, { disabledModelIds: () => off });
+
+  const inCatalog = registry.models().find((model) => model.id === 'deepseek-flash');
+  assert.ok(inCatalog, 'the disabled model must still be listed, so it can be switched back on');
+  assert.equal(inCatalog.disabled, true, 'and it must say that it is off');
+
+  assert.equal(
+    registry.routableModels().some((model) => model.id === 'deepseek-flash'),
+    false,
+    'but the router must not be able to pick it',
+  );
+  // A model that is not switched off is untouched.
+  const other = registry.models().find((model) => model.id === 'deepseek-v4-pro');
+  assert.ok(other);
+  assert.notEqual(other.disabled, true);
+});
+
+test('a switched-off model cannot be called even when something still names it', async () => {
+  // A stale pin or a route built before the setting changed would otherwise go
+  // straight at it, because `chat` looks each candidate up in the catalog — and
+  // the catalog now contains disabled models on purpose.
+  const config = { ...loadConfig(), llmMode: 'mock' as const };
+  const registry = createProviderRegistry(config, {
+    disabledModelIds: () => ['deepseek-flash'],
+  });
+  await assert.rejects(
+    () => registry.chat({ providerId: 'deepseek', modelId: 'deepseek-flash' }, [], { messages: [] }),
+    /unavailable/,
+  );
+});

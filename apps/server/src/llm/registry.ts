@@ -35,6 +35,14 @@ export interface RegistryStatus {
   modelSource: DiscoveryMode;
   /** Why discovery failed, when it did. */
   modelSourceDetail: string | null;
+  /**
+   * Whether this provider's endpoint is on this machine.
+   *
+   * Reported so a caller can tell an expected downtime from an actionable one: a
+   * local runtime that is not started yet is the ordinary state of an install,
+   * while a remote provider that cannot be reached is something to say out loud.
+   */
+  local: boolean;
   /** When the model list was last obtained, in epoch milliseconds. */
   discoveredAt: number | null;
 }
@@ -133,6 +141,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Whether a provider's endpoint is on this machine.
+ *
+ * Only used to decide how loudly to report a failed model list: a local runtime
+ * that is not running is the ordinary state of an install, while a remote
+ * provider that cannot be reached is something an operator should be told about.
+ *
+ * An unparseable or absent URL is deliberately *not* local, so a mistake in a
+ * base URL is reported rather than excused.
+ */
+function isLoopbackProvider(baseUrl: string | undefined): boolean {
+  if (baseUrl === undefined) return false;
+  let host: string;
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  // Brackets survive on IPv6 literals, and `::1` is loopback.
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
+}
+
+/**
  * Apply an operator's correction to a catalog model.
  *
  * Returns the same object when there is nothing to change, so the common case
@@ -157,7 +187,8 @@ function applyOverride(model: ModelSpec, override: ModelOverride | undefined): M
   return next;
 }
 
-export function createProviderRegistry(config: ServerConfig, options: RegistryOptions = {}): ProviderRegistry {  let providerConfigs: ProviderConfig[] = [];
+export function createProviderRegistry(config: ServerConfig, options: RegistryOptions = {}): ProviderRegistry {
+  let providerConfigs: ProviderConfig[] = [];
   let providers: LlmProvider[] = [];
   let byId = new Map<string, LlmProvider>();
 
@@ -174,6 +205,7 @@ export function createProviderRegistry(config: ServerConfig, options: RegistryOp
       const cfg = providerConfigs.find((c) => c.id === providerId);
       return cfg !== undefined && isProviderConfigured(cfg);
     },
+    isLocal: (providerId) => isLoopbackProvider(providerConfigs.find((c) => c.id === providerId)?.baseUrl),
     ttlMs: config.discoveryTtlMs,
     cachePath: config.discoveryCachePath,
     ...(options.log !== undefined ? { log: options.log } : {}),
@@ -251,9 +283,15 @@ export function createProviderRegistry(config: ServerConfig, options: RegistryOp
     const seen = new Set<string>();
     const out: ModelSpec[] = [];
     for (const model of [...base, ...extra]) {
-      if (disabled.has(model.id) || seen.has(model.id)) continue;
+      if (seen.has(model.id)) continue;
       seen.add(model.id);
-      out.push(applyOverride(model, overrides[model.id]));
+      const spec = applyOverride(model, overrides[model.id]);
+      // A switched-off model stays **in** the catalog, flagged. Filtering it out
+      // here removed the row that carries the Enable button, so the console could
+      // disable a model and never re-enable it — the catalog is what the operator
+      // reads, and a setting they cannot see they cannot undo. `routableModels`
+      // is the list that excludes it.
+      out.push(disabled.has(model.id) ? { ...spec, disabled: true } : spec);
     }
     // Learned and pooled opinions blend over whatever the catalog and the
     // operator established, so the router ranks on everything known about a
@@ -295,13 +333,18 @@ export function createProviderRegistry(config: ServerConfig, options: RegistryOp
    * demonstrable without a single key.
    */
   function routableModels(): ModelSpec[] {
-    if (config.llmMode === 'mock') return allModels();
+    // A switched-off model is filtered here rather than in `modelsFor`, so the
+    // catalog can still show it with its flag and the operator can turn it back
+    // on. This is the list the router ranks; `allModels()` is the list the console
+    // reads.
+    const routable = (models: ModelSpec[]): ModelSpec[] => models.filter((model) => model.disabled !== true);
+    if (config.llmMode === 'mock') return routable(allModels());
     return providers
       .filter((p) => {
         const cfg = providerConfigs.find((c) => c.id === p.id);
         return cfg !== undefined && isProviderConfigured(cfg);
       })
-      .flatMap((p) => modelsFor(p.id));
+      .flatMap((p) => routable(modelsFor(p.id)));
   }
 
   return {
@@ -344,6 +387,7 @@ export function createProviderRegistry(config: ServerConfig, options: RegistryOp
           modelSource: mode,
           modelSourceDetail:
             mode === 'degraded' ? (report?.error ?? 'discovery failed') : null,
+          local: isLoopbackProvider(cfg?.baseUrl),
           discoveredAt: report?.at ?? null,
         };
       }),
@@ -362,7 +406,11 @@ export function createProviderRegistry(config: ServerConfig, options: RegistryOp
         const model = modelsFor(cand.providerId).find((m) => m.id === cand.modelId);
         const key = `${cand.providerId}/${cand.modelId}`;
 
-        if (!provider || !model) {
+        // A switched-off model must not be callable even if something still names
+        // it — a stale pin, a route built before the setting changed — because
+        // "off" is what the operator asked for and the routing pool is not the
+        // only way a model id arrives here.
+        if (!provider || !model || model.disabled === true) {
           attempted.push(`${key} (unavailable)`);
           continue;
         }

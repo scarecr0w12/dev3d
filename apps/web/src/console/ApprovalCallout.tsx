@@ -31,7 +31,7 @@ const KIND_HINT: Record<ApprovalKind, string> = {
   write: 'write outside the scratch area',
   network: 'reach the network',
   spend: 'exceed a soft spend threshold',
-  risk: 'flagged its own action as risky',
+  risk: 'the employee flagged its own action as risky',
 };
 
 /** How many requests get full inline controls before the rest are summarised. */

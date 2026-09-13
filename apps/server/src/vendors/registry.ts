@@ -30,7 +30,7 @@
  * office's word; the model is given the plain one.
  */
 
-import type { VendorCapabilities, VendorState, VendorStatus } from '@dev3d/core';
+import type { ReadOnlyEnforcement, VendorCapabilities, VendorState, VendorStatus } from '@dev3d/core';
 import type { VendorConfig } from './config.ts';
 import { describeVendorCommand, runVendorCommand, type VendorRunOutcome } from './command.ts';
 import type { SpawnLike } from '../rpc/transport.ts';
@@ -138,6 +138,41 @@ function capabilitiesOf(config: VendorConfig): VendorCapabilities {
   };
 }
 
+/**
+ * The read-only instruction the office prepends to a vendor's prompt.
+ *
+ * `readOnlyEnforcement` distinguishes three levels, and only one of them needs
+ * this:
+ *
+ *  - `sandbox` — the harness has its own enforced read-only mode and the office
+ *    passes the flag. Nothing to add here.
+ *  - `client` — the office mediates every file operation itself (the ACP path),
+ *    so a write is refused whatever the vendor asks for. Advisory only.
+ *  - `requested` — the vendor is an unconfined process with the run's workspace
+ *    as its cwd, and the only thing standing between it and the files is a
+ *    sentence in the prompt. That sentence was never actually sent: the config
+ *    and the tool description both said the vendor "is asked to work read-only",
+ *    but the prompt was exactly the model-authored task, so the only thing that
+ *    had asked was the model.
+ *
+ * Prepending it here rather than trusting a model to include it is the whole
+ * point — this is a fixed, non-model-controlled block. It is still **advisory**
+ * for a `requested` vendor: a harness can ignore it, and nothing verifies that it
+ * did not. That is why the human approval gate matters, and why
+ * `docs/external-agents.md` should say so plainly.
+ */
+export function withReadOnlyInstruction(task: string, enforcement: ReadOnlyEnforcement): string {
+  if (enforcement !== 'requested') return task;
+  return (
+    'You are acting as a read-only contractor for this task.\n' +
+    'Do not create, modify, rename or delete any file, and do not run a command that does. ' +
+    'You may read whatever you need. Report the paths you read, and say plainly if answering ' +
+    'would require a change you are not permitted to make.\n\n' +
+    'Task:\n' +
+    task
+  );
+}
+
 export class VendorRegistry {
   private readonly deps: VendorRegistryDeps;
   private readonly runtimes = new Map<string, VendorRuntime>();
@@ -220,6 +255,7 @@ export class VendorRegistry {
    * rather than to propagate an exception into the turn.
    */
   async delegate(vendorId: string, request: DelegationRequest): Promise<DelegationResult> {
+    const startedAt = Date.now();
     const runtime = this.runtimes.get(vendorId);
     if (runtime === undefined) {
       return this.failed(vendorId, `There is no vendor named "${vendorId}".`, 0);
@@ -263,10 +299,24 @@ export class VendorRegistry {
     // - the guards, the status bookkeeping, the tally - is identical, which is
     // the point of putting the difference behind one branch rather than two
     // delegation paths.
-    const result =
-      runtime.config.transport === 'acp'
-        ? await this.delegateOverAcp(runtime, task, timeoutMs, request)
-        : await this.delegateOverCommand(runtime, task, timeoutMs, request);
+    //
+    // Guarded, because `engaged` gates every later delegation to this vendor
+    // (`registry.ts` refuses a second one while the first runs). If a delegate
+    // threw and nothing released the flag, the vendor would stay `engaged` for
+    // the life of the process and no employee could ever reach it again.
+    let result: DelegationResult;
+    try {
+      result =
+        runtime.config.transport === 'acp'
+          ? await this.delegateOverAcp(runtime, task, timeoutMs, request)
+          : await this.delegateOverCommand(runtime, task, timeoutMs, request);
+    } catch (e) {
+      runtime.activity = null;
+      runtime.status = 'errored';
+      runtime.lastError = e instanceof Error ? e.message : String(e);
+      this.deps.log('warn', 'vendors', `${runtime.config.id}: delegation threw: ${runtime.lastError}`);
+      return this.failed(vendorId, runtime.lastError, Date.now() - startedAt);
+    }
 
     runtime.activity = null;
 
@@ -315,7 +365,13 @@ export class VendorRegistry {
     const result = await runVendorCommand({
       command: config.command,
       args: config.args,
-      prompt: task,
+      // The read-only instruction is *prepended by the office*, not left to the
+      // model. The config and the tool description both said the vendor "is asked
+      // to work read-only", but nothing on this path ever asked: the prompt was
+      // exactly the model-authored task, so the only thing that had asked was the
+      // model — and nothing guaranteed it did. For a `requested` vendor this is
+      // an advisory control, and it is now at least actually extended.
+      prompt: withReadOnlyInstruction(task, config.capabilities.readOnlyEnforcement),
       promptTransport: config.promptTransport,
       cwd: request.cwd,
       timeoutMs,
@@ -376,7 +432,9 @@ export class VendorRegistry {
     const turn = await runAcpTurn({
       command: config.command,
       args: config.args,
-      prompt: task,
+      // Same instruction as the command path: ACP *mediates* writes, but the
+      // vendor is still told what the office expects of it.
+      prompt: withReadOnlyInstruction(task, config.capabilities.readOnlyEnforcement),
       cwd: request.cwd,
       timeoutMs,
       clientName: this.deps.clientName ?? 'dev3d',

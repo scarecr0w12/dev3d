@@ -1,5 +1,12 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<!--
+  `data-theme="dark"` used to sit on this element and was inert: `styles.css` has no
+  `data-theme` rules and no `prefers-color-scheme` block, so nothing ever read it,
+  while the *functional* declaration of the theme is the `color-scheme` meta below
+  (it is what makes form controls and scrollbars dark). An attribute that looks like
+  a switch and switches nothing is worse than no attribute.
+-->
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />

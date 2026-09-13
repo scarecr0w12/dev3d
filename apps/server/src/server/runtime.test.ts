@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { loadConfig } from '../config.ts';
+import { loadConfig, describeMcpGrant } from '../config.ts';
 import { resolveStyle } from '@dev3d/core';
 import { createProviderRegistry } from '../llm/registry.ts';
 import { defaultWorkspace } from '../org/defaultCompany.ts';
@@ -26,6 +26,8 @@ interface Harness {
   runtime: Runtime;
   workspace: string;
   workspacesRoot: string;
+  /** The store behind the runtime, so a test can plant a row the runtime refuses to write. */
+  store: ReturnType<typeof openStore>;
   cleanup(): void;
 }
 
@@ -55,6 +57,7 @@ function makeRuntime(opts: { allowExternal?: boolean } = {}): Harness {
     runtime,
     workspace,
     workspacesRoot,
+    store,
     cleanup: () => {
       runtime.close();
       store.close();
@@ -415,11 +418,146 @@ test('a role with neither run_shell nor a named grant gets nothing', () => {
   assert.equal(mcpGrantedForRole(qa, config), false);
 });
 
-test('the shipped config grants MCP to the roles holding run_shell', () => {
-  // Guards the default itself: if `mcpGrantToShellRoles` ever stops being what
-  // DEV3D_MCP_GRANT_ROLES defaults to, this fails.
-  const config = loadConfig();
-  assert.equal(config.mcpGrantToShellRoles, true);
-  const role = { id: 'frontend-dev-1', allowedTools: ['run_shell'] };
-  assert.equal(mcpGrantedForRole(role, config), true);
+test('by default nobody is granted MCP tools, and a role holding run_shell is no exception', () => {
+  // The default used to be `shell-roles`, so every role holding `run_shell` silently
+  // received every tool from every connected server. `run_shell` is approval-gated and
+  // runs in the run's workspace; a remote server's tool is somebody else's program
+  // with reach dev3d cannot confine. Inheriting one from the other made the operator's
+  // consent for `run_shell` stand in for consent they never gave.
+  const config = { mcpGrantRoles: [] as string[], mcpGrantToShellRoles: false };
+  assert.equal(mcpGrantedForRole(dev, config), false, 'not even for a role with run_shell');
+  assert.equal(mcpGrantedForRole(ceo, config), false);
+});
+
+test('the shipped default is default-deny, whatever this machine\u2019s .env says', () => {
+  // Read with the variable cleared rather than through `loadConfig()` alone: the
+  // operator's own `.env` legitimately sets `shell-roles`, and a test that only read
+  // that would be asserting their file rather than the default shipped to everyone.
+  const previous = process.env['DEV3D_MCP_GRANT_ROLES'];
+  delete process.env['DEV3D_MCP_GRANT_ROLES'];
+  try {
+    const config = loadConfig();
+    assert.deepEqual(config.mcpGrantRoles, [], 'the shipped default grants nothing');
+    assert.equal(config.mcpGrantToShellRoles, false);
+    assert.equal(config.mcpRequireApproval, true, 'and the approval gate is on');
+    assert.equal(mcpGrantedForRole({ id: 'x', allowedTools: ['run_shell'] }, config), false);
+  } finally {
+    if (previous !== undefined) process.env['DEV3D_MCP_GRANT_ROLES'] = previous;
+  }
+});
+
+test('`shell-roles` is still honoured when an operator asks for it', () => {
+  const previous = process.env['DEV3D_MCP_GRANT_ROLES'];
+  process.env['DEV3D_MCP_GRANT_ROLES'] = 'shell-roles';
+  try {
+    const config = loadConfig();
+    assert.deepEqual(config.mcpGrantRoles, ['shell-roles']);
+    assert.equal(config.mcpGrantToShellRoles, true);
+    assert.equal(mcpGrantedForRole({ id: 'dev', allowedTools: ['run_shell'] }, config), true);
+  } finally {
+    if (previous === undefined) delete process.env['DEV3D_MCP_GRANT_ROLES'];
+    else process.env['DEV3D_MCP_GRANT_ROLES'] = previous;
+  }
+});
+
+test('the boot line states who may call extension tools, and that they are unconfined', () => {
+  // The line exists so the blast radius of the setting is legible without reading
+  // `.env` — the same reasoning as the auto-approve warning.
+  const denied = describeMcpGrant({ mcpGrantRoles: [], mcpGrantToShellRoles: false, mcpRequireApproval: true });
+  assert.match(denied, /nobody/);
+  assert.match(denied, /asks a human/);
+  assert.match(denied, /not confined to the workspace/);
+
+  const shellRoles = describeMcpGrant({ mcpGrantRoles: ['shell-roles'], mcpGrantToShellRoles: true, mcpRequireApproval: true });
+  assert.match(shellRoles, /holding run_shell/);
+
+  const everyone = describeMcpGrant({ mcpGrantRoles: ['*'], mcpGrantToShellRoles: false, mcpRequireApproval: false });
+  assert.match(everyone, /every role/);
+  assert.match(everyone, /approval is OFF/);
+});
+
+test('the token stream is broadcast but never written to the log', () => {
+  // Two things depend on this fact. Persisting it made the durable history almost
+  // entirely deliberation — a measured 3,483 `turn.reasoning` rows in a single run,
+  // 96% of every event in the database — and replaying it is what doubled a client's
+  // live buffer, because the client's delta handler is a blind append.
+  const h = makeRuntime();
+  try {
+    const before = h.runtime.state().activeWorkspaceId;
+    assert.equal(typeof before, 'string');
+    const start = Date.now();
+    h.runtime.emit({ type: 'turn.delta', runId: 'run_x', turnId: 'turn_x', text: 'to', at: start });
+    h.runtime.emit({ type: 'turn.delta', runId: 'run_x', turnId: 'turn_x', text: 'ken', at: start + 1 });
+    h.runtime.emit({ type: 'turn.reasoning', runId: 'run_x', turnId: 'turn_x', text: 'thinking', at: start + 2 });
+    // A turn-level event that *is* record, so the test would notice a filter that
+    // simply dropped everything for this run.
+    h.runtime.emit({
+      type: 'turn.started',
+      turn: {
+        id: 'turn_x',
+        runId: 'run_x',
+        stageId: 'stage_x',
+        employeeId: 'ceo',
+        roleId: 'ceo',
+        purpose: 'test',
+        route: { providerId: 'mock', modelId: 'mock', tier: 'standard', taskClass: 'coding', reason: 'test', fallbacks: [], considered: [] },
+        status: 'running',
+        startedAt: start,
+        endedAt: null,
+        usage: { tokensIn: 0, tokensOut: 0, costUsd: 0 },
+        text: '',
+        reasoning: null,
+        toolCalls: [],
+        skills: [],
+        wroteFiles: [],
+        error: null,
+      },
+      at: start + 3,
+    });
+
+    const stored = h.runtime.replayableEvents('run_x');
+    assert.deepEqual(
+      stored.map((event) => event.type),
+      ['turn.started'],
+      'only the record, not the stream',
+    );
+
+    // And a row that *is* on disk is filtered out of the replay. This is the case
+    // that matters: the token rows already in a long-lived database were written
+    // before the persistence rule changed, and a replayed delta is a blind append on
+    // the client — onto a buffer that may already hold the live text — which doubles
+    // it. Appended straight to the store, because the runtime will not write one.
+    h.store.appendEvent({
+      runId: 'run_x',
+      type: 'turn.delta',
+      payloadJson: JSON.stringify({ type: 'turn.delta', runId: 'run_x', turnId: 'turn_x', text: 'to', at: start + 4 }),
+      at: start + 4,
+    });
+    assert.deepEqual(
+      h.runtime.replayableEvents('run_x').map((event) => event.type),
+      ['turn.started'],
+      'a delta row on disk is still not replayed',
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('the state frame says whether a provider is on this machine', () => {  // The registry has always known this and the state frame dropped it, so a local
+  // runtime that was simply not started rendered exactly like a remote provider that
+  // could not be reached — an expected state of an install presented as a fault.
+  const h = makeRuntime();
+  try {
+    const providers = h.runtime.state().providers;
+    assert.ok(providers.length > 0, 'the shipped config has providers');
+    for (const provider of providers) {
+      assert.equal(typeof provider.local, 'boolean', `${provider.id} must say whether it is local`);
+    }
+    // The distinction has to be real, not a constant: the mock registry's providers
+    // are the shipped ones, and at least one of them is a local runtime.
+    const registryFlags = createProviderRegistry(loadConfig()).status().map((status) => `${status.id}:${status.local}`);
+    assert.ok(registryFlags.length > 0, registryFlags.join(', '));
+  } finally {
+    h.cleanup();
+  }
 });

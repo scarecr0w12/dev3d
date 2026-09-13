@@ -16,6 +16,7 @@ import {
   parseMessage,
   request,
   type JsonRpcId,
+  type JsonRpcRequest,
   type JsonRpcResponse,
 } from '../rpc/jsonrpc.ts';
 import type { JsonRpcTransport } from '../rpc/transport.ts';
@@ -84,6 +85,36 @@ export class McpClient {
   private info: McpServerInfo | null = null;
   /** Tools the server last advertised. Refreshed by `listTools`. */
   private cachedTools: McpToolInfo[] | null = null;
+  /**
+   * Called when the connection dies rather than being closed.
+   *
+   * `failAll` rejected in-flight calls and recorded a reason, but nothing above
+   * it could find out: the manager kept reporting the last successful probe, kept
+   * handing out the now-dead tool names, and a role's grant and the console's
+   * green row both survived the crash. This is the signal that lets the owner of
+   * the connection decide what a dead server means.
+   */
+  private onFatal: ((error: Error) => void) | null = null;
+
+  /** Called when the server announces that its tool list changed. */
+  private toolsChanged: (() => void) | null = null;
+
+  /** Subscribe to an unexpected disconnection. Called at most once. */
+  onFatalError(handler: (error: Error) => void): void {
+    this.onFatal = handler;
+  }
+
+  /**
+   * Subscribe to `notifications/tools/list_changed`.
+   *
+   * The server is telling us its tool set moved. Without this the published set
+   * was frozen at connect time: a server that added or removed a tool at runtime
+   * kept advertising the stale names, and the only remedy was a restart, because
+   * `refresh` cannot re-list a connection that is otherwise healthy.
+   */
+  onToolsChanged(handler: () => void): void {
+    this.toolsChanged = handler;
+  }
 
   constructor(transport: McpTransport, options: McpClientOptions = {}) {
     this.transport = transport;
@@ -113,7 +144,7 @@ export class McpClient {
    */
   async connect(): Promise<McpServerInfo> {
     this.transport.onMessage((raw) => this.handleMessage(raw));
-    this.transport.onError((err) => this.failAll(err));
+    this.transport.onError((err) => this.failAll(err, true));
 
     await this.transport.start();
 
@@ -121,7 +152,13 @@ export class McpClient {
       'initialize',
       {
         protocolVersion: MCP_PROTOCOL_VERSION,
-        capabilities: { tools: {} },
+        // Empty, and that is the honest answer. `tools` is a *server* capability,
+        // not a client one — `ClientCapabilities` is `{ experimental?, roots?,
+        // sampling?, elicitation? }` — and claiming it declared something the
+        // schema does not define. This client implements none of the four, so it
+        // claims none: a strict validator is entitled to reject an unknown key
+        // with `-32602`, and a permissive one learns nothing either way.
+        capabilities: {},
         clientInfo: { name: this.options.clientName, version: this.options.clientVersion },
       },
       this.options.handshakeTimeoutMs,
@@ -272,12 +309,20 @@ export class McpClient {
     const msg = parseMessage(raw);
     if (msg === null) return;
 
-    // Notifications are acknowledged and ignored: this client registers no
-    // notification handlers, but a server is entitled to send them.
-    if (!('id' in msg) || msg.id === undefined || msg.id === null) {
-      if ('method' in msg) return;
+    // A request *from* the server has to be told apart from a response *to* us,
+    // and the discriminator is `method`, not `id`. Both carry an id, so checking
+    // only for an id made a server→client request — `sampling/createMessage`,
+    // `roots/list`, `ping` — look like the answer to whatever call happened to be
+    // in flight: the pending promise resolved with `response.result`, which is
+    // `undefined`, and the server was left waiting for a reply forever. Silent
+    // wrong data is the worst failure mode available here.
+    if ('method' in msg) {
+      this.handleServerMessage(msg as JsonRpcRequest);
       return;
     }
+
+    // A notification has no id and expects no answer.
+    if (!('id' in msg) || msg.id === undefined || msg.id === null) return;
 
     const entry = this.pending.get(msg.id);
     if (entry === undefined) return; // A response to something already abandoned.
@@ -296,13 +341,73 @@ export class McpClient {
     entry.resolve(response.result);
   }
 
+  /**
+   * Answer something the server asked *us*.
+   *
+   * `ping` is the one request the MCP specification obliges a client to answer,
+   * and it is how a server decides the connection is still worth keeping.
+   * Everything else — sampling, roots, elicitation — is a capability this office
+   * does not advertise, so the honest reply is "method not found": the server
+   * then knows not to ask again, rather than hanging on a promise nobody will
+   * settle. Refusing by name is also what the ACP side already does
+   * (`vendors/acp.ts`), and the two protocols share this transport.
+   */
+  private handleServerMessage(msg: JsonRpcRequest): void {
+    // A notification has no id and expects no answer — but some of them carry
+    // information worth acting on, so it is handled before the early return
+    // rather than dropped.
+    if (msg.id === undefined) {
+      if (msg.method === 'notifications/tools/list_changed') this.toolsChanged?.();
+      return;
+    }
+    const reply = (payload: Record<string, unknown>): void => {
+      try {
+        this.transport.send(payload);
+      } catch {
+        // A transport that cannot carry the reply is already failing; the close
+        // path reports why.
+      }
+    };
+
+    if (msg.method === 'ping') {
+      reply({ jsonrpc: '2.0', id: msg.id, result: {} });
+      return;
+    }
+    if (msg.method.startsWith('notifications/')) return;
+    reply({
+      jsonrpc: '2.0',
+      id: msg.id,
+      error: {
+        code: RPC_ERRORS.methodNotFound,
+        message:
+          `This office does not implement "${msg.method}". It advertises no client capabilities, ` +
+          'so it cannot answer sampling, roots or elicitation requests.',
+      },
+    });
+  }
+
   /** Reject everything in flight, e.g. because the connection died. */
-  private failAll(error: Error): void {
+  /**
+   * Reject everything in flight, e.g. because the connection died.
+   *
+   * `unexpected` distinguishes a transport failure — a crashed server, a closed
+   * pipe — from our own `close()`. Only the former is reported upward: a
+   * deliberate shutdown is not news, and waking the manager for it would make it
+   * mark a connection failed that it just chose to remove.
+   */
+  private failAll(error: Error, unexpected = false): void {
     if (this.closeReason === null) this.closeReason = error;
     for (const [id, entry] of this.pending) {
       clearTimeout(entry.timer);
       this.pending.delete(id);
       entry.reject(new Error(`MCP ${entry.method} on ${this.label} failed: ${error.message}`));
+    }
+    if (unexpected) {
+      const notify = this.onFatal;
+      // Cleared first, so a client that keeps failing reports once: the manager
+      // acts by tearing the connection down, and a second report would race that.
+      this.onFatal = null;
+      notify?.(error);
     }
   }
 }

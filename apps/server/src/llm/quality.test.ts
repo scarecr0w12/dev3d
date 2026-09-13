@@ -95,9 +95,12 @@ test('a source that named no class does not vote on that class', () => {
 test('every opinion is kept so any number can be explained', () => {
   const blended = blendQuality([opinion('curated', 0.7, 0.5), opinion('learned', 0.6, 0.3)]);
   assert.ok(blended);
-  assert.equal(blended.opinions.length, 2);
+  // `opinions` is optional on the type only because the *state frame* projects it
+  // away; the blend that the router ranks on always carries all of them.
+  const opinions = blended.opinions ?? [];
+  assert.equal(opinions.length, 2, 'the blend keeps every opinion');
   assert.deepEqual(
-    blended.opinions.map((o) => o.source),
+    opinions.map((o) => o.source),
     ['curated', 'learned'],
   );
 });
@@ -218,7 +221,7 @@ test('a learned opinion blends over the curated baseline', () => {
   const specs = applyOpinions([spec('m', curated)], fromMap(new Map([['m', opinion('learned', 0.9, 0.5)]])));
   const result = specs[0]?.quality;
   assert.ok(result);
-  assert.equal(result.opinions.length, 2);
+  assert.equal(result.opinions?.length, 2, 'the curated baseline and the learned opinion both survive');
   assert.equal(result.quality, 0.7, 'the midpoint of two equally confident opinions');
 });
 

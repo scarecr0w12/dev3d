@@ -34,6 +34,8 @@
  */
 
 import { spawn } from 'node:child_process';
+import { childEnv } from '../security/childEnv.ts';
+import { killProcessTree } from '../security/processTree.ts';
 import type { ChildLike, SpawnLike } from '../rpc/transport.ts';
 
 // The child-process seam is shared with the stdio transport (`rpc/transport.ts`)
@@ -135,21 +137,29 @@ export function runVendorCommand(options: VendorRunOptions): Promise<VendorRunRe
     }
 
     function killIfPossible(): void {
-      try {
-        child?.kill('SIGKILL');
-      } catch {
-        // The process may already be gone; nothing to do about it.
-      }
+      // The tree, not just the process: a third-party harness is exactly the kind
+      // of program that starts something and leaves it running (`npx` resolving a
+      // package, a wrapper around a build tool), and on Windows killing the direct
+      // child ends the launcher, not what it launched. The same helper the shell
+      // tool uses, so the two cannot disagree about what "killed" means.
+      killProcessTree(child ?? { kill: () => false });
     }
 
     function onAbort(): void {
       killIfPossible();
+      // The same wedge, reached by cancelling instead of by timing out: a kill
+      // that never produces `close` must still end the delegation, or an
+      // operator's Cancel leaves the turn hanging with no way back.
+      settleAfterKill('aborted', 'Cancelled by the operator.');
     }
 
     try {
       child = spawnFn(options.command, args, {
         cwd: options.cwd,
-        env: { ...process.env, ...(options.env ?? {}) },
+        // A third-party harness is somebody else's program, so it does not
+        // inherit the office's provider credentials; an operator can still pass
+        // what a specific vendor needs through `options.env`.
+        env: childEnv(options.env),
         // stdin is a pipe only when the prompt goes there; otherwise it is
         // closed, so a harness that reads stdin does not block waiting for
         // input that is never coming.
@@ -229,9 +239,40 @@ export function runVendorCommand(options: VendorRunOptions): Promise<VendorRunRe
       settle(finish(outcome, code, signal, stdout, stderr, stdoutTruncated, started, detail));
     });
 
+    /**
+     * How long to wait for the process to die after a kill before reporting
+     * anyway.
+     *
+     * `close` fires when the child's stdio streams are closed, which is *not*
+     * the same as the process exiting: a harness that leaves a grandchild
+     * holding the pipes — the `npx` case the module comment names — never emits
+     * `close` at all. Since `settle` was reachable only from `error` and `close`,
+     * the delegation promise never settled, the turn hung, and because
+     * `runtime.status` had already been set to `engaged` every later delegation
+     * to that vendor was refused until the office was restarted.
+     */
+    const KILL_GRACE_MS = 2_000;
+
+    /**
+     * Report the run as finished after a kill, whether or not `close` arrives.
+     *
+     * The timeout is a ceiling on the delegation, so it has to actually end it.
+     */
+    function settleAfterKill(outcome: VendorRunOutcome, detail: string): void {
+      if (settled) return;
+      setTimeout(() => {
+        if (settled) return;
+        settle(finish(outcome, null, 'SIGKILL', stdout, stderr, stdoutTruncated, started, detail));
+      }, KILL_GRACE_MS).unref?.();
+    }
+
     timer = setTimeout(() => {
       timedOut = true;
       killIfPossible();
+      settleAfterKill(
+        'timeout',
+        `${label} did not finish within ${options.timeoutMs}ms and was killed.`,
+      );
     }, options.timeoutMs);
 
     if (options.signal) {

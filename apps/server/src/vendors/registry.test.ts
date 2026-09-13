@@ -13,7 +13,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { VendorRegistry, parseVendorToolName, vendorToolName } from './registry.ts';
+import { VendorRegistry, parseVendorToolName, vendorToolName, withReadOnlyInstruction } from './registry.ts';
 import type { VendorConfig } from './config.ts';
 import { FakeChild, childThatFails, childThatHangs, childThatSucceeds, spawnEach } from './testing.ts';
 import type { SpawnCall } from './testing.ts';
@@ -35,6 +35,60 @@ function config(overrides: Partial<VendorConfig> = {}): VendorConfig {
     ...overrides,
   };
 }
+
+/**
+ * A read-only instruction is prepended by the office, not left to the model.
+ *
+ * The regression this pins: `config.ts` and the tool description both said a
+ * `requested`-enforcement vendor "is asked to work read-only", but nothing on the
+ * delegation path ever asked — the prompt was exactly the model-authored task. So
+ * the only thing that had asked was the model, and nothing guaranteed it did.
+ */
+test('a requested vendor is actually told to work read-only', () => {
+  const task = 'summarise the routing module';
+  const asked = withReadOnlyInstruction(task, 'requested');
+  assert.match(asked, /read-only contractor/);
+  assert.match(asked, /Do not create, modify, rename or delete/);
+  // The instruction is fixed and comes first; the task is appended verbatim.
+  assert.ok(asked.indexOf('read-only contractor') < asked.indexOf(task));
+  assert.ok(asked.endsWith(task), 'the model-authored task must survive unchanged');
+
+  // A harness with its own enforced sandbox needs no advisory sentence, and one
+  // the office mediates itself already refuses writes.
+  assert.equal(withReadOnlyInstruction(task, 'sandbox'), task);
+  assert.equal(withReadOnlyInstruction(task, 'client'), task);
+});
+
+test('the read-only instruction reaches the vendor prompt', async () => {
+  const { spawnFn, calls } = spawnEach(() => childThatSucceeds('read it'));
+  const registry = new VendorRegistry(
+    [
+      config({
+        id: 'asked',
+        command: 'dsh',
+        args: [],
+        capabilities: {
+          readOnlyEnforcement: 'requested',
+          reportsFiles: false,
+          streams: false,
+          reportsCost: false,
+        },
+      }),
+    ],
+    { log: recorder().log, spawnFn },
+  );
+  await registry.start();
+  calls.length = 0;
+  await registry.delegate('asked', { task: 'read the router', cwd: '/workspace' });
+
+  const spawned = calls[calls.length - 1];
+  assert.ok(spawned, 'the vendor was started');
+  // `promptTransport: 'argv'` appends the prompt as one argument, so the whole
+  // thing must be there — instruction first, task last.
+  const prompt = spawned.args[spawned.args.length - 1] ?? '';
+  assert.match(prompt, /read-only contractor/, 'the office asks, not the model');
+  assert.ok(prompt.endsWith('read the router'), `the task must survive: ${prompt}`);
+});
 
 /** A logger that keeps what it was told, so a warning can be asserted on. */
 function recorder(): {

@@ -16,7 +16,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -193,6 +193,66 @@ test('a read inside the workspace is served from disk', async () => {
 
     assert.equal(result.outcome, 'ok');
     assert.deepEqual(asked()?.['result'], { content: 'line one\nline two\nline three\n' });
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('a read naming another session, or no session, is refused', async () => {
+  // The session id was decorative: `fs/read_text_file` was served for any path the
+  // agent asked for, whatever session it claimed, so confinement was the workspace
+  // and nothing else. The office opens exactly one session per delegation, and a
+  // read must be in it.
+  const ws = workspace();
+  try {
+    for (const [label, params] of [
+      ['another session', { sessionId: 'sess_someone_else', path: 'session.ts' }],
+      ['no session at all', { path: 'session.ts' }],
+    ] as const) {
+      const { wire, asked } = wireAsking(31, 'fs/read_text_file', params);
+      const result = await runAcpTurn({
+        command: 'openclaw',
+        cwd: ws.root,
+        timeoutMs: 5_000,
+        clientName: 'dev3d',
+        clientVersion: '1.0.0',
+        prompt: 'read it',
+        transport: wire,
+      });
+
+      assert.equal(result.outcome, 'ok', 'the delegation continues; only the read is refused');
+      const answer = asked();
+      assert.ok(answer && 'error' in answer, `${label} must be refused`);
+      assert.doesNotMatch(JSON.stringify(answer), /line one/, `${label} must not be served`);
+    }
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('a link out of the workspace is refused by the ACP read too', async () => {
+  // The other half of the same finding: the read boundary has to be the real one.
+  // `resolveInWorkspace` resolves the canonical path *and* refuses any component
+  // that is a reparse point, so a junction planted inside the workspace is not a
+  // way to read outside it — which is the case a lexical check cannot see.
+  const ws = workspace();
+  try {
+    symlinkSync(join(ws.root, '..'), join(ws.root, 'up'), 'junction');
+    const { wire, asked } = wireAsking(41, 'fs/read_text_file', { sessionId: 'sess_1', path: 'up/secret.txt' });
+    const result = await runAcpTurn({
+      command: 'openclaw',
+      cwd: ws.root,
+      timeoutMs: 5_000,
+      clientName: 'dev3d',
+      clientVersion: '1.0.0',
+      prompt: 'follow the link',
+      transport: wire,
+    });
+
+    assert.equal(result.outcome, 'ok');
+    const answer = asked();
+    assert.ok(answer && 'error' in answer, 'the link must be refused, not followed');
+    assert.doesNotMatch(JSON.stringify(answer), /not yours/, 'and its contents must not leak');
   } finally {
     ws.cleanup();
   }

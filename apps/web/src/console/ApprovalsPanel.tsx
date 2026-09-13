@@ -7,7 +7,7 @@
  * approval is the one thing that stops the office dead.
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import type { Approval, ApprovalKind, ClientCommand } from '@dev3d/core';
 
@@ -58,6 +58,32 @@ export function ApprovalsPanel() {
     },
     [store],
   );
+
+  /**
+   * A row stops being "sending…" as soon as the office says otherwise.
+   *
+   * `store.send` returning true means only that a transport was attached — not
+   * that the server accepted the command. The local `sent` map was never cleared
+   * for any approval, so a *failed* decision left the buttons on "sending…"
+   * permanently and a decision made in another tab left a stuck row for an
+   * approval that no longer existed. Anything not still pending re-enables the
+   * controls, which covers both: the state comes from the approval itself rather
+   * than from a timer guessing at a round trip.
+   */
+  useEffect(() => {
+    if (pending.length === approvals.length) return;
+    setSent((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const approval of approvals) {
+        if (approval.status === 'pending') continue;
+        if (next[approval.id] === undefined) continue;
+        delete next[approval.id];
+        changed = true;
+      }
+      return changed ? next : current;
+    });
+  }, [approvals, pending.length]);
 
   return (
     <Panel

@@ -50,11 +50,17 @@ import type {
   UiPanelContribution,
 } from '@dev3d/core';
 import { PLUGIN_API_VERSION } from '@dev3d/core';
+// The naming rule lives in core so the console checks a manifest's declared tool
+// names against the host's registrations using *this* function, not a copy of it.
+import { namespacedToolName, toolNamespace } from '@dev3d/core';
+export { namespacedToolName, toolNamespace };
 import type { ServerConfig } from '../config.ts';
 import type { Tool, ToolRegistry } from '../tools/types.ts';
 import { BundleError, extractTarGz, findPluginRoot, sha256Hex } from './bundle.ts';
-import { coerceSettings, defaultSettings, validateManifest } from './manifest.ts';
+import { coercePersistedState, coerceSettings, defaultSettings, validateManifest } from './manifest.ts';
 import { createPanelReader, type PanelReadResult } from './panels.ts';
+import { isPathInside, assertNoReparsePoint } from '../tools/paths.ts';
+import { checkHostIsPublic, fetchGuarded } from '../security/webGuard.ts';
 
 export interface ActiveContributions {
   providers: Array<{ pluginId: string; provider: PluginProvider }>;
@@ -120,22 +126,6 @@ export interface PluginHost {
 }
 
 /** `dev3d.cost-guard` -> `dev3d_cost_guard`, so tool names cannot collide. */
-export function toolNamespace(pluginId: string): string {
-  return pluginId
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 40);
-}
-
-export function namespacedToolName(pluginId: string, toolName: string): string {
-  const clean = toolName
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '');
-  return `${toolNamespace(pluginId)}_${clean}`.slice(0, 64);
-}
-
 function errMsg(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -211,6 +201,9 @@ export function createPluginHost(options: {
   const panelReader = createPanelReader({
     panels: () => contributions().uiPanels,
     log: (level, scope, message) => log(level, scope, message),
+    // Off unless the operator opted in: a panel source is fetched by the server and
+    // drawn on the operator's screen, so a plugin could otherwise probe the machine.
+    allowPrivateHosts: config.allowPrivatePanelHosts,
   });
 
   function sourceDirectories(): Array<{ dir: string; source: PluginRecord['source'] }> {
@@ -252,7 +245,7 @@ export function createPluginHost(options: {
     error: string | null,
   ): PluginRecord {
     const contributions = manifest.contributes ?? {};
-    return {
+    const record: PluginRecord = {
       manifest,
       directory,
       source,
@@ -267,12 +260,75 @@ export function createPluginHost(options: {
         roleTemplates: contributions.roleTemplates?.length ?? 0,
         pipelines: contributions.pipelines?.length ?? 0,
         routingRules: contributions.routingRules?.length ?? 0,
-        tools: contributions.toolNames?.length ?? 0,
+        // Deliberately not the declared `contributes.toolNames` count: a manifest
+        // claiming six tools that registers none must not read as six. The real
+        // number is published by `publishToolContributions` once activate() ran.
+        tools: 0,
         uiPanels: contributions.uiPanels?.length ?? 0,
       },
+      registeredToolNames: [],
+      // The endpoints, filled in by `buildRecord` itself below — a record built for a
+      // manifest that declares providers must name them from the start, because the
+      // card renders before activation.
+      contributedProviderHosts: [],
       settings: effectiveSettings(manifest),
       installedAt: Date.now(),
     };
+    publishProviderHosts(record, contributions.providers ?? []);
+    return record;
+  }
+
+  /**
+   * Publish the tools a plugin actually holds, for the consent screen.
+   *
+   * `contributions.tools` and `registeredToolNames` are always written together
+   * so the count and the list can never disagree.
+   */
+  function publishToolContributions(plugin: LoadedPlugin): void {
+    plugin.record.contributions.tools = plugin.registeredTools.length;
+    plugin.record.registeredToolNames = [...plugin.registeredTools];
+  }
+
+  /**
+   * Publish where a plugin would send the office's prompts.
+   *
+   * A contributed provider is a destination for *everything the model sees*, and the
+   * card showed only a count. Each host is taken from the manifest as validated
+   * (https, or loopback for a keyless local runtime), so what is displayed is what
+   * the registry will actually dial.
+   */
+  function publishProviderHosts(record: PluginRecord, providers: readonly PluginProvider[]): void {
+    record.contributedProviderHosts = providers.map((provider) => {
+      let host = provider.baseUrl;
+      try {
+        host = new URL(provider.baseUrl).host;
+      } catch {
+        /* keep the raw string: a URL this malformed is worth seeing as-is */
+      }
+      return { id: provider.id, label: provider.label, host, keyless: provider.keyless === true };
+    });
+  }
+
+  /**
+   * Take back everything a half-finished `activate()` managed to register.
+   *
+   * A plugin that throws halfway through activation must leave no trace: a tool
+   * it registered before throwing would otherwise stay callable by the engine
+   * while its record reads `error`. Every activation failure path goes through
+   * here so no fix can be applied to one and forgotten in another.
+   */
+  function rollbackActivation(plugin: LoadedPlugin): void {
+    for (const name of plugin.registeredTools) tools.unregister(name);
+    for (const unsubscribe of plugin.unsubscribes) {
+      try {
+        unsubscribe();
+      } catch {
+        /* an observer that cannot unsubscribe is already gone */
+      }
+    }
+    plugin.registeredTools = [];
+    plugin.unsubscribes = [];
+    publishToolContributions(plugin);
   }
 
   /** Wrap a plugin tool so the engine sees an ordinary `Tool`. */
@@ -304,9 +360,17 @@ export function createPluginHost(options: {
     if (manifest.entry === undefined || manifest.entry === '') return;
 
     const entryPath = resolve(directory, manifest.entry);
-    if (!entryPath.startsWith(resolve(directory))) {
+    // Boundary-aware, not a bare string prefix: `C:\plugins\foo-evil\x.js` starts
+    // with `C:\plugins\foo`, so a sibling directory used to satisfy a check whose
+    // whole job was to prove the entry stayed inside the plugin's own directory.
+    if (!isPathInside(directory, entryPath)) {
       throw new Error(`entry "${manifest.entry}" escapes the plugin directory.`);
     }
+    // And the path being inside is not enough, because a component of it can be a
+    // link: `plugins/foo/lib` as a junction to `plugins/foo-evil` makes
+    // `lib/x.js` a path inside `foo` that imports a module from a directory the
+    // plugin does not own. The manifest's `..` check cannot see it either.
+    assertNoReparsePoint(directory, entryPath, 'the plugin directory');
     if (!existsSync(entryPath)) throw new Error(`entry module "${manifest.entry}" does not exist.`);
 
     const module = (await import(pathToFileURL(entryPath).href)) as Partial<PluginModule>;
@@ -317,11 +381,40 @@ export function createPluginHost(options: {
       plugin.deactivate = module.deactivate;
     }
 
+    /**
+     * The manifest's permission list, enforced rather than displayed.
+     *
+     * `permissions` was written into the manifest and then read by exactly two
+     * *warnings* and the console's descriptive copy — nothing in this host
+     * consulted it. So the consent screen told an operator that a plugin "asks
+     * for" a set of capabilities while the runtime drew no boundary at all: a
+     * plugin declaring `["models"]` could register a tool and subscribe to the
+     * event stream, and one that declared nothing could do the same. A consent
+     * record that nothing enforces is worse than no record, because it is
+     * believed.
+     *
+     * `activate()` itself remains unmediated code in this process — Node cannot
+     * unload an ES module and there is no sandbox around the import — and that is
+     * stated plainly in the docs and badged in the console. What this closes is
+     * the narrower, fixable gap: the *host's own* API surface now honours the
+     * declaration, so a plugin cannot acquire a capability through the supported
+     * path that its manifest did not ask for.
+     */
+    const granted = new Set<PluginPermission>(manifest.permissions ?? []);
+    const requirePermission = (permission: PluginPermission, what: string): void => {
+      if (granted.has(permission)) return;
+      throw new Error(
+        `${manifest.id}: ${what} needs the "${permission}" permission, which its manifest does not declare. ` +
+          `Declared: ${granted.size === 0 ? '(none)' : [...granted].join(', ')}.`,
+      );
+    };
+
     const api: PluginApi = {
       manifest,
       settings: plugin.record.settings,
       log: (level, message) => log(level, `plugin:${manifest.id}`, message),
       registerTool: (tool) => {
+        requirePermission('tools', 'registerTool');
         if (typeof tool?.name !== 'string' || tool.name.trim() === '') {
           throw new Error('registerTool needs a tool with a name.');
         }
@@ -336,6 +429,7 @@ export function createPluginHost(options: {
         plugin.registeredTools.push(name);
       },
       on: (type, handler) => {
+        requirePermission('events', 'subscribing to the event stream');
         const unsubscribe = options.subscribe((event) => {
           if (event.type !== type) return;
           try {
@@ -409,17 +503,14 @@ export function createPluginHost(options: {
         await activatePlugin(plugin);
       } catch (error) {
         // Contain it: take back whatever activate() managed before it threw.
-        for (const name of plugin.registeredTools) tools.unregister(name);
-        for (const unsubscribe of plugin.unsubscribes) unsubscribe();
-        plugin.registeredTools = [];
-        plugin.unsubscribes = [];
+        rollbackActivation(plugin);
         plugin.record.status = 'error';
         plugin.record.error = errMsg(error);
         log('error', `plugin:${manifest.id}`, `failed to activate: ${errMsg(error)}`);
       }
     }
 
-    plugin.record.contributions.tools = plugin.registeredTools.length;
+    publishToolContributions(plugin);
     loaded.set(manifest.id, plugin);
   }
 
@@ -468,6 +559,10 @@ export function createPluginHost(options: {
         error: failure.error,
         hasCode: false,
         contributions: { ...EMPTY_COUNTS },
+        // A directory that never yielded a manifest never registered anything, and
+        // never named an endpoint.
+        registeredToolNames: [],
+        contributedProviderHosts: [],
         settings: {},
         installedAt: Date.now(),
       });
@@ -580,13 +675,14 @@ export function createPluginHost(options: {
     try {
       await activatePlugin(fresh);
     } catch (error) {
+      rollbackActivation(fresh);
       fresh.record.status = 'error';
       fresh.record.error = errMsg(error);
       loaded.set(pluginId, fresh);
       options.onChange();
       return { ok: false, error: errMsg(error) };
     }
-    fresh.record.contributions.tools = fresh.registeredTools.length;
+    publishToolContributions(fresh);
     loaded.set(pluginId, fresh);
     options.onChange();
     return { ok: true };
@@ -621,9 +717,10 @@ export function createPluginHost(options: {
       };
       try {
         await activatePlugin(fresh);
-        fresh.record.contributions.tools = fresh.registeredTools.length;
+        publishToolContributions(fresh);
         loaded.set(pluginId, fresh);
       } catch (error) {
+        rollbackActivation(fresh);
         fresh.record.status = 'error';
         fresh.record.error = errMsg(error);
         loaded.set(pluginId, fresh);
@@ -671,9 +768,42 @@ export function createPluginHost(options: {
 
   // ---------------------------------------------------------- marketplaces
 
+  /**
+   * A marketplace URL, and whether an operator may register it.
+   *
+   * **https only, plus plaintext http on loopback.** A catalog fetched over
+   * plaintext is a catalog somebody on the path can rewrite, and it is the thing
+   * that decides which bundle gets downloaded and run — so its integrity is the
+   * integrity of the whole install path. Loopback is exempt because a local
+   * marketplace is a real thing to run while developing one, and there is no path
+   * to intercept there.
+   */
+  function checkSourceUrl(raw: string): { ok: true; url: string } | { ok: false; error: string } {
+    const clean = raw.trim();
+    let parsed: URL;
+    try {
+      parsed = new URL(clean);
+    } catch {
+      return { ok: false, error: 'A marketplace URL must be an absolute http:// or https:// URL.' };
+    }
+    if (parsed.protocol === 'https:') return { ok: true, url: parsed.toString() };
+    if (parsed.protocol !== 'http:') {
+      return { ok: false, error: `A marketplace URL must be http:// or https:// (got ${parsed.protocol}//).` };
+    }
+    const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return { ok: true, url: parsed.toString() };
+    return {
+      ok: false,
+      error:
+        'A marketplace URL must be https:// — a catalog fetched over plaintext can be rewritten in transit, ' +
+        'and it is what decides which bundle is downloaded and run. (Plain http is allowed on localhost.)',
+    };
+  }
+
   function addSource(label: string, url: string): { ok: boolean; source?: PluginSourceRecord; error?: string } {
-    const clean = url.trim();
-    if (!/^https?:\/\//i.test(clean)) return { ok: false, error: 'A marketplace URL must start with http:// or https://.' };
+    const checked = checkSourceUrl(url);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    const clean = checked.url;
     const name = label.trim() === '' ? new URL(clean).hostname : label.trim();
     if (persisted.sources.some((source) => source.url === clean)) {
       return { ok: false, error: 'That marketplace is already registered.' };
@@ -700,10 +830,26 @@ export function createPluginHost(options: {
     return { ok: true };
   }
 
+  /** Whether a URL's origin is one a bundle may be served from. */
+  function isTrustedOrigin(url: URL): boolean {
+    if (url.protocol === 'https:') return true;
+    if (url.protocol !== 'http:') return false;
+    const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  }
+
   function parseCatalog(raw: unknown, baseUrl: string): PluginCatalog {
     if (!isRecord(raw)) throw new Error('the catalog is not a JSON object.');
     const plugins = raw['plugins'];
     if (!Array.isArray(plugins)) throw new Error('the catalog has no "plugins" array.');
+    const catalogUrl = new URL(baseUrl);
+    const catalogOrigin = catalogUrl.origin;
+    /**
+     * A loopback catalog may serve its bundles over plain http, because there is
+     * no path to intercept and a local marketplace is a real thing to run while
+     * building one. Anything else must be https at both ends.
+     */
+    const loopbackCatalog = catalogUrl.protocol === 'http:' && isTrustedOrigin(catalogUrl);
     const entries: PluginCatalogEntry[] = [];
     plugins.forEach((entry, index) => {
       if (!isRecord(entry)) throw new Error(`plugins[${index}] is not an object.`);
@@ -716,7 +862,44 @@ export function createPluginHost(options: {
       if (downloadUrl === '') throw new Error(`plugins[${index}] has no downloadUrl.`);
       const absolute = new URL(downloadUrl, baseUrl).toString();
       const item: PluginCatalogEntry = { manifest: validated.manifest, downloadUrl: absolute };
-      if (typeof entry['sha256'] === 'string' && /^[0-9a-f]{64}$/.test(entry['sha256'])) item.sha256 = entry['sha256'];
+
+      /**
+       * The bundle must come from the marketplace that listed it, over https.
+       *
+       * A catalog could otherwise point the download at any host it named —
+       * including one on the operator's intranet — and `new URL(relative, base)`
+       * preserves an absolute URL, so a single line in a catalog was enough to
+       * redirect an install somewhere the operator never chose. Pinning to the
+       * catalog's own origin means the party who vetted the entry is the party who
+       * serves it.
+       */
+      const download = new URL(absolute);
+      const sameOrigin = download.origin === catalogOrigin;
+      const trusted = download.protocol === 'https:' || (loopbackCatalog && isTrustedOrigin(download));
+      if (!sameOrigin || !trusted) {
+        throw new Error(
+          `plugins[${index}] (${validated.manifest.id}) downloads from ${download.origin} over ` +
+            `${download.protocol}//, but it is listed by ${catalogOrigin}. A bundle must be served by the ` +
+            'marketplace that lists it, over https (plain http is allowed only between loopback addresses).',
+        );
+      }
+
+      /**
+       * The bundle hash is **required**, not optional.
+       *
+       * When it was optional, the only integrity check on the code about to be
+       * loaded and run was one the marketplace itself supplied — which protects
+       * against corruption and not against a hostile marketplace. Requiring it
+       * does not make a hostile marketplace safe, but it does make a tampered or
+       * truncated bundle detectable, which is the failure this can actually catch.
+       */
+      if (typeof entry['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(entry['sha256'])) {
+        throw new Error(
+          `plugins[${index}] (${validated.manifest.id}) has no valid sha256. An install will not run a ` +
+            'bundle whose hash the marketplace did not publish.',
+        );
+      }
+      item.sha256 = entry['sha256'];
       if (Array.isArray(entry['tags'])) item.tags = (entry['tags'] as unknown[]).map(String);
       if (typeof entry['sizeBytes'] === 'number') item.sizeBytes = entry['sizeBytes'];
       if (typeof entry['readme'] === 'string') item.readme = entry['readme'];
@@ -736,7 +919,24 @@ export function createPluginHost(options: {
     const clean = url.trim();
     if (!/^https?:\/\//i.test(clean)) return { ok: false, error: 'A catalog URL must start with http:// or https://.' };
     try {
-      const response = await fetch(clean, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+      // The URL the operator registered is the URL that answers, or the answer is
+      // not from where they think. A redirect here is reported with its target
+      // rather than followed: `parseCatalog` pins bundle downloads to the
+      // catalog's own origin, and a followed redirect would hand that pin to
+      // whoever the first hop chose.
+      const response = await fetch(clean, {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(15_000),
+        redirect: 'manual',
+      });
+      if (response.status >= 300 && response.status < 400) {
+        return {
+          ok: false,
+          error:
+            `the marketplace redirected to ${response.headers.get('location') ?? '(no Location header)'}. ` +
+            'Register the URL it redirects to, so the catalog and its bundles come from one origin.',
+        };
+      }
       if (!response.ok) return { ok: false, error: `the marketplace returned HTTP ${response.status}.` };
       const raw = (await response.json()) as unknown;
       return { ok: true, catalog: parseCatalog(raw, clean) };
@@ -849,14 +1049,61 @@ export function createPluginHost(options: {
 
     let archive: Buffer;
     try {
-      const response = await fetch(entry.downloadUrl, { signal: AbortSignal.timeout(30_000) });
+      // The origin pin in `parseCatalog` checks the URL the catalog *declared*.
+      // Following a redirect from there would hand the actual download to whoever
+      // the first hop chose — a CDN is the legitimate version of that, and
+      // `http://169.254.169.254/` is the illegitimate one. So each hop is
+      // re-checked against the same rule as the declared URL, and a hop that
+      // leaves the public internet is refused. A local marketplace (loopback) is
+      // exempt from the address check and nothing else, because there is no path
+      // to intercept and no metadata service to reach.
+      const declared = new URL(entry.downloadUrl);
+      const loopbackCatalog = declared.protocol === 'http:' && isTrustedOrigin(declared);
+      const attempt = await fetchGuarded(declared, {
+        headers: {},
+        timeoutMs: 30_000,
+        check:
+          declared.protocol === 'https:'
+            ? checkHostIsPublic
+            : async (url) =>
+                url.protocol === 'http:' && isTrustedOrigin(url)
+                  ? { ok: true, reason: '', addresses: [] }
+                  : {
+                      ok: false,
+                      reason:
+                        'a redirect left the loopback marketplace this bundle was listed by, and a bundle ' +
+                        'must be served by the party that listed it',
+                      addresses: [],
+                    },
+      });
+      if (!attempt.ok) {
+        return {
+          ok: false,
+          error: attempt.refused
+            ? `the bundle download was refused: ${attempt.reason}`
+            : `could not download the bundle: ${attempt.error}`,
+        };
+      }
+      if (loopbackCatalog && attempt.finalUrl.host !== declared.host) {
+        return {
+          ok: false,
+          error: `the bundle download left ${declared.host} for ${attempt.finalUrl.host}.`,
+        };
+      }
+      const response = attempt.response;
       if (!response.ok) return { ok: false, error: `the download returned HTTP ${response.status}.` };
       archive = Buffer.from(await response.arrayBuffer());
     } catch (error) {
       return { ok: false, error: `could not download the bundle: ${errMsg(error)}` };
     }
 
-    if (entry.sha256 !== undefined) {
+    // Required rather than conditional: `parseCatalog` refuses an entry without
+    // one, so this is the belt to that brace — a catalog built by some other path
+    // must not slip past with no integrity check at all.
+    if (entry.sha256 === undefined) {
+      return { ok: false, error: `"${pluginId}" publishes no sha256, so its bundle cannot be verified.` };
+    }
+    {
       const actual = sha256Hex(archive);
       if (actual !== entry.sha256) {
         return {
@@ -922,11 +1169,15 @@ export function createPluginHost(options: {
     readPanel: (pluginId, panelId) => panelReader.read(pluginId, panelId),
     persisted: () => ({ ...persisted, sources: persisted.sources.map((source) => ({ ...source })) }),
     hydrate(next) {
-      persisted = {
-        enabled: next.enabled ?? {},
-        settings: next.settings ?? {},
-        sources: Array.isArray(next.sources) ? next.sources : [],
-      };
+      // Shape-checked on read, and anything dropped is reported: the stored
+      // document is written by an older version, edited by hand, or restored from a
+      // backup, and a malformed value that silently takes effect is configuration
+      // the operator cannot see.
+      const { state, dropped } = coercePersistedState(next);
+      if (dropped.length > 0) {
+        log('warn', 'plugins', `ignored malformed saved plugin state: ${dropped.join('; ')}`);
+      }
+      persisted = state;
     },
     enable,
     configure,

@@ -13,20 +13,23 @@
  * reason when a value is refused, instead of silently doing nothing.
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, ReactNode } from 'react';
 
+import { MODEL_TIER_ORDER } from '@dev3d/core';
 import type { ModelOverride, ModelSpec, ModelTier, OfficeSettings, RoutingPosture } from '@dev3d/core';
 
 import { api } from '../app/api';
+import { numericDraft } from '../app/hooks';
 import { formatInt, formatUsd } from '../app/format';
+import { providerSourceCopy } from '../app/vocabulary';
 import { useOffice, useSkills, useStore } from '../app/StoreContext';
 import { Badge, Empty, Loading, Panel, Tabs, cx } from './ui';
 
 type SettingsTab = 'general' | 'models' | 'skills' | 'budget' | 'safety' | 'mcp';
 
 const POSTURES: readonly RoutingPosture[] = ['cheap', 'balanced', 'quality'];
-const TIERS: readonly ModelTier[] = ['nano', 'small', 'standard', 'strong', 'max'];
+const TIERS: readonly ModelTier[] = MODEL_TIER_ORDER;
 
 /**
  * Shared save plumbing: every form here is draft -> save -> report.
@@ -39,21 +42,50 @@ export function useSaver<T>(save: (value: T) => Promise<{ ok: boolean; error: st
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  /** The "saved" badge's timer, so it cannot outlive the component. */
+  const savedTimer = useRef<number | null>(null);
+  /** False once unmounted: a late reply must not write into a gone form. */
+  const alive = useRef(true);
+
+  useEffect(
+    () => () => {
+      alive.current = false;
+      if (savedTimer.current !== null) window.clearTimeout(savedTimer.current);
+    },
+    [],
+  );
 
   const run = useCallback(
     async (value: T): Promise<boolean> => {
       setBusy(true);
       setError(null);
       setSaved(false);
-      const result = await save(value);
-      setBusy(false);
-      if (!result.ok) {
-        setError(result.error ?? 'the request failed');
+      try {
+        const result = await save(value);
+        if (!alive.current) return result.ok;
+        if (!result.ok) {
+          setError(result.error ?? 'the request failed');
+          return false;
+        }
+        setSaved(true);
+        if (savedTimer.current !== null) window.clearTimeout(savedTimer.current);
+        savedTimer.current = window.setTimeout(() => {
+          savedTimer.current = null;
+          if (alive.current) setSaved(false);
+        }, 2500);
+        return true;
+      } catch (e) {
+        // A `save` that throws used to leave the button on "saving…" forever with
+        // an unhandled rejection. In-scope callers only avoid that because
+        // `api.request` converts throwables into results — and this hook is
+        // exported precisely so a *plugin's* generated form can use it, with a
+        // host-supplied `onSave` that nothing here controls.
+        if (alive.current) setError(e instanceof Error ? e.message : 'the request failed');
         return false;
+      } finally {
+        // Unconditional, so no path can leave the form permanently disabled.
+        if (alive.current) setBusy(false);
       }
-      setSaved(true);
-      window.setTimeout(() => setSaved(false), 2500);
-      return true;
     },
     [save],
   );
@@ -177,7 +209,10 @@ function GeneralSettings() {
           max={16}
           value={concurrency}
           onChange={(event: ChangeEvent<HTMLInputElement>) =>
-            setDraft((current) => ({ ...current, maxConcurrency: Number(event.target.value) }))
+            setDraft((current) => ({
+              ...current,
+              maxConcurrency: numericDraft(event.target.value, current.maxConcurrency, settings.maxConcurrency),
+            }))
           }
         />
       </Field>
@@ -266,26 +301,8 @@ function ModelSettings() {
             {/* Where the model list came from. Without it a count is a number
                 nobody can act on: a provider that was asked and one that never
                 was look identical. */}
-            <Badge
-              tone={
-                provider.modelSource === 'discovered'
-                  ? 'ok'
-                  : provider.modelSource === 'degraded'
-                    ? 'danger'
-                    : 'neutral'
-              }
-              title={
-                provider.modelSourceDetail ??
-                (provider.modelSource === 'discovered'
-                  ? 'Reported by the provider itself.'
-                  : 'Never asked: the curated catalog is in use.')
-              }
-            >
-              {provider.modelSource === 'discovered'
-                ? 'listed'
-                : provider.modelSource === 'degraded'
-                  ? 'unreachable'
-                  : 'catalog'}
+            <Badge tone={providerSourceCopy(provider).tone} title={providerSourceCopy(provider).hint}>
+              {providerSourceCopy(provider).label}
             </Badge>
             <span className="dim small mono">{provider.modelCount} models</span>
           </span>
@@ -364,6 +381,15 @@ function ModelSettings() {
 
       {editedModel !== null && (
         <ModelOverrideEditor
+          // Keyed by model id, and that is load-bearing rather than tidiness.
+          // The editor seeds its four fields once, in `useState` initialisers,
+          // and switching which model is being edited swaps a prop without
+          // unmounting anything — same element type, same position, so React
+          // reuses the instance and the initialisers never re-run. Without the
+          // key the header says "model B" while the fields still hold A's tier,
+          // prices and quality, and applying persists A's numbers as B's
+          // override: silent routing and cost corruption for the installation.
+          key={editedModel.id}
           model={editedModel}
           override={overrides[editedModel.id]}
           busy={overrideSaver.busy}
@@ -546,6 +572,17 @@ function SkillSettings() {
   const activeId = office?.activeWorkspaceId ?? '';
   const enabled = selection ?? office?.skillIds ?? [];
 
+  // A draft belongs to the floor it was started on. `office.skillIds` is the
+  // *active* organisation's list, and once the operator ticks a box `selection`
+  // shadows it for the rest of this component's life — while the floor selector
+  // in the header is always mounted and this panel does not remount. So
+  // "toggle on floor A → switch floor → Save" used to PUT floor A's skill list
+  // to floor B: a cross-organisation write, silently, in a product whose premise
+  // is per-floor isolation.
+  useEffect(() => {
+    setSelection(null);
+  }, [activeId]);
+
   const saver = useSaver<string[]>(async (ids) => {
     const result = await api.updateWorkspace(activeId, { skillIds: ids });
     return { ok: result.ok, error: result.error };
@@ -597,13 +634,28 @@ function SkillSettings() {
   );
 }
 
-// -------------------------------------------------------------------- budget
+/**
+ * A numeric field's new value, or the previous one when the box was cleared.
+ *
+ * Defined in `app/hooks.ts` so the verification harness can exercise it; the
+ * reasoning lives there.
+ */
+
 
 function BudgetSettings() {
   const office = useOffice();
   const [draft, setDraft] = useState<{ defaultRunUsd?: number; totalUsd?: number | '' }>({});
 
   const activeId = office?.activeWorkspaceId ?? '';
+
+  // Same defect as the skills draft above: a half-typed budget shadowed the
+  // active floor's money indefinitely, so switching floors and saving wrote one
+  // organisation's figures onto another. A draft is per-floor, so it is dropped
+  // when the floor changes.
+  useEffect(() => {
+    setDraft({});
+  }, [activeId]);
+
   const saver = useSaver<{ defaultRunUsd?: number; totalUsd?: number }>(async (value) => {
     const result = await api.updateWorkspace(activeId, { budget: value });
     return { ok: result.ok, error: result.error };
@@ -644,7 +696,14 @@ function BudgetSettings() {
           step={0.5}
           value={defaultRunUsd}
           onChange={(event) =>
-            setDraft((current) => ({ ...current, defaultRunUsd: Number(event.target.value) }))
+            setDraft((current) => ({
+              ...current,
+              defaultRunUsd: numericDraft(
+                event.target.value,
+                current.defaultRunUsd,
+                office.budget.defaultRunUsd,
+              ),
+            }))
           }
         />
       </Field>
@@ -739,17 +798,36 @@ function SafetySettings() {
           onChange={(event) => setDraft((current) => ({ ...current, autoApproveShell: event.target.checked }))}
         />
         <span>
-          <span className="strong">Let employees run shell commands without asking</span>
+          <span className="strong">Let employees act without asking</span>
           <span className="dim small">
-            A shell is the most dangerous tool anyone here holds. Leave this off unless you are running
-            unattended and accept that commands will execute unattended.
+            One switch, three different powers. Leave it off unless you are running unattended and accept
+            that all of the following will happen with nobody watching.
           </span>
         </span>
       </label>
 
       {autoApproveShell && (
-        <div className="alert alert-danger small" role="alert">
-          Shell commands will run without a human seeing them. Nothing else in the system is gated this way.
+        <div className="alert alert-danger" role="alert">
+          <div className="strong">Unattended, this authorises all three of these:</div>
+          <ul className="small">
+            <li>
+              <span className="mono">run_shell</span> — arbitrary commands in the workspace, including
+              anything a command can reach.
+            </li>
+            <li>
+              <span className="mono">git</span> writes — commits, branch creation, cherry-picks and stash
+              push, written straight into the repository&rsquo;s history.
+            </li>
+            <li>
+              <span className="mono">agent__*__delegate</span> — third-party harnesses whose read-only
+              mode is <em>requested</em> rather than enforced, running in this workspace with nobody
+              approving the hand-off.
+            </li>
+          </ul>
+          <div className="small dim">
+            The Settings page used to say only the shell was gated this way, which was not true. The three
+            are separate tools with separate risk, and this is the one switch that opens all of them.
+          </div>
         </div>
       )}
 
@@ -763,7 +841,14 @@ function SafetySettings() {
           step={0.5}
           value={softSpend}
           onChange={(event) =>
-            setDraft((current) => ({ ...current, softSpendApprovalUsd: Number(event.target.value) }))
+            setDraft((current) => ({
+              ...current,
+              softSpendApprovalUsd: numericDraft(
+                event.target.value,
+                current.softSpendApprovalUsd,
+                settings.softSpendApprovalUsd,
+              ),
+            }))
           }
         />
       </Field>
@@ -778,7 +863,14 @@ function SafetySettings() {
           step={30_000}
           value={timeoutMs}
           onChange={(event) =>
-            setDraft((current) => ({ ...current, approvalTimeoutMs: Number(event.target.value) }))
+            setDraft((current) => ({
+              ...current,
+              approvalTimeoutMs: numericDraft(
+                event.target.value,
+                current.approvalTimeoutMs,
+                settings.approvalTimeoutMs,
+              ),
+            }))
           }
         />
       </Field>

@@ -15,12 +15,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
+  ChatMessage,
   EmployeeState,
   OrgChart,
   Pipeline,
   Role,
   ServerEvent,
   Skill,
+  StageKind,
+  StageRun,
+  TurnRecord,
   UsageRecord,
   Workspace,
 } from '@dev3d/core';
@@ -31,9 +35,11 @@ import { allSkillIds, defaultOrgChart, defaultWorkspace } from '../org/defaultCo
 import { defaultPipelines } from '../org/defaultPipelines.ts';
 import { loadSkills } from '../skills/loader.ts';
 import { createDefaultTools, createToolRegistry } from '../tools/registry.ts';
+import type { Tool } from '../tools/types.ts';
 import { estimateComplexity } from './complexity.ts';
 import { parseTags, pickPipelineId, createRunEngine, type RunEngine } from './runEngine.ts';
 import { reviewApproved, reviewRaisedObjections } from './stages.ts';
+import { MAX_TOOL_ITERATIONS, OPEN_ENDED_TOOL_ITERATIONS, toolIterationsFor } from './turn.ts';
 import type { EmployeeTracker, EngineDeps, EventSink } from './types.ts';
 
 const skillsDir = fileURLToPath(new URL('../../../../skills', import.meta.url));
@@ -44,13 +50,64 @@ interface Harness {
   approvalRequests: Array<{ kind: string; summary: string }>;
   workspace: string;
   chart: OrgChart;
+  /**
+   * The same config object the engine reads, so a test can change a setting the
+   * way the runtime does: in place, while the office is running.
+   */
+  config: ReturnType<typeof loadConfig>;
   /** Every organisation in the test's building; push to add a floor. */
   workspaces: Workspace[];
+  /** Every model call the engine made, with how many tools it was offered. */
+  chatCalls: Array<{ toolCount: number; iteration: number }>;
+  /** Every message the engine sent to a model, flattened in order. */
+  chatMessages(): ChatMessage[];
+  /** Every turn the engine finished, in order. */
+  storeTurns(): TurnRecord[];
   cleanup(): void;
 }
 
 async function makeHarness(
-  opts: { autoApprove?: boolean; softSpendApprovalUsd?: number; rejectReviews?: boolean } = {},
+  opts: {
+    autoApprove?: boolean;
+    /**
+     * The `autoApproveShell` setting the office starts with. Separate from
+     * `autoApprove`, which is the *human* answering an approval through the
+     * broker: one is the setting, the other is what the person does when asked.
+     */
+    autoApproveShell?: boolean;
+    softSpendApprovalUsd?: number;
+    rejectReviews?: boolean;
+    /**
+     * Model every turn as a tool-caller that never writes prose.
+     *
+     * Reproduces the real failure: the loop burns its round trips and the turn
+     * comes back with no text. Used to pin both halves of the fix — that the
+     * final round trip is made without tools, and that a turn which still says
+     * nothing is recorded as failed rather than as an empty success.
+     */
+    neverAnswers?: boolean;
+    /**
+     * Make the first model call request this tool, then answer normally.
+     *
+     * A test that needs a tool result in the prompt should say so rather than
+     * depend on the scripted provider's brief heuristics choosing one.
+     */
+    alwaysCallTool?: string;
+    /**
+     * A tool to register alongside the real ones, so a test can observe what the
+     * engine handed a tool — the `ToolContext` is built inside the turn and is
+     * otherwise invisible.
+     */
+    probeTool?: Tool;
+    /**
+     * Called before each chat call is served, with its index.
+     *
+     * The `config` object is the same one the engine reads, and the runtime
+     * mutates it in place when the operator changes a setting — this is how a
+     * test makes a settings write land *during* a run rather than before it.
+     */
+    onChatCall?: (index: number) => void;
+  } = {},
 ): Promise<Harness> {
   const workspace = mkdtempSync(join(tmpdir(), 'dev3d-engine-'));
   const base = loadConfig();
@@ -59,7 +116,7 @@ async function makeHarness(
     workspace,
     dbPath: join(workspace, '.dev3d.sqlite'),
     llmMode: 'mock' as const,
-    autoApproveShell: true,
+    autoApproveShell: opts.autoApproveShell ?? true,
     logLevel: 'error' as const,
     ...(opts.softSpendApprovalUsd !== undefined
       ? { softSpendApprovalUsd: opts.softSpendApprovalUsd }
@@ -67,6 +124,61 @@ async function makeHarness(
   };
 
   const registry = createProviderRegistry(config);
+
+  /**
+   * Every chat call the engine made, with how many tools it was offered.
+   *
+   * `toolCount === 0` on a call is the signal that the turn's final,
+   * tools-withheld round trip actually happened — the thing that turns "I ran
+   * out of round trips" into an answer.
+   */
+  const chatCalls: Array<{ toolCount: number; iteration: number }> = [];
+  /** Every message list the engine sent, so a test can inspect the prompt. */
+  const chatMessages: ChatMessage[][] = [];
+  {
+    const realChat = registry.chat.bind(registry);
+    registry.chat = async (primary, fallbacks, req) => {
+      opts.onChatCall?.(chatCalls.length);
+      chatCalls.push({ toolCount: req.tools?.length ?? 0, iteration: chatCalls.length });
+      chatMessages.push(req.messages);
+      if (opts.alwaysCallTool !== undefined && chatCalls.length === 1) {
+        // The first call asks for a tool; every later one falls through to the
+        // scripted provider, so the turn converges normally and the tool result
+        // ends up in the next message list.
+        return {
+          result: {
+            text: '',
+            reasoning: null,
+            toolCalls: [
+              { id: 'call_fence', name: opts.alwaysCallTool, argumentsJson: '{"path":"."}' },
+            ],
+            finishReason: 'tool_calls',
+            usage: { tokensIn: 5, tokensOut: 5, costUsd: 0 },
+          },
+          used: primary,
+          attempted: [],
+        };
+      }
+      if (opts.neverAnswers === true) {
+        // Always asks for another tool, never writes prose. Each call reads a
+        // real file so the tool loop genuinely advances.
+        return {
+          result: {
+            text: '',
+            reasoning: 'thinking about it',
+            toolCalls: [
+              { id: `call_${chatCalls.length}`, name: 'list_dir', argumentsJson: '{"path":"."}' },
+            ],
+            finishReason: 'tool_calls',
+            usage: { tokensIn: 10, tokensOut: 5, costUsd: 0.0001 },
+          },
+          used: primary,
+          attempted: [],
+        };
+      }
+      return realChat(primary, fallbacks, req);
+    };
+  }
 
   /**
    * A chair that objects and never relents.
@@ -77,10 +189,11 @@ async function makeHarness(
    * which is what a review-loop looks like when it genuinely fails.
    */
   if (opts.rejectReviews === true) {
-    const realChat = registry.chat.bind(registry);
+    const previousChat = registry.chat.bind(registry);
     registry.chat = async (primary, fallbacks, req) => {
       const prompt = req.messages.map((m) => m.content).join('\n');
       if (prompt.includes('Synthesise review pass')) {
+        chatCalls.push({ toolCount: req.tools?.length ?? 0, iteration: chatCalls.length });
         return {
           result: {
             text:
@@ -96,12 +209,13 @@ async function makeHarness(
         };
       }
       void fallbacks;
-      return realChat(primary, fallbacks, req);
+      return previousChat(primary, fallbacks, req);
     };
   }
   const skills: Skill[] = await loadSkills(skillsDir);
   const tools = createToolRegistry();
   for (const tool of createDefaultTools()) tools.register(tool);
+  if (opts.probeTool !== undefined) tools.register(opts.probeTool);
 
   // One organisation to start with. Tests that need a second floor push another
   // workspace onto `workspaces`, which is the same list the engine reads.
@@ -206,7 +320,14 @@ async function makeHarness(
     approvalRequests,
     workspace,
     chart: org,
+    config,
     workspaces,
+    chatCalls,
+    /** Flattened: every message the engine ever sent, in order. */
+    chatMessages: (): ChatMessage[] => chatMessages.flat(),
+    /** Every turn the engine recorded, read back from the event feed. */
+    storeTurns: (): TurnRecord[] =>
+      eventsOfType(events, 'turn.finished').map((event) => event.turn),
     cleanup: () => rmSync(workspace, { recursive: true, force: true }),
   };
 }
@@ -249,7 +370,6 @@ test('complexity separates hard work from trivial work', () => {
   assert.ok(role);
   const common = {
     stageKind: 'build' as const,
-    taskClass: 'coding' as const,
     role: role as Role,
     turnIndex: 0,
     fileCount: 0,
@@ -263,6 +383,42 @@ test('complexity separates hard work from trivial work', () => {
   assert.ok(hard > trivial, `expected ${hard} > ${trivial}`);
   assert.ok(trivial >= 0 && trivial <= 1);
   assert.ok(hard >= 0 && hard <= 1);
+});
+
+test('the seniority term is ordered by who needs the escalation', () => {
+  // The table used to read `junior: 0.01, mid: 0, senior: 0.01, lead: 0.02,
+  // executive: 0.03` — so a mid-level employee's work was rated *easier* than a
+  // junior's, and the largest nudge went to the most senior person, which is the
+  // opposite of what the term is for. It is a small number, but the one property
+  // that matters about it is that it is ordered correctly.
+  const chart = defaultOrgChart();
+  const template = chart.roles.find((r) => r.id === 'backend-dev-1');
+  assert.ok(template);
+
+  const seniorities = ['junior', 'mid', 'senior', 'lead', 'executive'] as const;
+  const scored = seniorities.map((seniority) => ({
+    seniority,
+    value: estimateComplexity({
+      stageKind: 'build',
+      text: 'implement the parser',
+      role: { ...template, seniority } as Role,
+      turnIndex: 0,
+      fileCount: 0,
+      involvesFiles: true,
+    }),
+  }));
+
+  for (let i = 1; i < scored.length; i += 1) {
+    const before = scored[i - 1];
+    const after = scored[i];
+    assert.ok(before && after);
+    assert.ok(
+      before.value >= after.value,
+      `${before.seniority} (${before.value}) must be rated at least as hard as ${after.seniority} (${after.value})`,
+    );
+  }
+  // And it is monotonic but not flat, or the term would be doing nothing at all.
+  assert.ok((scored[0]?.value ?? 0) > (scored[scored.length - 1]?.value ?? 0));
 });
 
 test('the review heuristics separate blocking language from advice', () => {
@@ -320,8 +476,98 @@ test('a question runs the quick-answer pipeline end to end', async () => {
   }
 });
 
-test('a build run writes real files into the workspace and reports them', async () => {
-  const h = await makeHarness();
+// ---------------------------------------------------------------------------
+// the approval policy a run is pinned to
+// ---------------------------------------------------------------------------
+
+test('a run keeps the approval policy it started with when the setting changes under it', async () => {
+  // The engine reads one live config object, and the runtime mutates it in place
+  // when the operator saves a setting. That is right for "the next run" and wrong
+  // for "the run in flight": a write landing mid-run changed whether the employees
+  // in it were asked for approval, so the run was governed by a policy that was
+  // never true when it was submitted.
+  const seen: boolean[] = [];
+  const h = await makeHarness({
+    autoApprove: false,
+    autoApproveShell: false,
+    alwaysCallTool: 'policy_probe',
+    probeTool: {
+      name: 'policy_probe',
+      description: 'records the approval policy it was handed',
+      parameters: { type: 'object', properties: {} },
+      async run(_args, ctx) {
+        seen.push(ctx.autoApproveShell);
+        return { ok: true, content: 'probed', preview: 'probed', affectsPaths: [] };
+      },
+    },
+    // The first chat call happens after the engine pinned the policy, and before
+    // the tool it asks for runs — the exact window a settings write can land in.
+    onChatCall: (index) => {
+      if (index === 0) h.config.autoApproveShell = true;
+    },
+  });
+  try {
+    // The first stage's owner is the one the mock provider has take the first
+    // turn, so it is the role that has to be granted the probe.
+    const firstOwner = h.chart.roles[0];
+    assert.ok(firstOwner);
+    for (const role of h.chart.roles) role.allowedTools = [...role.allowedTools, 'policy_probe'];
+
+    const run = h.engine.submit({ brief: 'Explain how the tool loop terminates', pipelineId: 'quick-answer' });
+    // The setting really did change, so this is not a test of a no-op write.
+    assert.equal(h.config.autoApproveShell, true);
+    const settled = await h.engine.whenSettled(run.id);
+    assert.ok(settled);
+
+    assert.ok(seen.length > 0, 'the probe tool was never called');
+    assert.deepEqual(
+      [...new Set(seen)],
+      [false],
+      'every tool call in the run must see the policy the run started under, not the setting written mid-run',
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a run announces the approval policy it is pinned to', async () => {
+  // The review's other half: the blast radius was invisible at the point of
+  // decision. One boolean covers shell, git writes and vendor delegation, so the
+  // run log has to name them rather than echo the boolean.
+  const unattended = await makeHarness({ autoApprove: true, autoApproveShell: true });
+  try {
+    const run = unattended.engine.submit({ brief: 'Explain the model router tiers', pipelineId: 'quick-answer' });
+    await unattended.engine.whenSettled(run.id);
+    const logs = unattended.events.filter(
+      (event): event is Extract<ServerEvent, { type: 'log' }> => event.type === 'log' && event.scope === 'engine/run',
+    );
+    const start = logs.find((event) => event.message.includes(`Run ${run.id} started`));
+    assert.ok(start, 'the run start is logged');
+    for (const gate of ['shell commands', 'git repository writes', 'vendor delegation']) {
+      assert.match(start.message, new RegExp(gate), `the policy line must name ${gate}`);
+    }
+    // And the policy names itself rather than leaving the boolean to be looked up.
+    assert.match(start.message, /acting unattended/);
+  } finally {
+    unattended.cleanup();
+  }
+
+  const gated = await makeHarness({ autoApprove: false, autoApproveShell: false });
+  try {
+    const run = gated.engine.submit({ brief: 'Explain the model router tiers', pipelineId: 'quick-answer' });
+    await gated.engine.whenSettled(run.id);
+    const start = gated.events.find(
+      (event): event is Extract<ServerEvent, { type: 'log' }> =>
+        event.type === 'log' && event.scope === 'engine/run' && event.message.includes(`Run ${run.id} started`),
+    );
+    assert.ok(start);
+    assert.match(start.message, /asks first/);
+  } finally {
+    gated.cleanup();
+  }
+});
+
+test('a build run writes real files into the workspace and reports them', async () => {  const h = await makeHarness();
   try {
     const run = h.engine.submit({
       brief: 'Add a retry wrapper around the provider calls',
@@ -364,8 +610,106 @@ test('a build run writes real files into the workspace and reports them', async 
   }
 });
 
-test('every turn is routed, priced, and attributed to an employee', async () => {
-  const h = await makeHarness();
+test('a turn that runs out of round trips keeps whatever it gathered and says so', async () => {
+  // The live office's own first real run failed here: two of three turns spent
+  // their entire tool budget and came back with `text: ''`, so the money was
+  // spent and no work product existed. The fix has two halves, and this pins
+  // both — the loop withholds the tools for one final call so the model has to
+  // answer, and a turn that still produces nothing is recorded as failed rather
+  // than as an empty success.
+  const h = await makeHarness({ neverAnswers: true });
+  try {
+    const run = h.engine.submit({
+      brief: 'What does the routing posture "cheap" change about model selection?',
+      pipelineId: 'quick-answer',
+      budgetUsd: 5,
+    });
+    const settled = await h.engine.whenSettled(run.id);
+    assert.ok(settled, 'the run must settle rather than hang');
+
+    const turns = h.storeTurns();
+    assert.ok(turns.length > 0, 'the run produced turns');
+    const empty = turns.filter((t) => t.text.trim() === '');
+    assert.ok(empty.length > 0, 'the scenario must actually produce an empty turn');
+    for (const turn of empty) {
+      assert.equal(
+        turn.status,
+        'failed',
+        `a turn with no text must be failed, not done (got ${turn.status} for ${turn.id})`,
+      );
+      assert.ok(turn.error !== null, 'and it must say why');
+      assert.match(turn.error, /round trips|no text/);
+    }
+    // The point of the final call: tools are withheld for it, so the model is
+    // asked to answer from what it has instead of asking for another tool.
+    assert.ok(
+      h.chatCalls.some((call) => call.toolCount === 0),
+      'the last round trip must be made without tools so the model has to answer',
+    );
+    // And the turns did run tools — this is not a turn that simply had none.
+    assert.ok(
+      turns.some((t) => t.toolCalls.length > 0),
+      'the empty turns should have used tools before running out',
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a research turn is allowed more round trips than a focused one', async () => {
+  // Gathering evidence is open-ended, so `research` gets headroom; a build or
+  // report stage keeps the tight budget, because converging should not take
+  // many round trips and an unbounded loop is a real bill.
+  assert.ok(
+    OPEN_ENDED_TOOL_ITERATIONS > MAX_TOOL_ITERATIONS,
+    'open-ended stages must get more room than the default',
+  );
+  const kindRoom = (kind: StageKind): number =>
+    toolIterationsFor({ spec: { kind } } as unknown as StageRun);
+  assert.equal(kindRoom('research'), OPEN_ENDED_TOOL_ITERATIONS);
+  assert.equal(kindRoom('debate'), OPEN_ENDED_TOOL_ITERATIONS);
+  assert.equal(kindRoom('build'), MAX_TOOL_ITERATIONS);
+  assert.equal(kindRoom('report'), MAX_TOOL_ITERATIONS);
+});
+
+test('tool output reaches the model fenced, and stripped of invisible characters', async () => {
+  // Tool output is attacker-influenced by design — a hostile README, a hostile
+  // commit message, any page on the internet — and it goes straight into the
+  // prompt. The fence marks the boundary where the model reads it, and the strip
+  // removes the characters that make text *display* as something it does not say.
+  //
+  // Driven rather than scripted: whichever tool the mock chooses is fine, so the
+  // test asks for a tool call directly instead of depending on the mock's brief
+  // heuristics.
+  const h = await makeHarness({ alwaysCallTool: 'list_dir' });
+  try {
+    const run = h.engine.submit({
+      brief: 'List the workspace and report what you find.',
+      pipelineId: 'quick-answer',
+      budgetUsd: 5,
+    });
+    await h.engine.whenSettled(run.id);
+
+    const toolMessages = h.chatMessages()
+      .filter((m) => m.role === 'tool')
+      .map((m) => m.content);
+    assert.ok(toolMessages.length > 0, 'the run made at least one tool call');
+    for (const content of toolMessages) {
+      assert.match(content, /<untrusted-content source=tool:/, content.slice(0, 160));
+      assert.match(content, /<\/untrusted-content>/);
+      assert.ok(!content.includes('\u001b'), 'no terminal escape may reach the prompt');
+      assert.ok(!/[\u200b-\u200f\u202a-\u202e]/.test(content), 'no bidi or zero-width characters either');
+    }
+    // The prompt explains what the fence means, or the wrapping is just noise.
+    const system = h.chatMessages().find((m) => m.role === 'system');
+    assert.ok(system, 'there is a system prompt');
+    assert.match(system!.content, /untrusted-content/);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('every turn is routed, priced, and attributed to an employee', async () => {  const h = await makeHarness();
   try {
     const run = h.engine.submit({ brief: 'Explain the model router tiers', pipelineId: 'quick-answer' });
     const settled = await h.engine.whenSettled(run.id);

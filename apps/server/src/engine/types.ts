@@ -73,6 +73,28 @@ export interface EmployeeTracker {
   addUsage(workspaceId: string, employeeId: string, usage: UsageRecord): EmployeeState;
 }
 
+/**
+ * What a run was authorised to do without asking, fixed at the moment it started.
+ *
+ * The office has one live `autoApproveShell` setting, and `deps.config` is the
+ * same object for the life of the process — `applySettings()` mutates it in
+ * place, which is deliberate, because an operator changing a setting should see
+ * it take effect. But "takes effect" must mean *on the next run*, not "on the
+ * next tool call of a run that is already running". Live mutation made a
+ * contradiction reachable: a settings write that arrives mid-run changes whether
+ * the employees in that run are asked for approval, so the run is governed by a
+ * policy that was never true when it was submitted, and its transcript cannot
+ * say afterwards which policy it actually ran under.
+ *
+ * Pinning it fixes both halves. It is also the bound on the one actor that can
+ * reach `POST /api/settings` at all: whatever a local client manages to write,
+ * the run already in flight keeps the answer it started with.
+ */
+export interface RunPolicy {
+  /** Whether tools that would otherwise ask may act unattended. */
+  autoApproveShell: boolean;
+}
+
 export interface EngineDeps {
   config: ServerConfig;
   registry: ProviderRegistry;
@@ -135,6 +157,12 @@ export interface EngineDeps {
   employees: EmployeeTracker;
   sink: EventSink;
   approvals: ApprovalBroker;
+  /**
+   * The policy the run being executed started under, or `undefined` for a run
+   * this engine did not start. The engine supplies this; a caller that omits it
+   * gets the live config, which is what every turn did before runs were pinned.
+   */
+  policyFor?: (runId: string) => RunPolicy | undefined;
   /** Injected by tests so generated ids stay predictable. */
   newId?: (prefix: string) => string;
 }

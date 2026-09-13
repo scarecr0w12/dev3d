@@ -10,6 +10,7 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { registerSecretEnvName } from './security/childEnv.ts';
 import type { OfficeSettings, RoutingPosture } from '@dev3d/core';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -179,17 +180,33 @@ export interface ServerConfig {
   /**
    * Role ids that may call MCP tools.
    *
-   * `'*'` means every role; `'shell-roles'` (the default) means every role that
-   * already holds the `run_shell` tool, which is the closest built-in equivalent
-   * in reach; an empty list means nobody.
+   * `'*'` means every role; an empty list means nobody. **The default is nobody**,
+   * and that is a change: it used to default to `'shell-roles'`, so every role that
+   * already held `run_shell` silently received every tool from every connected
+   * server. The reasoning was that those roles already have unconfined reach — but
+   * the reach is different in kind. `run_shell` is approval-gated and runs in the
+   * workspace the run was given; a remote server's tools are somebody else's program,
+   * can be a filesystem or a browser, and were not gated at all. Inheriting one from
+   * the other made the operator's consent for `run_shell` stand in for consent they
+   * never gave.
    *
-   * A remote server's tools are more powerful than any built-in — they can be a
-   * filesystem, a database, a browser — so they are granted deliberately rather
-   * than inherited from the fact that a server happens to be connected.
+   * The doc comment already said these are "granted deliberately rather than
+   * inherited from the fact that a server happens to be connected". It is true now.
    */
   mcpGrantRoles: string[];
   /** True when `mcpGrantRoles` means "whoever already has run_shell". */
   mcpGrantToShellRoles: boolean;
+  /**
+   * Whether the first call to a tool from a newly connected MCP server asks a human.
+   *
+   * On by default, because an MCP tool is the one kind of tool that is neither
+   * confined nor otherwise gated: the arguments go to somebody else's process
+   * verbatim, `ctx.workspaceRoot` is never consulted, and until this existed there
+   * was no approval call either. The prompt is per *server* and asked once per
+   * connection — a prompt per call would be answered by reflex, which is worse than
+   * none.
+   */
+  mcpRequireApproval: boolean;
   /**
    * Whether third-party vendors may be engaged at all.
    *
@@ -234,6 +251,26 @@ export interface ServerConfig {
    * forever, so it always resolves - the run just gets an honest "declined".
    */
   approvalTimeoutMs: number;
+  /**
+   * How many days of the event log to keep. Zero keeps everything.
+   *
+   * The log is append-only and nothing removed from it, so a long-lived office
+   * accumulated rows forever. Runs, turns and artifacts are *not* covered: an old
+   * run is still served by `GET /api/runs/:id`, and pruning the record an operator
+   * can still ask for would make that route start lying.
+   */
+  eventRetentionDays: number;
+  /**
+   * Whether a plugin panel may be served from a private address.
+   *
+   * Off by default, and it is the *server* that does the fetching, so the answer
+   * comes back onto the operator's screen. A panel source pointing at loopback or
+   * link-local therefore lets a plugin author probe the machine (and, on a cloud
+   * VM, the instance metadata service) and read the shape of the reply. An
+   * operator developing a plugin against a local dev server turns this on and
+   * accepts that; nobody else needs it.
+   */
+  allowPrivatePanelHosts: boolean;
   /**
    * Whether the office asks each provider what models it serves.
    *
@@ -320,6 +357,18 @@ export interface ServerConfig {
 }
 
 function buildProviders(): ProviderConfig[] {
+  // Every credential this file reads is declared to the child-environment
+  // filter, so no process the office spawns inherits it. Declared here because
+  // this is where the names are actually known.
+  for (const name of [
+    'DEEPSEEK_API_KEY',
+    'OPENAI_API_KEY',
+    'OPENROUTER_API_KEY',
+    'ANTHROPIC_API_KEY',
+    'DEV3D_LOCAL_API_KEY',
+  ]) {
+    registerSecretEnvName(name);
+  }
   return [
     {
       id: 'deepseek',
@@ -408,6 +457,12 @@ function isProviderConfigured(p: ProviderConfig): boolean {
 
 export function loadConfig(): ServerConfig {
   const providers = buildProviders();
+  // Keys a plugin or the pooled-quality source names are credentials too; the
+  // environment filter has to know about them before anything is spawned.
+  for (const provider of providers) {
+    if (provider.keyEnvVar !== undefined) registerSecretEnvName(provider.keyEnvVar);
+  }
+  registerSecretEnvName(str('DEV3D_POOLED_QUALITY_KEY_VAR', 'ARTIFICIAL_ANALYSIS_API_KEY'));
   const configuredProviderIds = providers.filter(isProviderConfigured).map((p) => p.id);
   const anyConfigured = configuredProviderIds.length > 0;
 
@@ -477,7 +532,10 @@ export function loadConfig(): ServerConfig {
     ...(() => {
       // Read once, then decide: `mcpGrantRoles` is the parsed list and the
       // companion boolean says whether it means "whoever has run_shell".
-      const raw = str('DEV3D_MCP_GRANT_ROLES', 'shell-roles').trim();
+      //
+      // The default is `none`. `shell-roles` remains supported for an operator who
+      // wants the old behaviour and says so.
+      const raw = str('DEV3D_MCP_GRANT_ROLES', 'none').trim();
       const lower = raw.toLowerCase();
       const shellRoles = lower === 'shell-roles' || raw === 'run_shell';
       const roles = raw === '*' ? ['*'] : lower === 'none' ? [] : shellRoles ? ['shell-roles'] : raw
@@ -486,6 +544,7 @@ export function loadConfig(): ServerConfig {
         .filter((part) => part !== '');
       return { mcpGrantRoles: roles, mcpGrantToShellRoles: shellRoles };
     })(),
+    mcpRequireApproval: str('DEV3D_MCP_REQUIRE_APPROVAL', 'true').toLowerCase() !== 'false',
     vendorDelegation: str('DEV3D_VENDOR_DELEGATION', 'true').toLowerCase() !== 'false',
     modelDiscovery: str('DEV3D_MODEL_DISCOVERY', 'true').toLowerCase() !== 'false',    discoveryTtlMs: Math.max(0, num('DEV3D_MODEL_DISCOVERY_TTL_MS', 6 * 60 * 60 * 1000)),
     discoveryCachePath: (() => {
@@ -548,11 +607,43 @@ export function loadConfig(): ServerConfig {
     maxConcurrency: Math.max(1, Math.min(16, num('DEV3D_MAX_CONCURRENCY', 4))),
     autoApproveShell,
     approvalTimeoutMs: Math.max(1_000, num('DEV3D_APPROVAL_TIMEOUT_MS', 600_000)),
+    // Negative is a typo, not a request to keep everything forever; zero is the
+    // documented way to say that.
+    eventRetentionDays: Math.max(0, Math.round(num('DEV3D_EVENT_RETENTION_DAYS', 30))),
+    allowPrivatePanelHosts: str('DEV3D_ALLOW_PRIVATE_PANEL_HOSTS', 'false').toLowerCase() === 'true',
     providers,
     dotEnvCount,
     logLevel,
     version: readVersion(),
   };
+}
+
+/**
+ * The MCP grant policy in one line, for the boot log.
+ *
+ * An MCP server's tools are somebody else's program, with reach dev3d cannot confine
+ * — and before this line existed, "who may call them" was visible only by reading
+ * `.env`. It is the same reasoning as the auto-approve warning: the blast radius of a
+ * setting should be legible at the point it takes effect, not inferred later.
+ *
+ * Given its own function so a test can pin the wording, because the wording is the
+ * only place the *default* is stated to an operator who never reads this file.
+ */
+export function describeMcpGrant(
+  config: Pick<ServerConfig, 'mcpGrantRoles' | 'mcpGrantToShellRoles' | 'mcpRequireApproval'>,
+): string {
+  const who =
+    config.mcpGrantRoles.includes('*')
+      ? 'every role'
+      : config.mcpGrantRoles.length === 0
+        ? 'nobody — no role may call an MCP tool until DEV3D_MCP_GRANT_ROLES names one'
+        : config.mcpGrantToShellRoles
+          ? `the roles holding run_shell (${config.mcpGrantRoles.join(', ')})`
+          : config.mcpGrantRoles.join(', ');
+  const gate = config.mcpRequireApproval
+    ? 'the first call to a newly connected server asks a human'
+    : 'MCP approval is OFF (DEV3D_MCP_REQUIRE_APPROVAL=false) — calls run unattended';
+  return `MCP tools are granted to ${who}; ${gate}. They are not confined to the workspace: the arguments go to the server's own process.`;
 }
 
 /**
@@ -573,6 +664,7 @@ export function defaultOfficeSettings(config: ServerConfig): OfficeSettings {
     softSpendApprovalUsd: config.softSpendApprovalUsd,
     autoApproveShell: config.autoApproveShell,
     approvalTimeoutMs: config.approvalTimeoutMs,
+
     logLevel: config.logLevel,
     disabledModelIds: [],
     // Empty means "the catalog's word for every model", which is what a fresh

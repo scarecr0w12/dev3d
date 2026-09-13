@@ -74,8 +74,27 @@ export interface StyleSurface {
   transparent?: boolean;
   /** Some surfaces read as a pattern rather than a flat fill. */
   pattern?: StylePattern;
-  /** How many times the pattern tiles across a room module. */
+  /**
+   * The pattern's real-world scale: it tiles this many times every four metres of
+   * surface.
+   *
+   * Four metres is the nominal room module the block kit is built from, which is
+   * what the presets were tuned against. It is an exact physical scale rather than
+   * a per-part guess because both GLBs carry UVs measured in metres — one UV unit
+   * is one metre on every surface in the building, so a floor tiles at the same
+   * real size in an 8 m module, a 12 m one, and the core.
+   */
   patternRepeat?: number;
+  /**
+   * How hard the pattern's relief catches the light, as a normal-map strength.
+   *
+   * A pattern that only tints a surface reads as a printed image: the seams are
+   * drawn but nothing about the surface changes as the light moves. Deriving a
+   * normal map from the same pattern is what gives planks, tile and weave an
+   * actual surface. Absent means the role's own default, which is zero for a
+   * painted wall and non-zero for a floor.
+   */
+  relief?: number;
 }
 
 /** A role's appearance: a colour, plus how it behaves. */
@@ -129,6 +148,16 @@ export interface StyleEnvironment {
   /** A faint grid on that catcher, to give the building a floor to stand on. */
   grid: boolean;
   gridColor: string;
+  /**
+   * How much the room's own reflections contribute — image-based lighting.
+   *
+   * Without this a metallic surface has no diffuse term and nothing to reflect,
+   * so it renders as a black hole rather than as steel: `M_Metal_Frame` is 0.9
+   * metallic, and every chair post and desk leg wears it. It is a style knob
+   * because a blacked-out noir shell and a daylight glasshouse want very
+   * different amounts of it. Zero is a legitimate flat, diagram-like look.
+   */
+  environmentIntensity: number;
 }
 
 /** A named look a workspace can start from. */
@@ -245,8 +274,8 @@ export const STYLE_PRESETS: Record<string, StylePreset> = {
       wall: material('#9a9ba1', { roughness: 0.85, pattern: 'plain' }),
       accent: material('#383d47', { roughness: 0.8 }),
       glass: material('#8cb8cc', { roughness: 0.05, metallic: 0, opacity: 0.22, transparent: true }),
-      floor: material('#26282c', { roughness: 0.75, pattern: 'grid', patternRepeat: 6 }),
-      carpet: material('#1c2029', { roughness: 0.95, pattern: 'weave', patternRepeat: 8 }),
+      floor: material('#6f7378', { roughness: 0.62, pattern: 'grid', patternRepeat: 6 }),
+      carpet: material('#3a4250', { roughness: 0.95, pattern: 'weave', patternRepeat: 8 }),
       trim: material('#2f333b', { roughness: 0.6 }),
       frame: material('#111214', { roughness: 0.35, metallic: 0.9 }),
       desk: material('#4f4236', { roughness: 0.5 }),
@@ -279,6 +308,7 @@ export const STYLE_PRESETS: Record<string, StylePreset> = {
       groundShadowOpacity: 0.34,
       grid: true,
       gridColor: '#1b2030',
+      environmentIntensity: 0.85,
     },
   },
 
@@ -325,6 +355,7 @@ export const STYLE_PRESETS: Record<string, StylePreset> = {
       groundShadowOpacity: 0.2,
       grid: false,
       gridColor: '#c9cdd6',
+      environmentIntensity: 1.15,
     },
   },
 
@@ -371,6 +402,7 @@ export const STYLE_PRESETS: Record<string, StylePreset> = {
       groundShadowOpacity: 0.45,
       grid: true,
       gridColor: '#241f1b',
+      environmentIntensity: 0.7,
     },
   },
 
@@ -417,6 +449,7 @@ export const STYLE_PRESETS: Record<string, StylePreset> = {
       groundShadowOpacity: 0.18,
       grid: false,
       gridColor: '#c3cdc8',
+      environmentIntensity: 1.2,
     },
   },
 
@@ -463,6 +496,7 @@ export const STYLE_PRESETS: Record<string, StylePreset> = {
       groundShadowOpacity: 0.5,
       grid: true,
       gridColor: '#16203a',
+      environmentIntensity: 0.6,
     },
   },
 
@@ -509,6 +543,7 @@ export const STYLE_PRESETS: Record<string, StylePreset> = {
       groundShadowOpacity: 0.6,
       grid: false,
       gridColor: '#151518',
+      environmentIntensity: 0.45,
     },
   },
 
@@ -555,6 +590,7 @@ export const STYLE_PRESETS: Record<string, StylePreset> = {
       groundShadowOpacity: 0.1,
       grid: true,
       gridColor: '#dfe3ea',
+      environmentIntensity: 1.3,
     },
   },
 
@@ -601,6 +637,7 @@ export const STYLE_PRESETS: Record<string, StylePreset> = {
       groundShadowOpacity: 0.4,
       grid: false,
       gridColor: '#2a211b',
+      environmentIntensity: 0.9,
     },
   },
 };
@@ -748,6 +785,8 @@ function parseMaterialPatch(raw: Record<string, unknown>): Partial<StyleMaterial
   }
   const repeat = finite(raw['patternRepeat']);
   if (repeat !== undefined) patch.patternRepeat = Math.max(0.25, Math.min(64, repeat));
+  const relief = finite(raw['relief']);
+  if (relief !== undefined) patch.relief = Math.max(0, Math.min(4, relief));
   return patch;
 }
 
@@ -759,7 +798,7 @@ const LIGHTING_KEYS = [
   'exposure',
 ] as const;
 const LIGHTING_COLORS = ['keyColor', 'fillColor', 'rimColor', 'skyColor', 'groundColor'] as const;
-const ENVIRONMENT_KEYS = ['fogNear', 'fogFar', 'groundShadowOpacity'] as const;
+const ENVIRONMENT_KEYS = ['fogNear', 'fogFar', 'groundShadowOpacity', 'environmentIntensity'] as const;
 const ENVIRONMENT_COLORS = ['background', 'fogColor', 'gridColor'] as const;
 
 function parseNumberPatch(

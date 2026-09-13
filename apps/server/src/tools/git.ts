@@ -56,22 +56,82 @@ const WRITE_SUBCOMMANDS = new Set(['add', 'commit', 'stash', 'cherry-pick', 'tag
 /**
  * Arguments refused even with approval.
  *
- * These are the ones that destroy work or evade review, as opposed to merely
- * changing the repository. A commit is a change a person can see and revert; a
- * `reset --hard` is not, and `--no-verify` skips the hooks a project installed
- * precisely to run before a commit lands.
+ * These are the ones that destroy work, evade review, or touch a file git has no
+ * business touching, as opposed to merely changing the repository. A commit is a
+ * change a person can see and revert; a `reset --hard` is not, and `--no-verify`
+ * skips the hooks a project installed precisely to run before a commit lands.
+ *
+ * ## Why this is a pattern and not a `Set`
+ *
+ * It was a `Set` checked with `Set.has`, which is exact string equality — so
+ * every `--option=value` spelling sailed straight past. That is not a theoretical
+ * gap: `git log --output=<any path>` writes attacker-chosen content to any path
+ * the process can reach, and `git blame --contents=<any path>` prints an
+ * arbitrary file's contents into the tool result, i.e. into the model's context.
+ * Both were reachable on the *un-gated* inspection path, because the subcommand
+ * (`log`, `blame`) is legitimately read-only and only the option is dangerous.
+ *
+ * The match therefore discards the `=value` half before deciding, and covers the
+ * short spelling of `--no-verify` (`-n`), which `git help commit` documents as
+ * the same switch.
  */
-const FORBIDDEN_ARGS = new Set([
-  '--hard',
-  '--force',
-  '-f',
-  '--no-verify',
-  '--output',
-  '--exec',
-  '--upload-pack',
-  '--receive-pack',
-  'clean',
+const FORBIDDEN_OPTION_RE =
+  /^--(hard|force|no-verify|output|exec|upload-pack|receive-pack|contents|path|file|ext-diff|textconv)(=|$)/;
+const FORBIDDEN_SHORT_OPTIONS = new Set(['-f', '-n']);
+
+/** Bare words that are only dangerous as a subcommand, e.g. `git clean`. */
+const FORBIDDEN_WORDS = new Set(['clean']);
+
+/**
+ * Verbs that turn an otherwise read-only subcommand into a repository write.
+ *
+ * `git remote` and `git branch` are read-only *bare*; with a verb they rewrite
+ * `.git/config` — which carries `core.sshCommand`, `core.hooksPath`, `alias.*`
+ * and the fetch/push URLs — or delete a branch. None of that is "saving work",
+ * so it is refused outright rather than offered behind approval: an approval
+ * prompt for `git remote add` would be asking a person to bless a change to the
+ * configuration that runs their other commands.
+ */
+const FORBIDDEN_VERBS: ReadonlySet<string> = new Set([
+  'add',
+  'remove',
+  'rm',
+  'rename',
+  'set-url',
+  'set-head',
+  'set-branches',
+  'update',
+  'prune',
 ]);
+
+/** Subcommands whose *first* argument is a verb from `FORBIDDEN_VERBS`. */
+const VERB_SUBCOMMANDS: ReadonlySet<string> = new Set(['remote']);
+
+/**
+ * The first argument that must be refused, or undefined when the invocation is
+ * acceptable. Reports the argument as the caller wrote it, so the message names
+ * what the model actually asked for.
+ */
+function forbiddenArg(command: string, args: string[]): string | undefined {
+  const flag = args.find((raw) => {
+    if (raw === '--') return false;
+    // `--opt=value` and `--opt value` are the same option; compare the name.
+    const name = raw.split('=', 1)[0] ?? raw;
+    if (FORBIDDEN_SHORT_OPTIONS.has(name)) return true;
+    if (FORBIDDEN_OPTION_RE.test(name)) return true;
+    // A bare word is only forbidden where it is the verb, never as a path or a
+    // revision: `git show clean` is a ref name, `git clean` deletes untracked
+    // files.
+    return FORBIDDEN_WORDS.has(name) && raw === name;
+  });
+  if (flag !== undefined) return flag;
+
+  // `git remote add …` / `git branch -D …`: the verb is the danger, not a flag.
+  if (VERB_SUBCOMMANDS.has(command) && args[0] !== undefined && FORBIDDEN_VERBS.has(args[0])) {
+    return args[0];
+  }
+  return undefined;
+}
 
 /**
  * Arguments that are only refused on the read-only path.
@@ -80,6 +140,12 @@ const FORBIDDEN_ARGS = new Set([
  * tree. On the write path the verb is the point, so it is allowed there and
  * refused here — which is a smaller and more auditable rule than trying to
  * enumerate everything safe.
+ *
+ * The `remote` and `branch` verbs are here for the same reason: both subcommands
+ * are read-only *bare* and mutating with a verb. `git remote add`/`set-url`
+ * rewrites `.git/config` (and therefore `core.sshCommand`, `core.hooksPath` and
+ * aliases), and `git remote update` reaches the network. That write used to be
+ * ungated because the deny list only knew about the flags.
  */
 const READ_ONLY_FORBIDDEN = new Set([
   'push',
@@ -102,6 +168,18 @@ const READ_ONLY_FORBIDDEN = new Set([
   '--soft',
   '--mixed',
   '--no-index',
+  // `remote` verbs. Bare `git remote` lists, which is the read-only form.
+  'add',
+  'remove',
+  'rm',
+  'rename',
+  'set-url',
+  'set-head',
+  'set-branches',
+  'update',
+  'prune',
+  // `branch`/`tag` verbs not already covered above.
+  '--unset-upstream',
 ]);
 
 interface GitRun {
@@ -265,11 +343,12 @@ const gitTool: Tool = {
       );
     }
 
-    const hardForbidden = extra.find((a) => FORBIDDEN_ARGS.has(a));
+    const hardForbidden = forbiddenArg(command, extra);
     if (hardForbidden !== undefined) {
       return fail(
-        `git: refusing the argument ${JSON.stringify(hardForbidden)} - it destroys work or skips the ` +
-          `hooks this repository installed. Do it deliberately in a shell if you really mean it.`,
+        `git: refusing the argument ${JSON.stringify(hardForbidden.split('=', 1)[0])} - it destroys work, ` +
+          `skips the hooks this repository installed, or reads and writes files outside the workspace. ` +
+          `Do it deliberately in a shell if you really mean it.`,
         'Refused a destructive argument',
       );
     }

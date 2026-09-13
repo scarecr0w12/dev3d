@@ -1,5 +1,6 @@
 /**
- * Render the block kit contact sheet, wherever Blender happens to be installed.
+ * Render a Blender preview - the block kit contact sheet, or the office - wherever
+ * Blender happens to be installed.
  *
  * `blender` is not on PATH after a default Windows install, and custom install
  * directories are not uniform across machines, so the binary is resolved here in
@@ -136,6 +137,9 @@ export function resolveBlender({
   return { error: HELP };
 }
 
+/** The script rendered when `--script` does not name another one. */
+export const DEFAULT_PREVIEW_SCRIPT = '04_preview_blocks.py';
+
 /**
  * The full Blender argument list for a render.
  *
@@ -143,12 +147,37 @@ export function resolveBlender({
  * script reads its own options from there, so the separator is required even
  * when there are no options.
  */
-export function blenderArgs(passthrough = []) {
-  const script = path.join(REPO_ROOT, 'blender', 'scripts', '04_preview_blocks.py');
-  return ['--background', '--factory-startup', '--python', script, '--', ...passthrough];
+export function blenderArgs(passthrough = [], script = DEFAULT_PREVIEW_SCRIPT) {
+  const scriptPath = path.join(REPO_ROOT, 'blender', 'scripts', script);
+  return ['--background', '--factory-startup', '--python', scriptPath, '--', ...passthrough];
+}
+
+/**
+ * Split this runner's own options from the ones the render script reads.
+ *
+ * `--script` selects which renderer to run and is consumed here; everything else
+ * is passed through to it, so `-- --views desks` still means what it says. It is
+ * separated rather than left in the passthrough because the two scripts take
+ * different options, and a stray `--script` reaching a render script would be
+ * silently ignored there.
+ */
+export function parseArgs(argv = process.argv.slice(2)) {
+  const at = argv.indexOf('--script');
+  if (at < 0) return { script: DEFAULT_PREVIEW_SCRIPT, passthrough: argv };
+  const script = argv[at + 1];
+  if (script === undefined || script.startsWith('--')) {
+    return { error: '--script needs the name of a file in blender/scripts, e.g. 05_preview_office.py' };
+  }
+  return { script, passthrough: [...argv.slice(0, at), ...argv.slice(at + 2)] };
 }
 
 function main() {
+  const parsed = parseArgs();
+  if (parsed.error !== undefined) {
+    console.error(parsed.error);
+    process.exit(1);
+  }
+
   const { blender, error } = resolveBlender();
   if (blender === undefined) {
     console.error(error);
@@ -156,7 +185,7 @@ function main() {
   }
 
   console.log(`blender: ${blender}`);
-  const result = spawnSync(blender, blenderArgs(process.argv.slice(2)), { stdio: 'inherit' });
+  const result = spawnSync(blender, blenderArgs(parsed.passthrough, parsed.script), { stdio: 'inherit' });
 
   if (result.error) {
     console.error(`Could not run Blender: ${result.error.message}`);

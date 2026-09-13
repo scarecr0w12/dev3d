@@ -93,7 +93,7 @@ export function PlanPage() {
    * it on the HTTP path made the button work with the socket down and quietly
    * do nothing with it up, which is the worse of the two ways to be wrong.
    */
-  const awaiting = useRef<{ requestId: string; asDraft: boolean } | null>(null);
+  const awaiting = useRef<{ requestId: string; asDraft: boolean; sessionId: string } | null>(null);
 
   const employees = office?.employees ?? [];
   const workspaces = office?.workspaces ?? [];
@@ -169,7 +169,11 @@ export function PlanPage() {
       setDraft('');
       setError(null);
       setBusy(true);
-      awaiting.current = { requestId, asDraft };
+      // The session that asked is recorded with the request, because a planning
+      // turn can take a minute and the operator is free to switch plans while it
+      // runs. Resolving the target from the current render on arrival put the
+      // answer in whichever plan happened to be open.
+      awaiting.current = { requestId, asDraft, sessionId: active.id };
 
       const history = toHistory(active.messages);
 
@@ -218,15 +222,27 @@ export function PlanPage() {
     const pending = awaiting.current;
     if (pending === null) return;
     const reply = replies.find((candidate) => candidate.requestId === pending.requestId);
-    if (!reply || !active) return;
+    if (!reply) return;
+    // Consume and clear on *every* path, including the one where the asking
+    // session has gone. This used to `return` before either, so deleting the
+    // session mid-turn left the composer disabled until the 180 s timeout — and
+    // switching sessions landed the reply in whichever plan happened to be open
+    // when it arrived, because the target was resolved from the current render
+    // rather than from the turn that asked.
     store.takePlanReply(pending.requestId);
     awaiting.current = null;
     setBusy(false);
-    updateSession(active.id, {
-      messages: [...active.messages, { id: messageId(), role: 'assistant', text: reply.text, at: reply.at }],
+
+    const target = sessions.items.find((session) => session.id === pending.sessionId);
+    if (!target) {
+      setError('the plan this reply belonged to was closed before it arrived, so it was discarded');
+      return;
+    }
+    updateSession(target.id, {
+      messages: [...target.messages, { id: messageId(), role: 'assistant', text: reply.text, at: reply.at }],
       ...(pending.asDraft ? { draft: stripLeadingEmphasis(reply.text) } : {}),
     });
-  }, [active, replies, store, updateSession]);
+  }, [replies, sessions, store, updateSession]);
 
   // A budget or a plan that never answers must not leave the composer disabled.
   useEffect(() => {

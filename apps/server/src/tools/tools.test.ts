@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveInWorkspace } from './paths.ts';
+import { isPathInside, resolveInWorkspace, toWorkspaceRelative } from './paths.ts';
 import { createFsTools } from './fs.ts';
 import { createShellTools } from './shell.ts';
 import { createDefaultTools, createToolRegistry } from './registry.ts';
@@ -41,6 +41,210 @@ test('resolveInWorkspace rejects escapes and accepts nested paths', () => {
     assert.throws(() => resolveInWorkspace(ws, 'D:bar'));
     const nested = resolveInWorkspace(ws, 'a/b/c.txt');
     assert.equal(nested, join(ws, 'a', 'b', 'c.txt'));
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('resolveInWorkspace refuses to follow a link out of the workspace', () => {
+  // The regression this pins: the check used to be purely lexical, so
+  // `<root>/link/secret.txt` normalised to a path starting with the root and
+  // was allowed - and then node:fs followed the link and read outside. A pnpm
+  // node_modules is largely junctions, so this needed no attacker.
+  const base = mkdtempSync(join(tmpdir(), 'dev3d-link-'));
+  const ws = join(base, 'ws');
+  const outside = join(base, 'outside');
+  mkdirSync(ws, { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(join(outside, 'secret.txt'), 'OUTSIDE-SECRET\n', 'utf8');
+  // A directory junction needs no elevation on Windows and is the same code
+  // path a symlink takes here.
+  symlinkSync(outside, join(ws, 'link'), 'junction');
+  try {
+    assert.throws(
+      () => resolveInWorkspace(ws, 'link/secret.txt'),
+      /symbolic link or junction|resolves outside/,
+      'a junction out of the workspace must be refused, not followed',
+    );
+    assert.throws(
+      () => resolveInWorkspace(ws, 'link/nested/created.txt'),
+      /symbolic link or junction|resolves outside/,
+      'a not-yet-existing file under a junction must also be refused',
+    );
+    // A link that points back INSIDE the root is refused too: the point is that
+    // no link is followed, so "the link appears between check and use" is not a
+    // meaningful attack.
+    mkdirSync(join(ws, 'inner'), { recursive: true });
+    symlinkSync(join(ws, 'inner'), join(ws, 'selflink'), 'junction');
+    assert.throws(() => resolveInWorkspace(ws, 'selflink/ok.txt'), /symbolic link or junction/);
+    // A plain directory still works.
+    assert.equal(resolveInWorkspace(ws, 'inner/ok.txt'), join(ws, 'inner', 'ok.txt'));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('the filesystem tools cannot read or write through a link out of the workspace', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'dev3d-linktool-'));
+  const ws = join(base, 'ws');
+  const outside = join(base, 'outside');
+  mkdirSync(ws, { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(join(outside, 'secret.txt'), 'OUTSIDE-SECRET\n', 'utf8');
+  symlinkSync(outside, join(ws, 'link'), 'junction');
+  const tools = createFsTools();
+  const ctx = makeContext(ws);
+  try {
+    const read = await find(tools, 'read_file').run({ path: 'link/secret.txt' }, ctx);
+    assert.equal(read.ok, false, 'read_file must not read through the junction');
+    assert.match(read.content, /symbolic link or junction|escapes|resolves outside/);
+
+    const write = await find(tools, 'write_file').run(
+      { path: 'link/planted.txt', content: 'pwned' },
+      ctx,
+    );
+    assert.equal(write.ok, false, 'write_file must not write through the junction');
+    assert.equal(existsSync(join(outside, 'planted.txt')), false, 'nothing may land outside');
+
+    const list = await find(tools, 'list_dir').run({ path: 'link' }, ctx);
+    assert.equal(list.ok, false, 'list_dir must not follow the junction');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('an NTFS alternate data stream is refused as a write target', () => {
+  // `write_file('a.txt:hidden')` used to succeed and `read_file` could read it
+  // back, while `readdirSync` showed only `a.txt` — so it was a place to stash
+  // content the operator's own inspection tools would never show, and it made
+  // `affectsPaths` disagree with the tree. `a.txt::$DATA` is the default-stream
+  // spelling of the same trick.
+  const ws = makeTempWorkspace();
+  try {
+    for (const candidate of ['a.txt:hidden', 'a.txt::$DATA', 'dir/file.txt:stream', ':hidden']) {
+      assert.throws(
+        () => resolveInWorkspace(ws, candidate),
+        /alternate data stream/,
+        `${candidate} must be refused`,
+      );
+    }
+    // A colon is only legal in a Windows path as part of the volume prefix, so an
+    // ordinary nested path — and an absolute path whose drive letter contains one
+    // — is unaffected.
+    assert.equal(resolveInWorkspace(ws, 'a/b/c.txt'), join(ws, 'a', 'b', 'c.txt'));
+    assert.equal(resolveInWorkspace(ws, join(ws, 'a', 'b.txt')), join(ws, 'a', 'b.txt'));
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('a reserved Windows device name is refused before it can silently swallow a write', () => {
+  // `write_file('NUL')` used to "succeed" while creating nothing, and `NUL` really
+  // is the device through `run_shell`'s cmd.exe — so `writtenPaths` recorded a file
+  // no later tool could read. Windows maps the name with an extension, with a
+  // trailing dot and with a trailing space, and through a directory, so every
+  // component is checked rather than only the last.
+  const ws = makeTempWorkspace();
+  try {
+    for (const candidate of [
+      'NUL',
+      'CON',
+      'aux',
+      'PRN.txt',
+      'sub/COM1',
+      'LPT9.log',
+      'NUL ',
+      'CON.',
+      'CONIN$',
+      'dir/nul/file.txt',
+    ]) {
+      assert.throws(
+        () => resolveInWorkspace(ws, candidate),
+        /reserved Windows device/,
+        `${candidate} must be refused`,
+      );
+    }
+    // Ordinary names that merely start with a device name are untouched, or the
+    // guard would refuse half of a normal project.
+    for (const candidate of ['console.txt', 'nullable.md', 'com10.txt', 'prn-notes.txt', 'a/NULL.txt']) {
+      assert.doesNotThrow(() => resolveInWorkspace(ws, candidate), `${candidate} must be allowed`);
+    }
+    // A device name as a *directory* is the one Windows would silently redirect,
+    // so it is refused even though the file beneath it is ordinary.
+    assert.throws(() => resolveInWorkspace(ws, 'COM1/notes.txt'), /reserved Windows device/);
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('isPathInside is boundary-aware and case-exact', () => {
+  // `startsWith(root)` reported `C:\plugins\foo-evil\x.js` as inside
+  // `C:\plugins\foo`, and lowercasing both sides made `C:\WS` and `C:\ws` the same
+  // directory — which they are not on NTFS with per-directory case sensitivity
+  // enabled.
+  const root = join(tmpdir(), 'dev3d-inside-root');
+  assert.equal(isPathInside(root, root), true, 'the root contains itself');
+  assert.equal(isPathInside(root, join(root, 'a', 'b.txt')), true, 'a nested path is inside');
+  assert.equal(isPathInside(root, join(tmpdir(), 'dev3d-inside-root-evil', 'x.js')), false, 'a sibling sharing the prefix is outside');
+  assert.equal(isPathInside(root, join(tmpdir(), 'other')), false, 'an unrelated directory is outside');
+  assert.equal(isPathInside(root, join(root, '..', 'sibling')), false, 'a parent is outside');
+  if (process.platform === 'win32') {
+    // The property the case-folding threw away. On a case-insensitive volume the
+    // filesystem itself would resolve both spellings to one directory; the
+    // predicate has to be able to say they are different, because on a
+    // case-sensitive tree they are.
+    assert.equal(
+      isPathInside('C:\\WS', 'C:\\ws\\evil'),
+      false,
+      'a different spelling of the root is a different directory',
+    );
+    assert.equal(isPathInside('C:\\WS', 'C:\\WS\\ok.txt'), true);
+  }
+});
+
+test('toWorkspaceRelative refuses a path outside the root instead of returning ../', () => {  const ws = makeTempWorkspace();
+  try {
+    assert.equal(toWorkspaceRelative(ws, join(ws, 'a', 'b.txt')), 'a/b.txt');
+    assert.equal(toWorkspaceRelative(ws, ws), '.');
+    // It used to return '../elsewhere', which made every caller's guard dead
+    // code and let an outside path be recorded as a file the run wrote.
+    assert.throws(() => toWorkspaceRelative(ws, join(tmpdir(), 'elsewhere', 'x.txt')));
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('the writing tools refuse a .git control file, because an approval cannot see it', async () => {
+  // The attack this closes: plant `.git/hooks/pre-commit` with write_file (no
+  // approval needed for a file in your own workspace), then call
+  // `git commit -m x`, which a human approves while seeing only the argv — and
+  // the planted hook runs with the provider keys in its environment.
+  const ws = makeTempWorkspace();
+  const tools = createFsTools();
+  const ctx = makeContext(ws);
+  try {
+    mkdirSync(join(ws, '.git', 'hooks'), { recursive: true });
+    for (const rel of [
+      '.git/hooks/pre-commit',
+      '.git/config',
+      join('.git', 'objects', 'x'),
+      'sub/.git/config',
+    ]) {
+      const res = await find(tools, 'write_file').run({ path: rel, content: '#!/bin/sh\necho pwned' }, ctx);
+      assert.equal(res.ok, false, `write_file must refuse ${rel}`);
+      assert.match(res.content, /\.git directory/);
+      assert.equal(existsSync(join(ws, rel)), false, `${rel} must not be created`);
+    }
+    // A directory merely *named* like a git dir is not the repository's own.
+    const ok = await find(tools, 'write_file').run({ path: 'src/.gitignore', content: 'node_modules' }, ctx);
+    assert.equal(ok.ok, true, 'an ordinary file whose name starts with .git stays writable');
+    // edit_file is refused on the same basis.
+    const edited = await find(tools, 'edit_file').run(
+      { path: '.git/config', oldString: 'a', newString: 'b' },
+      ctx,
+    );
+    assert.equal(edited.ok, false);
+    assert.match(edited.content, /\.git directory/);
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }

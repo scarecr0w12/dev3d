@@ -42,6 +42,11 @@ export interface VendorAnswer {
 /** Keys whose string value is plausibly a path the vendor touched. */
 const PATH_KEYS = ['path', 'file', 'filePath', 'filepath', 'filename', 'target'];
 
+import { stripControlSequences } from '../security/text.ts';
+
+/** Re-exported so the stripping can be tested through this module's surface. */
+export { stripControlSequences };
+
 /**
  * Turn raw stdout into an answer.
  *
@@ -50,7 +55,7 @@ const PATH_KEYS = ['path', 'file', 'filePath', 'filepath', 'filename', 'target']
  * used instead of returning nothing.
  */
 export function extractVendorAnswer(raw: string, format: VendorOutputFormat): VendorAnswer {
-  const trimmed = raw.trim();
+  const trimmed = stripControlSequences(raw).trim();
   if (format === 'text') {
     return { text: trimmed, parsed: false, reportedStatus: null, files: [] };
   }

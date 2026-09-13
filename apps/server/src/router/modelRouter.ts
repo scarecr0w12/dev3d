@@ -40,6 +40,7 @@ import type {
 import { MODEL_TIER_ORDER, applyRoutingHints, hintsForTaskClass, tierRank } from '@dev3d/core';
 import { blendedCostPerKTok } from '../llm/pricing.ts';
 import {
+  candidateKey,
   explainScore,
   provenanceOf,
   rankCandidates,
@@ -157,9 +158,15 @@ function hintBonuses(
     const avoidedModels = new Set(hint.avoidModelIds);
 
     for (const model of inScope) {
-      if (preferredModels.has(model.id)) add(model.id, HINT_BONUS.model);
-      if (preferredProviders.has(model.providerId)) add(model.id, HINT_BONUS.provider);
-      if (avoidedModels.has(model.id)) add(model.id, HINT_BONUS.avoid);
+      // Keyed by provider *and* id, the same key the scorer reads (`candidateKey`),
+      // because the pool spans every provider: two providers serving one model id
+      // used to share a single entry, so a hint aimed at one applied to both.
+      const key = candidateKey(model);
+      // The *matching* is unchanged — a rule names a model id, as its manifest
+      // always has — only the key the bonus is remembered under.
+      if (preferredModels.has(model.id)) add(key, HINT_BONUS.model);
+      if (preferredProviders.has(model.providerId)) add(key, HINT_BONUS.provider);
+      if (avoidedModels.has(model.id)) add(key, HINT_BONUS.avoid);
     }
   }
 

@@ -28,6 +28,33 @@ import type { ServerEvent } from './events.ts';
 /** The plugin API this build implements. Bump only for a breaking change. */
 export const PLUGIN_API_VERSION = '1';
 
+/** The major version of an API string like '1' or '1.2'. Null when unparseable. */
+export function apiMajor(version: string): number | null {
+  const match = /^(\d+)/.exec(version.trim());
+  if (!match || match[1] === undefined) return null;
+  const major = Number.parseInt(match[1], 10);
+  return Number.isFinite(major) ? major : null;
+}
+
+/**
+ * A plugin is compatible when it targets the same major API as the host.
+ *
+ * Major, not exact: `1.2` is a plugin built against a later minor revision of an
+ * API that promised not to break within its major, so refusing it would be wrong.
+ *
+ * It lives **here**, beside the version it compares, because it used to be written
+ * out three times — the host's real gate, the console's card, and the marketplace
+ * browser — and they disagreed. The console compared exact strings, so it painted
+ * a perfectly loadable plugin's card red with "host implements 1 — mismatch", and
+ * the marketplace hardcoded `!== '1'`, which would flag every catalog entry the
+ * moment the version is bumped. One definition means one answer.
+ */
+export function apiCompatible(pluginApi: string, hostApi: string = PLUGIN_API_VERSION): boolean {
+  const plugin = apiMajor(pluginApi);
+  const host = apiMajor(hostApi);
+  return plugin !== null && host !== null && plugin === host;
+}
+
 /**
  * What a plugin asks to be allowed to touch. Declared in the manifest and shown
  * to the operator before enabling: a plugin that registers tools is asking for
@@ -115,8 +142,23 @@ export interface UiPanelContribution {
    * one costs a panel, not the console.
    */
   source?: { url: string; refreshMs?: number };
-  /** Optional CSS custom properties this panel needs. */
-  tokens?: Record<string, string>;
+  /**
+   * Colours this panel wants its card painted in.
+   *
+   * A panel's body is a closed widget vocabulary — `PanelWidget` — so a plugin
+   * cannot ship markup or CSS for it. These are the only three knobs that reach
+   * the console's own styling, and the host validates both the names and the
+   * values. Anything else is dropped with a warning rather than silently ignored,
+   * because a token that does nothing is worse than one that was refused.
+   */
+  tokens?: {
+    /** Colour of the panel's title and its left edge. */
+    accent?: string;
+    /** Background of the panel card. */
+    surface?: string;
+    /** Body text colour inside the panel. */
+    text?: string;
+  };
 }
 
 /** One operator-facing setting, rendered as a form control. */
@@ -156,6 +198,39 @@ export interface PluginTool {
   description: string;
   parameters: Record<string, unknown>;
   run(args: Record<string, unknown>, ctx: PluginToolContext): Promise<PluginToolResult>;
+}
+
+/**
+ * How a plugin's tool is named once it is in the office.
+ *
+ * This lives in core rather than in the plugin host because two places have to
+ * agree on it exactly. The host derives the real name when it registers the
+ * tool; the console derives the expected name when it checks a manifest's
+ * declared `toolNames` against the registrations the host reported. Two
+ * hand-written copies of this rule would drift, and a drifted copy does not
+ * fail — it quietly accuses a correct plugin of claiming a tool it never
+ * registered. That is the same bug `apiCompatible` exists to prevent.
+ */
+
+/** The length cap `namespacedToolName` truncates at, exported for the same reason. */
+export const MAX_TOOL_NAME_LENGTH = 64;
+
+/** The name prefix a plugin owns, derived from its id. */
+export function toolNamespace(pluginId: string): string {
+  return pluginId
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 40);
+}
+
+/** Both the namespace and the tool name are cleaned and bounded. */
+export function namespacedToolName(pluginId: string, toolName: string): string {
+  const clean = toolName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return `${toolNamespace(pluginId)}_${clean}`.slice(0, MAX_TOOL_NAME_LENGTH);
 }
 
 /** What a plugin contributes, declared in the manifest. */
@@ -260,6 +335,28 @@ export interface PluginRecord {
   /** True when it ships code that runs in the orchestrator's process. */
   hasCode: boolean;
   contributions: PluginContributionCounts;
+  /**
+   * The tool names this plugin actually registered, once it has run.
+   *
+   * From the host, not from the manifest. The manifest's
+   * `contributes.toolNames` was documented as being "for the consent screen" and
+   * nothing read it — while the host separately tracked the *real* registrations
+   * and only ever published their count. An operator deciding whether to trust a
+   * plugin wants the names of the tools it now holds, and the declared list is
+   * exactly the claim that needs checking rather than repeating.
+   */
+  registeredToolNames: string[];
+  /**
+   * The endpoints this plugin contributes, as `label → host`.
+   *
+   * A contributed provider is a *destination for every prompt*: the brief, the stage
+   * transcript, the knowledge block, and any file the tool loop read. The console
+   * showed a count ("1 provider") and not one host, so an operator turning a plugin
+   * on was agreeing to send their work somewhere the card never named — and
+   * "data only" read as a safety property when a data-only manifest is exactly what
+   * can declare a remote endpoint.
+   */
+  contributedProviderHosts: Array<{ id: string; label: string; host: string; keyless: boolean }>;
   /** Current settings, already merged over the manifest defaults. */
   settings: Record<string, unknown>;
   installedAt: number;

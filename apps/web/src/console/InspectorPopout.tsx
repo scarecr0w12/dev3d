@@ -194,9 +194,14 @@ export function InspectorPopout({
                       id="inspector-chat-target"
                       value={chatEmployee?.id ?? ''}
                       onChange={(event) => {
-                        const next = event.target.value;
-                        setChatTarget(next);
-                        store.selectEmployee(next);
+                        // Choosing who to *talk to* must not also mean "show me
+                        // this person". It used to call `store.selectEmployee`,
+                        // which emits synchronously; the shell then saw a changed
+                        // selection and switched the inspector to the Agent tab —
+                        // so the act of picking a chat target navigated away from
+                        // the conversation surface. `chatTarget` is the component's
+                        // own state and is the right home for this intent.
+                        setChatTarget(event.target.value);
                       }}
                     >
                       <option value="" disabled>

@@ -64,6 +64,17 @@ export interface DiscoveryOptions {
   providers: () => LlmProvider[];
   /** Providers an operator actually configured, for `onlyConfigured`. */
   isConfigured?: (providerId: string) => boolean;
+  /**
+   * Whether this provider is a local runtime, such as LM Studio or Ollama.
+   *
+   * Used only to choose a log level. A keyless local endpoint is reachable in
+   * principle but usually is not running, so a failed list is the expected state
+   * of an install rather than a fault to report at every boot: nothing here is
+   * misconfigured, and the step that would fix it is starting a program the
+   * office does not manage. The fallback is the same either way - the curated
+   * catalog stands in - so the report is kept and only the volume changes.
+   */
+  isLocal?: (providerId: string) => boolean;
   /** How long a result stays fresh. `0` always re-asks. */
   ttlMs: number;
   /** Where results are cached. */
@@ -112,8 +123,37 @@ export function curatedButMissing(providerId: string, discovered: DiscoveredMode
   return curatedIdsForProvider(providerId).filter((id) => !seen.has(id));
 }
 
-export function createDiscoveryService(options: DiscoveryOptions): DiscoveryService {
-  const now = options.now ?? (() => Date.now());
+/**
+ * Bound one provider's model-list call.
+ *
+ * The built-in adapters bound their own `fetch`, so this is the backstop for a
+ * provider contributed by a plugin: a `listModels` that returns a promise which
+ * never settles must not stall discovery for every provider behind it in the
+ * sequential walk.
+ */
+function withDiscoveryDeadline<T>(work: Promise<T>, providerId: string): Promise<T> {
+  return new Promise<T>((settle, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${providerId}: the model list did not answer within ${DISCOVERY_DEADLINE_MS}ms.`));
+    }, DISCOVERY_DEADLINE_MS);
+    timer.unref?.();
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        settle(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
+/** How long one provider's model list may take before it is written off. */
+const DISCOVERY_DEADLINE_MS = 90_000;
+
+export function createDiscoveryService(options: DiscoveryOptions): DiscoveryService {  const now = options.now ?? (() => Date.now());
   const reports = new Map<string, DiscoveryReport>();
   /** The merged catalog per provider, kept beside the raw report. */
   const specs = new Map<string, ModelSpec[]>();
@@ -168,7 +208,11 @@ export function createDiscoveryService(options: DiscoveryOptions): DiscoveryServ
     }
 
     try {
-      const models = await provider.listModels();
+      // An outer bound as well as the adapters' own timeouts. The adapters are
+      // bounded, but a plugin may contribute a provider of its own, and one
+      // that never answers must not hold up every provider after it in this
+      // sequential walk.
+      const models = await withDiscoveryDeadline(provider.listModels(), providerId);
       const report: DiscoveryReport = {
         providerId,
         ok: true,
@@ -199,7 +243,15 @@ export function createDiscoveryService(options: DiscoveryOptions): DiscoveryServ
         at: now(),
       };
       record(report);
-      options.log?.('warn', 'discovery', `${providerId}: model list unavailable (${report.error}); using the curated catalog`);
+      // A local runtime that is not running is the normal case, not a fault, so
+      // it does not get a warning. Everything else does, because an unreachable
+      // remote provider is something an operator can and should act on.
+      const level = options.isLocal?.(providerId) === true ? 'debug' : 'warn';
+      options.log?.(
+        level,
+        'discovery',
+        `${providerId}: model list unavailable (${report.error}); using the curated catalog`,
+      );
       return report;
     }
   }

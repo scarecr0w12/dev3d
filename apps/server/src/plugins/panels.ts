@@ -10,9 +10,13 @@
  *
  * Two consequences worth naming:
  *
- *  - Fetching server-side means a plugin endpoint cannot be used to probe the
- *    operator's machine or intranet from the browser, and a dead endpoint costs
- *    one panel rather than the console.
+ *  - Fetching server-side keeps a plugin endpoint out of the browser, and a dead
+ *    endpoint costs one panel rather than the console. It does **not** mean the
+ *    plugin cannot probe the machine — the server is the one probing, and the
+ *    answer is rendered on the operator's screen. So the fetch is guarded: a panel
+ *    source may not point at a loopback, private or link-local address unless the
+ *    operator says so, and it may not redirect. That sentence used to claim the
+ *    first half of this without doing it, which is worse than not claiming it.
  *  - Because the fetch happens here, a hostile or merely broken source could
  *    otherwise turn every console into a request amplifier, so responses are
  *    cached for at least the panel's `refreshMs`, concurrent requests for the
@@ -21,6 +25,7 @@
  */
 
 import type { PanelWidget, UiPanelContribution } from '@dev3d/core';
+import { checkHostIsPublic, fetchGuarded } from '../security/webGuard.ts';
 import { validatePanelWidgets } from './manifest.ts';
 
 export interface PanelReadResult {
@@ -63,9 +68,16 @@ function errMsg(error: unknown): string {
 export function createPanelReader(options: {
   panels: () => Array<{ pluginId: string; panel: UiPanelContribution }>;
   log: (level: 'debug' | 'info' | 'warn' | 'error', scope: string, message: string) => void;
+  /**
+   * Whether a panel may be served from a private address. Off by default: see
+   * `allowPrivatePanelHosts` in the config for why this is an explicit opt-in.
+   */
+  allowPrivateHosts?: boolean;
 }): PanelReader {
   const cache = new Map<string, CacheEntry>();
   const inFlight = new Map<string, Promise<PanelReadResult>>();
+  /** Hosts already logged, so one endpoint is named once rather than every refresh. */
+  const loggedHosts = new Set<string>();
 
   function find(pluginId: string, panelId: string): UiPanelContribution | null {
     const entry = options.panels().find(
@@ -94,11 +106,45 @@ export function createPanelReader(options: {
   ): Promise<{ widgets: PanelWidget[]; error: string | null }> {
     const source = panel.source;
     if (source === undefined) return { widgets: panel.body ?? [], error: null };
+
+    let url: URL;
     try {
-      const response = await fetch(source.url, {
+      url = new URL(source.url);
+    } catch {
+      return { widgets: [], error: 'the panel endpoint is not a URL.' };
+    }
+
+    // Named once per host, so an operator can see where a panel's data comes from
+    // without the console refreshing it into their log every thirty seconds.
+    if (!loggedHosts.has(url.host)) {
+      loggedHosts.add(url.host);
+      options.log('info', `plugin:${pluginId}`, `panel "${panel.id}" is served by ${url.host}.`);
+    }
+
+    try {
+      // No redirects: the URL in the manifest is meant to be the endpoint, and a
+      // redirect is how a source that passed the host check reaches an address the
+      // check refused. Host-guarded unless the operator opted in to private ones,
+      // because *this server* is the one probing and the answer is drawn on the
+      // operator's screen.
+      const attempt = await fetchGuarded(url, {
         headers: { accept: 'application/json' },
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        timeoutMs: FETCH_TIMEOUT_MS,
+        maxRedirects: 0,
+        ...(options.allowPrivateHosts === true
+          ? { check: async () => ({ ok: true, reason: '', addresses: [] }) }
+          : { check: checkHostIsPublic }),
       });
+      if (!attempt.ok) {
+        return {
+          widgets: [],
+          error: attempt.refused
+            ? `the panel endpoint was refused: ${attempt.reason}`
+            : `could not reach the panel endpoint: ${attempt.error}`,
+        };
+      }
+
+      const response = attempt.response;
       if (!response.ok) return { widgets: [], error: `the panel endpoint returned HTTP ${response.status}.` };
       const raw = (await response.json()) as unknown;
       const container =

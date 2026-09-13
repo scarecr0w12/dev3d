@@ -6,9 +6,9 @@
   "type": "module",
   "description": "dev3d orchestrator: org chart, model router, tool-execution loop, and hierarchical run engine.",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "node --watch src/index.ts",
     "dev:node": "node src/index.ts",
-    "start": "tsx src/index.ts",
+    "start": "node src/index.ts",
     "start:node": "node src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test --test-isolation=none \"src/**/*.test.ts\""

@@ -166,14 +166,28 @@ export function PluginsPanels() {
       if (update === undefined) return;
       const pluginId = record.manifest.id;
       setActionError(null);
+      // The server's install takes a **catalog** URL — it fetches the document and
+      // then looks the plugin up inside it. `update.downloadUrl` is the bundle
+      // archive, so passing it here made every Update fail with the marketplace
+      // being blamed for a client-side URL mistake: the server fetched a
+      // `.tar.gz` and reported "is not valid JSON". The catalog URL is the
+      // source's own `url`, which the panel already holds.
+      const catalogUrl = sources.find((source) => source.id === update.sourceId)?.url;
+      if (catalogUrl === undefined) {
+        setActionError(
+          `${record.manifest.name}: its marketplace source is no longer configured, so the update ` +
+            'cannot be fetched. Add the source back, or install the plugin by hand.',
+        );
+        return;
+      }
       mark(pluginId, true);
-      void api.installPlugin(update.downloadUrl, pluginId, true).then((result) => {
+      void api.installPlugin(catalogUrl, pluginId, true).then((result) => {
         mark(pluginId, false);
         if (!result.ok) setActionError(`${record.manifest.name}: ${result.error ?? 'the update failed'}`);
         else if (result.data) setSelectedId(pluginId);
       });
     },
-    [mark],
+    [mark, sources],
   );
 
   const refresh = useCallback(() => {

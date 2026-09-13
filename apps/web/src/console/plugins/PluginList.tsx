@@ -18,7 +18,15 @@ import type { PluginRecord } from '@dev3d/core';
 import { formatAgo } from '../../app/format';
 import { useNow } from '../../app/hooks';
 import { Badge, Empty, Panel, cx } from '../ui';
-import { checkApiVersion, contributionLine, contributionRows, describePermissions, sourceCopy, statusCopy } from './format';
+import {
+  checkApiVersion,
+  contributionLine,
+  contributionRows,
+  describePermissions,
+  sourceCopy,
+  statusCopy,
+  toolConsent,
+} from './format';
 
 export interface PluginListProps {
   records: readonly PluginRecord[];
@@ -164,6 +172,7 @@ function PluginCard({
   const version = checkApiVersion(record, hostApiVersion);
   const contributions = contributionRows(record.contributions);
   const permissions = describePermissions(manifest.permissions);
+  const tools = toolConsent(record);
 
   return (
     <article
@@ -197,10 +206,10 @@ function PluginCard({
           title={
             record.hasCode
               ? 'This plugin ships a module the orchestrator imports and runs in its own process.'
-              : 'Declarative: data only, no module is loaded, so it can do nothing the manifest does not describe.'
+              : 'Declarative: no module is loaded. It cannot run code here — but what it declares can still reach out, so the endpoints it names are listed below.'
           }
         >
-          {record.hasCode ? 'runs code' : 'data only'}
+          {record.hasCode ? 'runs code' : 'no code'}
         </Badge>
         <Badge tone={source.tone} title={source.hint}>
           {source.label}
@@ -236,7 +245,9 @@ function PluginCard({
         </div>
       ) : (
         <div className="dim small plugin-code-note">
-          Declarative: data only. No module is loaded, so it can contribute nothing beyond what its manifest lists.
+          Declarative: no module is loaded, so it cannot run code here. That is not the
+          same as harmless — what it declares can still send your work somewhere, which is
+          what the endpoints above name.
         </div>
       )}
 
@@ -244,6 +255,54 @@ function PluginCard({
         <div className="alert alert-danger small" role="alert">
           <span className="strong">This plugin did not load.</span>
           <span className="mono plugin-error-text">{record.error ?? 'the host reported an error without a message'}</span>
+        </div>
+      )}
+
+      {record.contributedProviderHosts.length > 0 && (
+        <div className="plugin-endpoints">
+          <span className="dim small">sends prompts to</span>
+          <span className="chips">
+            {record.contributedProviderHosts.map((provider) => (
+              <Badge
+                key={provider.id}
+                tone={provider.keyless ? 'neutral' : 'warn'}
+                mono
+                title={
+                  provider.keyless
+                    ? `${provider.label}: a keyless local runtime at ${provider.host}`
+                    : `${provider.label} at ${provider.host}. A plugin provider is a destination for every prompt the model sees: the brief, the stage transcript and any file the tool loop read.`
+                }
+              >
+                {provider.host}
+              </Badge>
+            ))}
+          </span>
+        </div>
+      )}
+
+      <div className="plugin-tools">
+        <span className="dim small">tools it holds</span>
+        {tools.registered.length === 0 ? (
+          <span className="dim small">
+            {record.status === 'loaded'
+              ? 'none — it has registered no tool in the orchestrator'
+              : 'none — it is not loaded'}
+          </span>
+        ) : (
+          <span className="chips">
+            {tools.registered.map((name) => (
+              <Badge key={name} tone="warn" mono title={tools.hint ?? undefined}>
+                {name}
+              </Badge>
+            ))}
+          </span>
+        )}
+      </div>
+
+      {tools.mismatch && (
+        <div className="alert alert-warn small" role="note">
+          <span className="strong">Its manifest does not match what it registered.</span>
+          <span>{tools.hint}</span>
         </div>
       )}
 

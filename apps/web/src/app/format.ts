@@ -36,6 +36,42 @@ export function formatTokens(tokensIn: number | null | undefined, tokensOut: num
   return `${formatCompact(tokensIn ?? 0)} in / ${formatCompact(tokensOut ?? 0)} out`;
 }
 
+/** The parts of a `UsageRecord` these helpers read, so a fixture need not be whole. */
+export interface UsageLike {
+  tokensIn: number;
+  tokensOut: number;
+  estimated?: boolean;
+  reasoningTokens?: number;
+}
+
+/**
+ * Token counts, marked when they were **estimated** rather than reported.
+ *
+ * The office falls back to a `chars/4` estimate when a provider reports no usage —
+ * a local runtime mostly — and it drew that identically to a bill, so an estimate
+ * was indistinguishable from a measurement everywhere downstream. The tilde is the
+ * whole difference, and it is the honest one: the number may be wrong in either
+ * direction, and now it says so.
+ */
+export function formatUsage(usage: UsageLike): string {
+  return `${usage.estimated === true ? '~' : ''}${formatTokens(usage.tokensIn, usage.tokensOut)}`;
+}
+
+/**
+ * How much of the output was reasoning, or `null` when the provider did not say.
+ *
+ * Reasoning tokens are billed at the output rate and routinely dominate a
+ * completion, so a total with no split is a bill nobody can account for. This is
+ * only ever shown when the provider reported the figure; an estimate of it would be
+ * a second guess stacked on the first.
+ */
+export function reasoningShare(usage: UsageLike): string | null {
+  const reasoning = usage.reasoningTokens;
+  if (reasoning === undefined || !Number.isFinite(reasoning) || reasoning <= 0) return null;
+  const share = usage.tokensOut > 0 ? Math.round((reasoning / usage.tokensOut) * 100) : 0;
+  return `${formatCompact(reasoning)} reasoning (${share}% of output)`;
+}
+
 /** `1.4s`, `12.3s`, `4m 05s`, `1h 12m` - compact and stable width. */
 export function formatDuration(ms: number | null | undefined): string {
   if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) return '—';
@@ -84,11 +120,6 @@ export function formatPercent(part: number, whole: number): string {
 export function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
-}
-
-export function firstLine(text: string): string {
-  const line = text.split('\n').find((l) => l.trim().length > 0);
-  return line ? line.trim() : '';
 }
 
 export function humaniseToken(token: string): string {

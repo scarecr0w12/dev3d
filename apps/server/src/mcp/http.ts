@@ -35,6 +35,42 @@ export interface HttpTransportOptions {
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 
+/**
+ * How much of a non-streaming response body is read.
+ *
+ * A JSON-RPC reply is small; anything approaching this is a misbehaving or
+ * hostile endpoint. The bound exists because `res.text()` buffers the entire body
+ * before anyone can look at it, so an unbounded read is an out-of-memory waiting
+ * to happen on a URL an operator merely typed.
+ */
+const MAX_JSON_BYTES = 8_000_000;
+
+/** Read at most `maxBytes` of a response body, as text. */
+async function readCappedText(response: Response, maxBytes: number): Promise<string> {
+  const body = response.body;
+  if (body === null) return '';
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      total += value.byteLength;
+      if (total >= maxBytes) {
+        chunks.push(value.subarray(0, Math.max(0, maxBytes - (total - value.byteLength))));
+        await reader.cancel().catch(() => {});
+        break;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8');
+}
+
 export class HttpTransport implements McpTransport {
   readonly label: string;
   private readonly options: HttpTransportOptions;
@@ -89,19 +125,27 @@ export class HttpTransport implements McpTransport {
 
     // Best-effort session teardown. A server that does not support it answers
     // 405, which is not an error worth reporting.
-    if (this.sessionId !== null) {
-      const session = this.sessionId;
+    //
+    // `this.sessionId` used to be nulled *before* the request, and `headers()`
+    // only sends the id when it is set — so the DELETE went out without
+    // `Mcp-Session-Id` and the server had nothing to tear down. The session then
+    // lingered until it expired on its own, which for a server that counts
+    // sessions is a leak.
+    const session = this.sessionId;
+    if (session !== null) {
       this.sessionId = null;
       try {
         await fetch(this.options.url, {
           method: 'DELETE',
-          headers: this.headers(),
+          headers: { ...this.headers(), 'mcp-session-id': session },
           signal: AbortSignal.timeout(5000),
+          // Manual for the same reason as the POST: a redirected DELETE would go
+          // out without the session header it needs to mean anything.
+          redirect: 'manual',
         });
       } catch {
         // ignore: the session will expire on its own
       }
-      void session;
     }
   }
 
@@ -130,12 +174,29 @@ export class HttpTransport implements McpTransport {
         headers: this.headers(),
         body: JSON.stringify(message),
         signal: controller.signal,
+        // Not followed. A 301/302 makes the fetch spec rewrite this POST into a
+        // GET and drop the JSON-RPC body entirely, so the handshake fails with a
+        // protocol error that names nothing — while the real cause is that the
+        // configured URL redirects. Reported as itself below instead.
+        redirect: 'manual',
       });
     } catch (e) {
       if (this.closed) return;
       throw new Error(`${this.label} request failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       clearTimeout(timeout);
+    }
+
+    // A redirect on the JSON-RPC endpoint is a configuration problem, and saying
+    // so — with the target — is the whole fix for a class of "it just does not
+    // work" that had no diagnostic at all.
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location') ?? '(no Location header)';
+      throw new Error(
+        `${this.label} answered ${response.status} redirecting to ${location}. A JSON-RPC endpoint must not ` +
+          'redirect: the request would be rewritten to a GET and its body dropped. Point the server URL at ' +
+          'the endpoint it redirects to.',
+      );
     }
 
     // The server may issue a session on any response; remember the first one.
@@ -157,7 +218,11 @@ export class HttpTransport implements McpTransport {
       return;
     }
 
-    const text = await response.text();
+    // Bounded, because a JSON response is still a response from somebody else's
+    // server and `res.text()` concatenates the whole body in memory first. An
+    // unbounded body is an out-of-memory waiting to happen, and this transport
+    // talks to endpoints an operator merely named.
+    const text = await readCappedText(response, MAX_JSON_BYTES);
     if (text.trim() === '') return;
     this.deliverJson(text);
   }
@@ -186,7 +251,13 @@ export class HttpTransport implements McpTransport {
         resetIdle();
         buffer += decoder.decode(value, { stream: true });
 
-        // SSE events are separated by a blank line.
+        // SSE events are separated by a blank line — and a server is free to use
+        // CRLF, which the specification explicitly permits. Splitting on `\n\n`
+        // alone therefore found *nothing* in a CRLF stream: every event sat in
+        // the buffer until the connection closed, so a server that streams its
+        // response and keeps the connection open delivered no message at all.
+        // Normalising the separator is the whole fix.
+        buffer = buffer.replace(/\r\n/g, '\n');
         let split = buffer.indexOf('\n\n');
         while (split !== -1) {
           const event = buffer.slice(0, split);

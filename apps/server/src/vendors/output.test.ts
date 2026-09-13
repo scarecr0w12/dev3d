@@ -10,7 +10,31 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractVendorAnswer } from './output.ts';
+import { extractVendorAnswer, stripControlSequences } from './output.ts';
+
+test('terminal escape sequences are stripped before the model sees them', () => {
+  // Harnesses colourise their output, and those sequences are not text — they
+  // arrive as tokens in the model's context. CSI can move the cursor or set the
+  // terminal title; OSC-52 writes the clipboard.
+  assert.equal(stripControlSequences('\u001b[31mred\u001b[0m'), 'red');
+  assert.equal(stripControlSequences('a\u001b[1;32mb\u001b[0mc'), 'abc');
+  // OSC-52, terminated by BEL or by ST.
+  assert.equal(stripControlSequences('\u001b]52;c;aGVsbG8=\u0007after'), 'after');
+  assert.equal(stripControlSequences('\u001b]0;title\u001b\\after'), 'after');
+  // A lone ESC and other two-character escapes go too.
+  assert.equal(stripControlSequences('a\u001bMb'), 'ab');
+  assert.equal(stripControlSequences('a\u001bb'), 'ab');
+  // C0 controls except newline and tab, plus DEL and C1.
+  assert.equal(stripControlSequences('a\u0000\u0007\u001fb'), 'ab');
+  assert.equal(stripControlSequences('a\u007fb'), 'ab');
+  // Newlines and tabs carry meaning in prose and code, so they survive.
+  assert.equal(stripControlSequences('one\ntwo\tthree'), 'one\ntwo\tthree');
+});
+
+test('a coloured answer still comes through with its text intact', () => {
+  const answer = extractVendorAnswer('\u001b[32mFound the bug\u001b[0m\n', 'text');
+  assert.equal(answer.text, 'Found the bug');
+});
 
 test('a plain-text vendor gets its stdout back, trimmed', () => {
   const answer = extractVendorAnswer('\n  the session lookup is fine  \n\n', 'text');

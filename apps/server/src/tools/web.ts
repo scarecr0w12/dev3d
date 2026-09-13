@@ -8,6 +8,7 @@
  */
 
 import type { Tool, ToolContext } from './types.ts';
+import { MAX_FETCH_BYTES, fetchGuarded, readCapped } from '../security/webGuard.ts';
 
 const FETCH_TIMEOUT_MS = 15_000;
 const MAX_CONTENT_CHARS = 20_000;
@@ -95,19 +96,40 @@ const webFetchTool: Tool = {
     }
 
     try {
-      const res = await fetch(parsed, {
+      // Redirects are followed by hand inside `fetchGuarded` so that every hop is
+      // checked: with `redirect: 'follow'`, a public URL could 302 straight to
+      // loopback and the guard would never see it.
+      const attempt = await fetchGuarded(parsed, {
         headers: { 'User-Agent': USER_AGENT, Accept: 'text/html,text/plain,*/*' },
-        redirect: 'follow',
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        timeoutMs: FETCH_TIMEOUT_MS,
       });
-      const rawBody = await res.text();
+      if (!attempt.ok) {
+        if (attempt.refused) {
+          return fail(
+            `web_fetch refused ${attempt.url}: ${attempt.reason} ` +
+              'Only public internet addresses may be fetched.',
+            'Refused a non-public address',
+          );
+        }
+        return fail(
+          `Network request to ${args.url} failed: ${attempt.error}. Check the URL and connectivity, then try again.`,
+          'Network error',
+        );
+      }
+      const res = attempt.response;
+      const current = attempt.finalUrl;
+
+      const raw = await readCapped(res, MAX_FETCH_BYTES);
       const contentType = res.headers.get('content-type') ?? '';
       const isHtml = contentType.toLowerCase().includes('text/html');
-      const body = cap(isHtml ? stripHtml(rawBody) : rawBody, MAX_CONTENT_CHARS);
-      const finalUrl = res.url || args.url;
+      const body = cap(isHtml ? stripHtml(raw.text) : raw.text, MAX_CONTENT_CHARS);
+      const finalUrl = res.url || current.href;
+      const sizeNote = raw.truncated
+        ? `\n\n[truncated: the response exceeded ${Math.round(MAX_FETCH_BYTES / 1000)} KB and only the beginning was read]`
+        : '';
       return {
         ok: res.ok,
-        content: `Status: ${res.status} ${res.statusText}\nFinal URL: ${finalUrl}\n\n${body}`,
+        content: `Status: ${res.status} ${res.statusText}\nFinal URL: ${finalUrl}\n\n${body}${sizeNote}`,
         preview: `Status ${res.status} (${finalUrl})`,
         affectsPaths: [],
       };
@@ -193,18 +215,29 @@ const webSearchTool: Tool = {
       return fail('web_search: the query could not be URL-encoded.', 'Web search unavailable');
     }
     try {
-      const res = await fetch(url, {
+      // The same guard and the same byte ceiling as `web_fetch`, because this is
+      // the same fetch: it kept `redirect: 'follow'` and an unbounded `res.text()`
+      // long after `web_fetch` was fixed, and the buffering half is exactly as
+      // reachable from here — the query is the model's, and the response is not.
+      const attempt = await fetchGuarded(new URL(url), {
         headers: { 'User-Agent': USER_AGENT, Accept: 'text/html' },
-        redirect: 'follow',
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        timeoutMs: FETCH_TIMEOUT_MS,
       });
+      if (!attempt.ok) {
+        const why = attempt.refused ? `refused ${attempt.url}: ${attempt.reason}` : `network error (${attempt.error})`;
+        return fail(
+          `Web search was unavailable (${why}). The employee should say "I could not reach the network" rather than inventing sources.`,
+          'Web search unavailable',
+        );
+      }
+      const res = attempt.response;
       if (!res.ok) {
         return fail(
           `Web search was unavailable (DuckDuckGo returned HTTP ${res.status}).`,
           'Web search unavailable',
         );
       }
-      const html = await res.text();
+      const { text: html } = await readCapped(res, MAX_FETCH_BYTES);
       const hits = parseDuckDuckGo(html, maxResults);
       if (hits.length === 0) {
         return fail(

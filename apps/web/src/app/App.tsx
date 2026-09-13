@@ -155,7 +155,11 @@ function Console() {
   // that is resizable and remembers its size. Width is a stored preference, in
   // px, bounded to what is still a floating pane rather than a takeover.
   const [inspectorWidth, setInspectorWidth] = useStoredNumber('dev3d.inspectorWidth', 420, 320, 900);
-  const [inspectorHeight, setInspectorHeight] = useStoredNumber('dev3d.inspectorHeight', 0, 0, 2400);
+  // `-1` is the "no height chosen yet" sentinel, and it has to be *outside*
+  // `[min, max]` to be unambiguous: the initial value used to be `0`, which is
+  // also a legal value for this range, so "unset" and "the operator dragged it
+  // shut" were the same number.
+  const [inspectorHeight, setInspectorHeight] = useStoredNumber('dev3d.inspectorHeight', -1, 0, 2400);
 
   /** The composer inside the dock wrapper - what the pane's ceiling is based on. */
   const dockInnerRef = useRef<HTMLDivElement>(null);
@@ -236,11 +240,11 @@ function Console() {
       url: resolveSocketUrl(),
       onEvent: (event) => store.apply(event),
       onStatus: (update) => store.setConnectionStatus(update.status, update.attempt, update.error, update.at),
-      onOpen: (resumed) => {
-        // The server answers a reconnect with a fresh hello; ask for the full
-        // snapshot too so nothing is missed while the socket was down.
-        if (resumed) store.send({ type: 'resync' });
-      },
+      // No `onOpen`: the server pushes a full `hello` to every new connection, a
+      // reconnect included, so this used to answer that with `{type:'resync'}` and
+      // receive a **second** identical snapshot — the largest frame on the wire,
+      // sent twice at the moment the network had just come back. The explicit
+      // `resync` still exists for the manual button, which has no hello of its own.
       onProtocolError: (message) => store.notify('warn', message),
     });
 
@@ -327,11 +331,23 @@ function Console() {
     // specific intent, and it is the load the user is waiting to watch.
     if (runChanged && selection.runId !== null) setInspector('run');
   }, [selection.employeeId, selection.vendorId, selection.runId]);
-  // Escape returns to the office from any page.
+  // Escape returns to the office from any page — but only the *topmost* overlay
+  // should answer it. The quick-jump palette lives above the sheet and handles
+  // Escape itself, so one keypress used to close both, losing the reader's place;
+  // and Escape inside a native `<select>` or a text field closes the popup the
+  // browser owns before it ever reaches us.
   useEffect(() => {
     if (!sheetOpen) return;
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setTab('office');
+      if (event.key !== 'Escape') return;
+      // Something above us has already claimed this Escape.
+      if (event.defaultPrevented) return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName.toLowerCase();
+      if (tag === 'input' || tag === 'select' || tag === 'textarea' || target?.isContentEditable === true) {
+        return;
+      }
+      setTab('office');
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -363,8 +379,20 @@ function Console() {
 
   const resetInspectorSize = useCallback(() => {
     setInspectorWidth(420);
-    setInspectorHeight(0);
+    // Back to the sentinel, not to 0: `0` is a height the operator can drag to,
+    // and "reset" has to mean "no stored height" rather than "stored height of
+    // zero", or the pane would come back collapsed instead of room-sized.
+    setInspectorHeight(-1);
   }, [setInspectorHeight, setInspectorWidth]);
+
+  // The palette lives inside the inspector, so it cannot be shown while the
+  // inspector is hidden (the Plan sheet stands it down, and the ✕ closes it).
+  // `jumping` was never reset in those cases, so Ctrl-K on the Plan tab left the
+  // state `true` with nothing rendered and the palette was sitting there,
+  // unasked, the next time the inspector appeared.
+  useEffect(() => {
+    if (!inspectorVisible) setJumping(false);
+  }, [inspectorVisible]);
 
   // Ctrl/Cmd-K is the console's one global shortcut: jump to anything.
   useEffect(() => {
@@ -422,9 +450,20 @@ function Console() {
 
         <ApprovalCallout onOpenAll={() => setTab('runs')} />
 
-        {/* A plugin's office-overlay panel, if any plugin claimed that placement.
-            It sits over the 3D view but never over the dock or an approval. */}
-        <PluginPanels placement="office-overlay" className="plugin-panels-overlay" />
+        {/*
+          A plugin's office-overlay panel, if any plugin claimed that placement.
+          It sits over the 3D view but never over the dock or an approval.
+
+          Rendered only when no sheet is open. The sheet is deliberately *not* a
+          modal — the office stays clickable around it — but the overlay occupies
+          the same horizontal band at a lower z-index, so its controls were painted
+          behind the near-opaque sheet while staying in the tab order. Tab order
+          reaching controls the user can neither see nor click is exactly the
+          failure the region-not-dialog design was trying to avoid elsewhere, and
+          hiding the overlay while a sheet is up costs a plugin panel nothing that
+          a reader wanted at that moment.
+        */}
+        {!sheetOpen && <PluginPanels placement="office-overlay" className="plugin-panels-overlay" />}
 
         <div className="stage-dock">
           <div ref={dockInnerRef} className="dock-measure">

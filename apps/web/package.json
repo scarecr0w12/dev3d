@@ -9,7 +9,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p .verify/tsconfig.json --noEmit",
+    "test": "node .verify/smoke.ts"
   },
   "dependencies": {
     "@dev3d/core": "workspace:*",

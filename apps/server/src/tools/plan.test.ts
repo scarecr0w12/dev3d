@@ -224,6 +224,103 @@ function fakeRepo(): string {
   return root;
 }
 
+test('git refuses the --option=value spelling of a forbidden argument', async () => {
+  // The regression this pins: the gate was `Set.has(arg)`, which is exact
+  // equality, so `--output=<path>` never matched the `--output` entry. On the
+  // un-gated inspection path that let a model write attacker-chosen content to
+  // any path git could reach, and `blame --contents=<path>` print an arbitrary
+  // file into its own context.
+  const root = fakeRepo();
+  try {
+    for (const [command, args, why] of [
+      ['log', ['--output=C:/Windows/Temp/pwned.txt'], 'writes a file outside the workspace'],
+      ['log', ['--output', 'C:/Windows/Temp/pwned.txt'], 'spaced form of the same'],
+      ['diff', ['--output=../pwned.txt'], 'relative escape via --output'],
+      ['blame', ['--contents=C:/Windows/win.ini', '--', 'README.md'], 'reads an arbitrary file'],
+      ['show', ['--exec=calc.exe'], 'runs a program'],
+      ['log', ['--upload-pack=evil'], 'redirects a pack fetch'],
+      ['commit', ['-m', 'x', '-n'], 'short spelling of --no-verify'],
+      ['commit', ['-m', 'x', '--no-verify=true'], 'valued spelling of --no-verify'],
+    ] as const) {
+      const res = await git().run({ command, args: [...args] }, makeContext(root));
+      assert.equal(res.ok, false, `git ${command} ${args.join(' ')} should be refused (${why})`);
+      assert.match(res.content, /refusing the argument/);
+      // The message must name the offending argument, not merely refuse. The
+      // refused argument is the dangerous one, which is not always the first.
+      const dangerous = args.find((a) => /^--|^-[A-Za-z]/.test(a) && a !== '-m')!;
+      assert.ok(
+        res.content.includes(JSON.stringify(dangerous.split('=')[0])),
+        `the refusal should name ${dangerous.split('=')[0]}, got: ${res.content}`,
+      );
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('git refuses a read-only subcommand whose verb mutates the repository', async () => {
+  // `remote` and `branch` are read-only *bare*; with a verb they rewrite
+  // .git/config (core.sshCommand, core.hooksPath, aliases) or delete a branch.
+  // `remote add` is refused outright rather than offered behind approval,
+  // because blessing it would mean blessing a change to the configuration that
+  // runs every other command.
+  const root = fakeRepo();
+  try {
+    for (const [command, args] of [
+      ['remote', ['add', 'origin', 'https://evil.example/x.git']],
+      ['remote', ['set-url', 'origin', 'https://evil.example/x.git']],
+      ['remote', ['update']],
+      ['remote', ['prune']],
+    ] as const) {
+      const res = await git().run({ command, args: [...args] }, makeContext(root));
+      assert.equal(res.ok, false, `git ${command} ${args.join(' ')} should be refused`);
+      assert.match(res.content, /refusing the argument/, `git ${command} ${args[0]} must be refused`);
+    }
+    // A mutating flag on an otherwise read-only subcommand must either be
+    // refused on the inspection path or go through the approval gate. What it
+    // must never do is reach git with nobody asked: `branch -D` deletes a
+    // branch, `tag -d` deletes a tag.
+    for (const [command, args] of [
+      ['branch', ['-D', 'main']],
+      ['tag', ['-d', 'v1']],
+    ] as const) {
+      let asked = 0;
+      const refused = await git().run(
+        { command, args: [...args] },
+        makeContext(root, {
+          requestApproval: async () => {
+            asked += 1;
+            return false;
+          },
+        }),
+      );
+      assert.equal(refused.ok, false, `git ${command} ${args.join(' ')} must not run`);
+      assert.doesNotMatch(
+        refused.content,
+        /could not be started/,
+        `git ${command} ${args.join(' ')} reached git without approval`,
+      );
+      const refusedOnInspectionPath = /on the inspection path/.test(refused.content);
+      assert.ok(
+        refusedOnInspectionPath || asked >= 1,
+        `git ${command} ${args.join(' ')} must be refused or ask a human, got: ${refused.content}`,
+      );
+    }
+    // The bare read-only forms still pass the gate: they must reach git (which
+    // then fails to start in this sandbox), not be refused by the tool.
+    for (const command of ['remote', 'branch', 'tag'] as const) {
+      const listed = await git().run({ command }, makeContext(root));
+      assert.doesNotMatch(
+        listed.content,
+        /refusing the argument|inspection path/,
+        `bare \`git ${command}\` must not be refused`,
+      );
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('git tells a reading stash from a destructive one by what it will ask', async () => {
   const root = fakeRepo();
   try {

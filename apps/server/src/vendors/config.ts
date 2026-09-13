@@ -131,9 +131,11 @@ const MAX_TIMEOUT_MS = 3_600_000;
  *
  *  - **Codex** takes `-s read-only` as a real sandbox mode, so Codex confines
  *    itself → `sandbox`.
- *  - **DSH** and **Hermes** expose no documented per-invocation sandbox flag. The
- *    office still only ever sends them read-only work and says so in the prompt,
- *    but nothing stops them writing except their own cooperation → `requested`.
+ *  - **DSH** and **Hermes** expose no documented per-invocation sandbox flag.
+ *    The office prepends a fixed, non-model-controlled instruction telling them
+ *    to work read-only and to report what they read — but that is **advisory**.
+ *    Nothing stops them writing except their own cooperation, so treat the
+ *    human approval gate, not this sentence, as the control → `requested`.
  *  - **OpenClaw** speaks ACP, so dev3d mediates it: write access is not
  *    advertised, reads are confined by the office, and every tool call the agent
  *    reports needs a human → `client`.
@@ -340,6 +342,26 @@ function readVendor(entry: unknown, where: string, problems: string[]): VendorCo
     return null;
   }
 
+  /**
+   * A command containing a path separator is resolved to an absolute path; a bare
+   * name is left alone.
+   *
+   * A bare name goes through `PATH`, which is the operator's own — so a `codex.exe`
+   * planted in a model-writable workspace is not on it. A name like `./codex` or
+   * `tools/codex`, however, *is* resolved against the child's working directory,
+   * and that directory is the run's workspace: an agent that can write files there
+   * could otherwise place the program that the office then runs. Resolving against
+   * the orchestrator's own directory at load time pins what was meant.
+   */
+  const resolvedCommand =
+    command.includes('/') || command.includes('\\') ? resolve(command) : command;
+  if (command.includes('/') || command.includes('\\')) {
+    problems.push(
+      `${where}.command is a path (${JSON.stringify(command)}); resolved to ${JSON.stringify(resolvedCommand)} ` +
+        'against the orchestrator, not against the run workspace.',
+    );
+  }
+
   const args = Array.isArray(entry['args'])
     ? (entry['args'] as unknown[]).filter((a): a is string => typeof a === 'string')
     : [...(preset?.args ?? [])];
@@ -389,23 +411,55 @@ function readVendor(entry: unknown, where: string, problems: string[]): VendorCo
     streams: false,
     reportsCost: false,
   };
+
+  /**
+   * A preset's sandbox claim only travels with the preset's own invocation.
+   *
+   * `readOnlyEnforcement: 'sandbox'` means "the harness confines itself", and it
+   * is derived from the *command line the preset uses* — Codex's `-s read-only`.
+   * An entry that overrides `command` or `args` is therefore running something
+   * else, and inheriting the claim would let an arbitrary program be presented to
+   * the model as "pinned to a read-only sandbox, so it cannot change any file"
+   * (`tools/vendor.ts`) while the approval gate keyed off the same field stayed
+   * open. The failure mode is an unattended third-party process with write access
+   * to a repository, which is exactly what the field exists to prevent.
+   *
+   * So a `sandbox` claim that came from the preset is demoted to `requested`
+   * unless the entry declares the level itself — an operator who knows their
+   * override is also sandboxed can say so explicitly.
+   */
+  const overridesInvocation =
+    (typeof entry['command'] === 'string' && entry['command'] !== preset?.command) ||
+    (Array.isArray(entry['args']) && JSON.stringify(entry['args']) !== JSON.stringify(preset?.args ?? []));
+  const presetBase =
+    overridesInvocation && base.readOnlyEnforcement === 'sandbox'
+      ? { ...base, readOnlyEnforcement: 'requested' as const }
+      : base;
+
   const capabilities = {
     // Only the three known levels; anything else falls back to the preset, and
     // then to the weakest honest claim. An unrecognised value must never be read
     // as the strongest one - the whole point of the field is that overstating it
     // is the failure mode.
-    readOnlyEnforcement: enforcementOr(declared['readOnlyEnforcement'], base.readOnlyEnforcement),
+    readOnlyEnforcement: enforcementOr(declared['readOnlyEnforcement'], presetBase.readOnlyEnforcement),
     reportsFiles: boolOr(declared['reportsFiles'], base.reportsFiles),
     streams: boolOr(declared['streams'], base.streams),
     reportsCost: boolOr(declared['reportsCost'], base.reportsCost),
   };
+  if (overridesInvocation && base.readOnlyEnforcement === 'sandbox' && declared['readOnlyEnforcement'] === undefined) {
+    problems.push(
+      `${id}: overrides the "${presetName ?? 'preset'}" command line, so its sandbox claim was demoted to ` +
+        '"requested" — a human must approve each delegation. Declare readOnlyEnforcement explicitly if the ' +
+        'replacement really does confine itself.',
+    );
+  }
 
   const config: VendorConfig = {
     id,
     label,
     operator,
     transport,
-    command,
+    command: resolvedCommand,
     args,
     promptTransport,
     outputFormat,

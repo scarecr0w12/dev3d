@@ -25,6 +25,29 @@ pnpm dev:server              # orchestrator on http://127.0.0.1:8787
 pnpm dev:web                 # office UI on http://127.0.0.1:5273 (proxies /api and /ws)
 ```
 
+### Restarting the orchestrator
+
+`pnpm dev:server` is the foreground, watching case. A detached one — no window,
+output redirected to `logs/dev3d-server.{out,err}.log`, surviving the shell that
+started it — is what an unattended office runs, and it is awkward to find later
+because there is no console to go back to. Restart it by port rather than by
+memory:
+
+```bash
+pnpm restart:server          # find the listener on 8787, stop it, start a fresh one, verify /api/health
+pnpm restart:server -- --dry-run     # report what it would stop, change nothing
+```
+
+**The orchestrator is started with plain `node`, not `tsx`.** `tsx` transforms
+through esbuild, which runs a helper process over a named pipe, and a
+DSH-confined shell cannot open one — so `--import tsx` dies with `spawn EPERM`
+before the server loads a single line. Node 24 strips types natively and this
+source contains no enums, namespaces or parameter properties, so `node
+src/index.ts` runs the identical file with no build step and no helper process.
+That is why `apps/server`'s `dev`, `dev:node` and `start` all invoke `node`. If
+you add syntax that only a transform can erase, the server stops starting under
+`node` and this is the paragraph to remember.
+
 ### Repository layout
 
 ```
@@ -295,7 +318,40 @@ The block kit is a separate pass producing a separate file:
 ```
 02_office_blocks.py      writes blocks.glb alongside blocks.json
 04_preview_blocks.py     renders a contact sheet of the kit, for review
+05_preview_office.py     renders the office itself, for review
+06_avatar.py             writes office/avatar.glb, the employee figure
+07_textures.py           writes the PBR texture library to apps/web/public/textures
 ```
+
+`06_avatar.py` and `07_textures.py` are the odd ones out: they build no room
+geometry and nothing reads them. `06` writes the figure the browser clones per
+employee, and `07` authors the albedo, normal and roughness maps the office is
+dressed with plus an `index.json` naming the style role each set dresses and how
+many metres one tile of it covers. Re-running either is independent of the asset
+pipeline above.
+
+`06_avatar.py` asserts its own contract before exporting — the seven node names the
+pose logic resolves by name, and that a standing sole lands on the floor once the
+body is raised — because a rename there fails in the browser as a figure that
+quietly does not move.
+
+`05_preview_office.py` runs `01` and `03` in one session and then renders the
+result from six angles — an elevation, an overview, a desk, the lounge, the meeting
+room and the CEO's office. It exists because a bevel, a chair caster or a monitor
+bezel is invisible in a bounds check and obvious in a render, and because it is the
+only way to look at the office asset without a browser. It also **refuses to render
+a building whose exterior walls leak**: it samples the walls the way the browser's
+nav grid does, and an opening cut into a wall without a sill under it is a hole an
+employee can walk out of — which the elevation looks exactly the same either way.
+
+Every mesh in both assets must be unwrapped with `_uv_world_scale`, so that one UV
+unit is one metre of surface — see
+[design-notes.md](design-notes.md#uvs-are-measured-in-metres). A new part built
+without it carries the primitive's 0..1 unwrap and `pnpm check:blocks` fails,
+rather than the surface quietly rendering at the wrong texel density. The same
+applies to the bevel: fit-out parts get one, and the shell deliberately does not,
+because modules tile flush and a bevelled slab would draw a groove along every
+joint.
 
 The furniture is scripted rather than authored by hand in an interactive Blender
 session, because a script can be re-run and a hand-built scene cannot. That is what
@@ -321,8 +377,15 @@ previewing and checking the kit are package scripts:
 
 ```bash
 pnpm preview:blocks    # a rendered contact sheet of all 24 modules
+pnpm preview:office    # the office rendered from five angles
+pnpm build:textures    # regenerate the PBR texture library
+pnpm build:avatar      # regenerate office/avatar.glb
 pnpm check:blocks      # the GLB against its sidecar: sizes, anchors, heights, material roles
 ```
+
+`preview:office` renders in well under a minute and needs nothing but Blender, so
+it is the cheap way to check a change to the furniture or the shell before
+touching the browser build at all.
 
 `scripts/blender-preview.mjs` finds the binary in this order:
 
@@ -342,7 +405,17 @@ export DEV3D_BLENDER=/Applications/Blender.app/Contents/MacOS/Blender
 It runs Blender as `--background --factory-startup --python
 blender/scripts/04_preview_blocks.py --`, and anything after the bare `--` is
 passed through to the render script, so `pnpm preview:blocks -- --only
-pod4,lounge3` draws just those modules. Blender's output is left visible rather
+pod4,lounge3` draws just those modules. `--script 05_preview_office.py` chooses
+the other renderer, which is what `pnpm preview:office` is; the flag is consumed
+by the runner rather than passed on, because the two render scripts take
+different options.
+
+Two options exist because a sheet of twenty-four and a single room want opposite
+framings. `--margin` scales the air around the grid — the default margins are sized
+for the full sheet and make one module a speck, so `--only lounge3 --margin 0.5`
+fills the frame with it. `--elevation` sets how far above the floor the camera
+looks from; the default 52 degrees reads a module's *plan*, and is the wrong angle
+for seeing anything standing inside it. Blender's output is left visible rather
 than captured, because it is chatty and worth seeing.
 
 ### The ordering constraint

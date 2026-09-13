@@ -289,12 +289,114 @@ set and releases it when the floor closes.
 ### What a style carries
 
 Beyond colour, a style carries roughness and a **surface pattern** (grid, planks,
-hex, weave, speckle) — generated as a small deterministic texture, not sampled
-from a file, so a floor looks the same on the first frame as on the hundredth and
-nothing has to be awaited. It carries a **light rig** (key, fill, rim, ambient,
+hex, weave, speckle). It carries a **light rig** (key, fill, rim, ambient,
 exposure, shadows), a scene **environment** (background, fog, ground shadow, grid)
 and a palette for the screens and fixtures, which is what makes `neonlab` read as
 a late-night lab and `paper` as a diagram.
+
+A surface is dressed in one of two tiers, and the style does not have to know
+which:
+
+- **A real PBR set**, if the library has one for that role — albedo, normal and
+  roughness maps at a real-world scale. See below.
+- **A generated pattern**, otherwise: a small deterministic texture computed in
+  the browser, not sampled from a file, so a surface looks the same on the first
+  frame as on the hundredth and there is nothing to await.
+
+Both are *multiplied* by the style's colour, so a preset keeps its palette and
+gains a material. The generated tier is what makes the office renderable before
+any asset has loaded, and it is what a role with no map falls back to.
+
+### Real materials, and what they replaced
+
+The office was built on a rule: no image files, nothing to await, nothing to
+fetch. It bought determinism and it cost the thing that matters — a greyscale
+multiplier can only make a surface *lighter or darker*. It can never make it a
+different material. Concrete was grey with a grid drawn on it.
+
+`blender/scripts/07_textures.py` writes the other half: six sets of albedo, normal
+and roughness maps, plus an `index.json` naming the style role each set dresses and
+how many metres one tile covers. `apps/web/src/office/textures.ts` loads them once,
+before any model is, and hands the library to the theme; `applyStyle` stays
+synchronous, which it has to be, because it runs in the render loop and on the
+server.
+
+Three decisions are worth knowing:
+
+- **They are authored, not scanned.** This machine has no HTTPS route to a texture
+  library, so the maps are generated from periodic value noise: multi-octave fields
+  with material-specific structure, a height field that the normal map is derived
+  from, and roughness that varies across the surface instead of being one number.
+  The ceiling is lower than a photogrammetry set; dropping scanned maps in later is
+  a file swap, because nothing in the renderer knows a material by name.
+- **Every field tiles.** These are floor and wall finishes, and a seam every two
+  metres would be worse than no texture. Value noise on a lattice that wraps at its
+  own cell count is exactly periodic over the image, so every octave can be summed
+  without a seam appearing.
+- **The normal map is scaled to a slope, not to the image size.** A per-pixel
+  difference across a 512 px tile is a slope of 512 times itself in UV space, so
+  multiplying by the size produces a normal map that is almost entirely sideways —
+  which is not a rough surface, it is television static at every mip level. The
+  gradient is normalised to a typical slope per material instead.
+
+### A style's colour is divided by the material, not multiplied by it
+
+A style colour means "the colour of this surface". An albedo map *also* carries a
+colour. Multiplying the two is the obvious thing and it is wrong: a preset colour
+of 0.44 lighting a concrete that already averages 0.44 renders at 0.19, so every
+textured surface comes out darker than the Look panel says it is — and a preset
+whose floor is deliberately near-black renders a floor with no material in it at
+all, because multiplication by almost nothing compresses every variation away.
+
+So the generator writes each albedo's average into the sidecar, in linear light,
+and the theme divides the style colour by it. The surface then renders at the
+colour the preset names, on average, with the map's variation *around* that
+colour. `07_textures.py` prints the figure for every set, which is how the number
+stays honest.
+
+That fix is what made the default floor visible rather than black, and it came
+with one preset change: `studio`'s floor was `#26282c` and its carpet `#1c2029`,
+which multiplied a real albedo to `#17181a` and `#020306`. They are now `#6f7378`
+and `#3a4250` — the colours those surfaces were always meant to read as. Every
+other dark preset (`noir`, `neonlab`, `industrial`) is left alone, because there a
+dark floor is the point rather than an accident.
+
+The scale convention is the one the assets already use: one UV unit is one metre,
+so a set's `tileMetres` is both its size on the floor and the number that keeps
+texel density even across a 20 cm drawer and an 8 m slab.
+
+### UVs are measured in metres
+
+Both GLBs are unwrapped so that **one UV unit is one metre of surface**, on every
+part whatever its size. This is the whole of texel density, and it is what makes a
+pattern tile at the same *real* size on a 20 cm drawer and on an 8 m floor slab.
+
+It is worth being explicit about what it replaced, because the failure is
+invisible in a type signature and nearly invisible in a viewport. A primitive mesh
+carries a 0..1 unwrap, so before this the same floor surface finished at a
+different real-world scale in every module — and on the core's 22 m slab the
+entire floor carried **one** tile of its pattern. `patternRepeat` was documented as
+a rough per-module guess for exactly that reason. It is now an exact physical
+scale: the pattern tiles `patternRepeat` times per four metres, four metres being
+the nominal room module the kit is built from.
+
+Two consequences worth knowing:
+
+- **The relief maps inherit it.** The normal and roughness maps are baked from the
+  same height field as the tint and share its tiling, so a groove is now a real
+  number of millimetres deep and wide rather than whatever the part's size implied.
+- **It is checked, not asserted.** `verify-blocks-glb.mjs` reads `TEXCOORD_0` out
+  of both buffers and fails if any mesh's UV span falls below 0.9 of its real-world
+  span — which is what a regression to per-part UVs looks like. The floor rather
+  than an equality is because a bevelled part's faces are inset from the bounding
+  box that the world span is measured over.
+
+The unwrap is a **cube projection per face** (each face projected along its own
+dominant normal), done in `bmesh` rather than with Blender's `uv.cube_project`,
+because that operator wants a UV editor in the context and these scripts run
+headless. UVs are metadata rather than geometry, so unlike the bevel this applies
+to the shell as well: it cannot move a module's edges, and the walls and floors are
+exactly the surfaces whose tiling was worst.
 
 ### What the StylePanel edits
 
@@ -862,9 +964,63 @@ and shares it across every part that uses it. That is not premature optimisation
 built one-mesh-per-part it exports a 2.4 MB GLB of 1 468 identical cubes, where
 sharing them produces 438 KB with the same geometry.
 
+`03_office_furniture.py` does the same thing with richer shapes, and that is what
+made real detail affordable. Every part of the core office is a bevelled box or a
+bevelled cylinder, built once and instanced: **679 objects cut from 103 distinct
+shapes**, which is 82 500 triangles on screen held in a 451 KB file. Two things
+make that detail read, and they are worth more than the polygon count:
+
+- **A bevel on every edge.** A razor-sharp 90 degree corner has no surface for a
+  highlight to land on, which is exactly why an unmodified box reads as cardboard
+  however carefully it is lit. Six millimetres of bevel is enough to catch one.
+- **Smooth shading with an angle threshold.** The bevel then rounds while the
+  flats stay flat. Without the threshold a smooth-shaded box looks inflated.
+
+Sharing is the point: detail costs geometry, which is cheap. It does not cost file
+size, which is not. Both properties are asserted by
+`blender/scripts/verify-blocks-glb.mjs` and by the web smoke suite, because
+"one mesh per part" is a regression that a viewport cannot show you.
+
+The kit's **props** were brought up to the same standard, because a grown room is
+most of the building and its fit-out was where a box still stood in for a shape: a
+plant was a box with a box on top, a lampshade was a cube, a shelf held one slab of
+"books". The plants are now a turned pot with nine tilted leaves — and the leaves
+cost **one** shared mesh between them, because rotation lives on the object while
+only the shape is cached. That is the same argument as the bevelled box, one level
+down: eleven parts and eleven parts' worth of detail, for one shape's worth of
+file. Their footprints are held to what the boxes occupied, because a prop that
+grows is a prop that fails the module's own fit-out validation.
+
+The kit's **workstations** followed: a five-star chair base on casters, a gas lift,
+a monitor in a bezel on a neck and a foot, a keyboard, a mouse and a cable tray —
+what the core office already had and a grown room did not. That work turned up a
+bug in the core, which the kit had copied. `at(dx, dy)` measures from the centre of
+the desk and the seat is at `-SEAT_BACK`, so **+dy is away from the person**. The
+screen was at `-0.22` and the keyboard at `+0.10`, which put the keyboard 0.32 m
+*behind* the monitor: from the seat you looked at the screen and reached past it to
+type. It is the kind of thing a bounds check cannot see and a render from the wrong
+angle hides, and it was found by reading the exported transforms back out of the
+GLB and asking which of the two is nearer the seat.
+
+Its **soft seating** was the last of it. A meeting chair stood on a single central
+post — a side chair drawn as a bar stool — and is now four legs, which is what the
+core's meeting chair always had. A sofa was a base with a back and two arms on it,
+which is a bench; it now carries seat and back cushions, and how many follows the
+width so a wider sofa is not three cushions stretched. There are no `Chair_*_Post`
+nodes left in the kit, and the nineteen `*_Post` nodes that remain are all
+`Stool_*`, where a pedestal is the right answer.
+
 ### The asset is generated
 
 The whole asset pipeline is scripted, in this order:
+
+    01_office_shell.py       the shell, with growth doorways in the side walls
+    03_office_furniture.py   desks, chairs, fixtures, and every anchor
+    99_export_glb.py         writes apps/web/public/office/office.glb
+
+    02_office_blocks.py      writes blocks.glb alongside blocks.json
+    04_preview_blocks.py     renders the kit, for review
+    05_preview_office.py     renders the office, for review
 
 Scripting the furniture rather than authoring it in interactive Blender sessions
 is what makes the asset reproducible: an unscripted edit is not written back, so
@@ -881,8 +1037,11 @@ desk that `deskNameForSeat` can never find. Both are build failures rather than
 somebody quietly sitting somewhere else.
 
 The hand-authored asset the script replaced is kept at
-`blender/reference/office.hand-authored.glb`. Nothing was lost, but the
-reconstruction is rougher than what a person made.
+`blender/reference/office.hand-authored.glb`, and it is worth keeping for the
+comparison: 5 004 triangles across 312 primitives, against 82 500 drawn from 103
+shared shapes now. The reconstruction was rougher than what a person made for as
+long as it was built from scaled cubes, which is exactly what it was; it no longer
+is.
 
 ### The rule the whole jigsaw rests on
 
@@ -975,15 +1134,126 @@ wall completely, and the grid that comes out of it is right about where the door
 are without anyone having described a door.
 
 Three consequences are worth having. A floor that grows a module is walkable the
-moment it is drawn, because a module is more boxes. A sealed room is sealed here
-too, so an errand into one is refused rather than walked through a wall: the three
-back offices and the glass meeting room are enclosed, and their occupants pace in
-their own rooms instead of commuting through masonry. And the walkable extent is
-the extent of the *geometry*, not of the plate drawn under it — a plate is
+moment it is drawn, because a module is more boxes. A room with no doorway is
+sealed here too, so an errand into one is refused rather than walked through a
+wall — which is a property to design against rather than to discover: the three
+back offices and the glass meeting room were each their own region until doorways
+were cut for them, and their eleven seats could be occupied but never left. The
+partition *between* two rooms still stays solid, because an office you can only
+reach through the office next door is a suite. And the walkable extent is the
+extent of the *geometry*, not of the plate drawn under it — a plate is
 deliberately a little larger than its walls, and sampling it finds a strip outside
 the building that connects to the inside through the growth doorways. That strip
 is one omitted bound away from being a route out of the west door and back in
 through the east one.
+
+The band rule is also what makes an **opening** a decision rather than a detail.
+Both long elevations carry a ribbon of windows — a pier, an opening, a pier, with
+glazing, a frame, a centre mullion and an outside cill inside each opening.
+
+It is worth being exact about why a hole in a wall is safe here, because the
+obvious guess is wrong. The rule is an *overlap* test on height that then
+contributes the mesh's **whole footprint**, not the part of it inside the band. So
+an opening is sealed by whatever of it still crosses 0.25..1.75 m: here that is the
+0.9 m sill below it *and* the glazing across it, and either alone would do. Taken
+down to the floor with no glazing, the same window is a doorway an employee can
+walk out of. `05_preview_office.py` therefore samples both long walls the way the
+grid does and refuses to render a building that leaks, naming the gap — and its
+negative test is the informative one. Withdrawing the glazing and dropping the sill
+to 0.05 m makes it exit 1 with eight leaks across the two elevations.
+
+The rearrangement is free in file size because the seven bays of a 22 m elevation
+are seven copies of the same dozen parts: the shell shares one mesh per distinct
+size and surface exactly as the furniture does, so 140 more objects cost 21 KB.
+
+### A grown module is glazed by whoever knows which way it faces
+
+The core's elevations are glazed in Blender, because Blender knows where the
+outside is. A block module cannot be: the kit is authored with doorways on whichever
+edges suit a module's shape, and which of those edges ends up against another module
+— or against the core — is decided by the layout engine at placement time. So a
+grown wing read as a blank box while the core had windows, and the *browser* is the
+first place in the pipeline that knows which way any given module faces.
+
+`apps/web/src/office/glazing.ts` answers it there: a wall is outside when no other
+module and not the core comes within a third of a metre of any point along it. It
+is deliberately free of React and of the scene graph — it is planar geometry, and
+the smoke suite asserts it without a WebGL context: a module on its own has four
+outside walls, a wall shared with the next module is not one, a wall that merely
+shares a *corner* still is, and a wall against the core is not.
+
+Two things about that are worth knowing.
+
+**A fraction, not "any sample".** The first version treated an edge as shared if any
+sample along it was blocked, and almost nothing was ever glazed: every module in a
+row shares corners with its neighbours, so the sample at each end of a long wall
+landed inside the next module's box and condemned the whole wall. A neighbour that
+clips the end of a wall has not shared it; one that joins a quarter of it has. Erring
+towards "shared" is the right way to be wrong, because a window looking into the room
+next door is worse than a blank wall.
+
+**The sill is load-bearing, and now so is the visibility flag.** The wall is hidden
+rather than veneered — glass applied over a solid wall is a facade trick, and from
+inside the room you would be looking at a window with a wall behind it. But the
+walkability grid is sampled from the geometry, so a hidden wall has to stop counting
+as an obstacle or a window taken down to the floor becomes a way out of the building.
+`obstacleBoxesOf` now skips invisible meshes, which makes "the wall is hidden" mean
+what a reader assumes, and the sill below the glass — spanning the full length of the
+wall it replaced, and asserted to cross the 0.25..1.75 m band — is what holds that
+module's footprint exactly where it was.
+
+### The figure is measured against the furniture
+
+An avatar is built in the browser rather than loaded from the asset pipeline, and
+its shape is the same language the office is: **a bevelled box and a capsule**.
+A razor-sharp corner has no surface for a highlight, which is why the furniture is
+bevelled too, and it is what turned a stack of bricks into a person. Limbs are
+capsules so they have no corners at all; the skull is a sphere with a clipped
+second sphere over the top as hair, since a full ball would cover the face.
+
+The proportions are **derived, not chosen**. `HIP_Y` is 0.5 m because that is the
+height of the seat pad `03_office_furniture.py` builds, and the standing leg is
+exactly `HIP_Y + STANCE` long so that a raised body's soles land on the floor.
+Both used to be guesses, and the guess put the hips at 0.32 m — so every seated
+employee sat 18 cm *inside* their chair, with their feet on the floor and their
+torso a head too low. Two constants read off the furniture is the whole fix.
+
+The pose contract is the part that is load-bearing, and it is unchanged: `Body` is
+what rises, `LegL`/`LegR` are the stride, `SeatedLegs` is what a chair folds a
+person into, and the two swap on `onFeet`. The verification harness asserts that
+arithmetic directly — `Body.position.y` above 0.4 on both feet and below 0.05 at a
+desk — so a figure that stands up wrongly fails a check rather than a screenshot.
+
+### The figure is an asset, and the pose is still arithmetic
+
+`06_avatar.py` builds `avatar.glb`: thirty parts cut from nineteen shared shapes,
+bevelled and smooth-shaded, with the same two measured constants the browser
+figure uses. The canvas loads it before the office — avatars are created the
+moment the office arrives, so a template still in flight would leave the first
+floor primitive and the later ones modelled, which is a mixed office nobody would
+think to look for — and `createAvatar` clones it per employee and swaps the
+materials by name.
+
+The procedural figure stays, and it is the *fallback*: a missing asset is a
+plainer office rather than no office, in the same way a missing block kit costs
+rooms rather than the building. It is also what the verification harness
+exercises, since it has no filesystem and no loader.
+
+**There is no armature and no skinning.** That is the one deliberate seam. The
+pose is asserted as arithmetic — `Body.position.y` above 0.4 on both feet and
+below 0.05 at a desk, `LegL`/`LegR` visible exactly when `SeatedLegs` is not — and
+those are *node* properties. A skinned mesh has no separate legs to show and hide,
+so the same intent becomes an animation clip and the checks become "the walk clip
+is playing", which is a different and weaker claim. Trading a checked pose for a
+checked clip is a decision worth making deliberately rather than as a side effect
+of wanting better shoulders.
+
+The asset is verified where it is built rather than in the browser: the script
+refuses to export without `Body`, `LegL`, `LegR`, `SeatedLegs`, `ArmL`, `ArmR` and
+`Tablet`, and it refuses if a standing sole does not land on the floor once the
+body is raised by `STANCE`. That second one caught a real bug — parenting a limb
+with `matrix_parent_inverse` preserves its *world* position, so the legs hung in
+space at the origin instead of off the hip.
 
 ### Only idle people move
 

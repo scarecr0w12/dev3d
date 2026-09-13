@@ -49,8 +49,20 @@ export function PluginSettings({ record, onSave }: PluginSettingsProps) {
 
   const [draft, setDraft] = useState<Record<string, unknown>>({});
 
-  // Seeding happens when the selected plugin changes - a different record - so
-  // an event arriving mid-edit cannot overwrite what has been typed.
+  // Seeding happens when the *selected plugin* changes — not whenever a new
+  // record object arrives. The comment above this always said so; the dependency
+  // did not implement it. `record` identity is never stable: the server rebuilds
+  // every record with a fresh `settings` object on each state call, and a full
+  // `office.updated` is broadcast on `run.created`, on a run finishing, on
+  // `org.updated`, on `settings.updated` and — before it was fixed — on every
+  // heartbeat. So typing was wiped mid-keystroke by unrelated office activity.
+  //
+  // Keyed on the plugin's id, which is the identity that actually matters.
+  const settingsKey = record?.manifest.id ?? null;
+  const settingsIdentity = useMemo(
+    () => JSON.stringify(record?.settings ?? {}),
+    [record?.settings],
+  );
   useEffect(() => {
     if (!record) {
       setDraft({});
@@ -61,7 +73,11 @@ export function PluginSettings({ record, onSave }: PluginSettingsProps) {
       seed[field.key] = seedValue(field, record.settings);
     }
     setDraft(seed);
-  }, [record]);
+    // Re-seeds on a plugin change and when the *server's* values actually change
+    // (a save landing, or another tab editing them) — but not on a state push
+    // that merely re-sends the same values in a new object.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsKey, settingsIdentity]);
 
   const saver = useSaver<Record<string, unknown>>(async (value) => {
     if (selectedId === null) return { ok: false, error: 'no plugin is selected' };

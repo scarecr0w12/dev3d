@@ -13,6 +13,17 @@ import { isProviderConfigured } from '../config.ts';
 import type { ChatRequest, ChatResult, LlmProvider, LlmToolSchema } from './types.ts';
 import { computeCost } from './pricing.ts';
 import { parseModelList } from './modelList.ts';
+import {
+  FIRST_BYTE_TIMEOUT_MS,
+  MAX_RETRIES,
+  REQUEST_CEILING_MS,
+  STREAM_IDLE_TIMEOUT_MS,
+  deadlineSignal,
+  delay,
+  isRetryableError,
+  isRetryableStatus,
+  retryDelayMs,
+} from './deadline.ts';
 
 type Block =
   | { type: 'text'; text: string }
@@ -34,7 +45,20 @@ interface AnthropicResponse {
     input?: unknown;
   }>;
   stop_reason?: string;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: AnthropicUsage;
+}
+
+/**
+ * A reported usage block.
+ *
+ * `thinking_tokens` is Anthropic's split of the output bill: extended thinking is
+ * billed at the output rate and routinely dominates it, so a total with no split
+ * is a number an operator cannot account for.
+ */
+interface AnthropicUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  thinking_tokens?: number;
 }
 
 interface AnthropicStreamEvent {
@@ -118,7 +142,22 @@ function buildUsage(
   let outChars = text.length + (reasoning?.length ?? 0);
   for (const tc of toolCalls) outChars += tc.name.length + tc.argumentsJson.length;
   const tokensOut = usage?.output_tokens ?? Math.max(1, Math.round(outChars / 4));
-  return { tokensIn, tokensOut, costUsd: computeCost(req.model, tokensIn, tokensOut) };
+  const out: UsageRecord = {
+    tokensIn,
+    tokensOut,
+    costUsd: computeCost(req.model, tokensIn, tokensOut),
+    // An estimate and a bill used to be drawn identically. They still may be
+    // numerically wrong, but they are no longer indistinguishable.
+    ...(usage?.input_tokens === undefined || usage.output_tokens === undefined ? { estimated: true } : {}),
+  };
+  // Extended thinking is billed as output and is often most of it. Anthropic
+  // reports the split; folding it in and saying nothing is how a bill stops being
+  // explicable.
+  const thinking = usage?.thinking_tokens;
+  if (typeof thinking === 'number' && Number.isFinite(thinking) && thinking > 0) {
+    out.reasoningTokens = Math.min(Math.round(thinking), tokensOut);
+  }
+  return out;
 }
 
 function parseResponse(json: AnthropicResponse, req: ChatRequest): ChatResult {
@@ -161,6 +200,18 @@ async function parseStream(resp: Response, req: ChatRequest): Promise<ChatResult
   const toolCalls: ToolCallRequest[] = [];
   let inputTokens: number | undefined;
   let outputTokens: number | undefined;
+  /** Reset on every chunk: a slow stream is fine, a silent one is not. */
+  let idleTimer: NodeJS.Timeout | undefined;
+  let stalled = false;
+
+  const armIdleTimer = (): void => {
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      stalled = true;
+      void reader.cancel().catch(() => {});
+    }, STREAM_IDLE_TIMEOUT_MS);
+    idleTimer.unref?.();
+  };
 
   const processLine = (rawLine: string): void => {
     const line = rawLine.trim();
@@ -216,18 +267,31 @@ async function parseStream(resp: Response, req: ChatRequest): Promise<ChatResult
     }
   };
 
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    let nl: number;
-    while ((nl = buffer.indexOf('\n')) !== -1) {
-      const line = buffer.slice(0, nl);
-      buffer = buffer.slice(nl + 1);
-      processLine(line);
+  try {
+    armIdleTimer();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      armIdleTimer();
+      buffer += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        processLine(line);
+      }
     }
-    if (done) break;
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') processLine(buffer);
+  } finally {
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
   }
-  if (buffer.trim() !== '') processLine(buffer);
+
+  if (stalled && text === '' && toolCalls.length === 0) {
+    throw new Error(
+      `${req.model.providerId}: the stream sent nothing for ${Math.round(STREAM_IDLE_TIMEOUT_MS / 1000)}s and was abandoned.`,
+    );
+  }
 
   return {
     text,
@@ -270,6 +334,10 @@ export function createAnthropicProvider(cfg: ProviderConfig): LlmProvider {
       const resp = await fetch(`${baseUrl}/models?limit=1000`, {
         method: 'GET',
         headers: { ...authHeaders(), accept: 'application/json' },
+        // Bounded, because discovery runs sequentially across providers and a
+        // vendor that accepts the connection and never answers would otherwise
+        // hold up every provider after it.
+        signal: AbortSignal.timeout(FIRST_BYTE_TIMEOUT_MS),
       });
       if (!resp.ok) {
         const detail = await resp.text().catch(() => '');
@@ -299,21 +367,45 @@ export function createAnthropicProvider(cfg: ProviderConfig): LlmProvider {
 
       const headers: Record<string, string> = authHeaders();
 
-      const resp = await fetch(`${baseUrl}/messages`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: req.signal,
-      });
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt += 1) {
+        const signal = deadlineSignal(
+          req.onDelta ? REQUEST_CEILING_MS : FIRST_BYTE_TIMEOUT_MS,
+          req.signal,
+        );
+        try {
+          const resp = await fetch(`${baseUrl}/messages`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body),
+            signal,
+          });
 
-      if (!resp.ok) {
-        const detail = await resp.text().catch(() => '');
-        throw new Error(`HTTP ${resp.status} from ${cfg.id}: ${detail.slice(0, 300)}`);
+          if (!resp.ok) {
+            const detail = await resp.text().catch(() => '');
+            const error = new Error(`HTTP ${resp.status} from ${cfg.id}: ${detail.slice(0, 300)}`);
+            if (attempt <= MAX_RETRIES && isRetryableStatus(resp.status)) {
+              lastError = error;
+              await delay(retryDelayMs(attempt), req.signal);
+              continue;
+            }
+            throw error;
+          }
+
+          if (req.onDelta) return await parseStream(resp, req);
+          const json = (await resp.json()) as AnthropicResponse;
+          return parseResponse(json, req);
+        } catch (err) {
+          if (req.signal?.aborted === true) throw err;
+          if (attempt <= MAX_RETRIES && isRetryableError(err)) {
+            lastError = err;
+            await delay(retryDelayMs(attempt), req.signal);
+            continue;
+          }
+          throw err;
+        }
       }
-
-      if (req.onDelta) return parseStream(resp, req);
-      const json = (await resp.json()) as AnthropicResponse;
-      return parseResponse(json, req);
+      throw lastError instanceof Error ? lastError : new Error(`${cfg.id}: all attempts failed`);
     },
   };
 

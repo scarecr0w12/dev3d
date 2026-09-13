@@ -12,16 +12,25 @@
  * two copies of a chat composer would drift apart.
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, KeyboardEvent, ReactNode } from 'react';
 
 import type { ClientCommand, DirectMessage } from '@dev3d/core';
 
 import { api } from '../app/api';
+import { pendingEcho, REPLY_PATIENCE_MS } from '../app/chat';
 import { formatAgo } from '../app/format';
 import { useAutoScroll, useNow } from '../app/hooks';
 import { useMessages, useStore } from '../app/StoreContext';
 import { Badge, cx } from './ui';
+
+/**
+ * How long an unanswered optimistic echo counts as "still waiting".
+ *
+ * Defined in `app/chat.ts` so the verification harness can exercise it directly;
+ * re-exported here because this component is where a reader looks for it.
+ */
+export { pendingEcho, REPLY_PATIENCE_MS } from '../app/chat';
 
 export interface ChatThreadProps {
   employeeId: string;
@@ -39,20 +48,36 @@ export function ChatThread({ employeeId, employeeName, header, emptyHint, classN
   const now = useNow(1000);
 
   const [draft, setDraft] = useState('');
-  const [sending, setSending] = useState(false);
+  const [httpInFlight, setHttpInFlight] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  /** Cleared on unmount so a late HTTP reply cannot write into a gone component. */
+  const cancelledRef = useRef(false);
+  useEffect(
+    () => () => {
+      cancelledRef.current = true;
+    },
+    [],
+  );
 
   const thread: DirectMessage[] = useMemo(() => messages[employeeId] ?? [], [messages, employeeId]);
+  /**
+   * The waiting indicator.
+   *
+   * The socket path used to return before ever setting this, so the normal way of
+   * sending a message showed no feedback at all between sending and the reply.
+   */
+  const sending = httpInFlight || pendingEcho(thread, now);
   const autoScroll = useAutoScroll(thread.length + (sending ? 1 : 0));
 
   const send = useCallback(async () => {
     const text = draft.trim();
     if (text.length === 0) return;
     const at = Date.now();
+    const echoId = `local-${at}`;
     // Optimistic echo under a local id: the server's copy of the same message
     // arrives with its own id, so this one is a placeholder rather than a
     // duplicate that has to be reconciled.
-    store.appendDirectMessage({ id: `local-${at}`, employeeId, role: 'user', text, at });
+    store.appendDirectMessage({ id: echoId, employeeId, role: 'user', text, at });
     setDraft('');
     setSendError(null);
 
@@ -62,11 +87,30 @@ export function ChatThread({ employeeId, employeeName, header, emptyHint, classN
       return;
     }
 
-    setSending(true);
-    const result = await api.chat(employeeId, text);
-    setSending(false);
-    if (result.ok && result.data) store.ingestDirectMessages(employeeId, result.data);
-    else setSendError(result.error ?? 'the chat request failed');
+    // The HTTP fallback runs inline, so its whole life is bracketed here: the
+    // indicator is set before the await and cleared in a `finally`, because
+    // `api.request` converts a throw into a result but the await can still reject
+    // for reasons outside that (an aborted fetch, a bug in the wrapper) — and a
+    // `sending` flag left set disables the Send button with no explanation.
+    setHttpInFlight(true);
+    try {
+      const result = await api.chat(employeeId, text);
+      if (result.ok && result.data) {
+        store.ingestDirectMessages(employeeId, result.data);
+      } else {
+        // Nothing came back, so the echo will never be answered: drop it rather
+        // than leaving a message on screen that the office never received.
+        store.dropDirectMessage(employeeId, echoId);
+        setSendError(result.error ?? 'the chat request failed');
+      }
+    } catch (e) {
+      store.dropDirectMessage(employeeId, echoId);
+      setSendError(e instanceof Error ? e.message : 'the chat request failed');
+    } finally {
+      // Guarded, because the operator may have switched employee mid-flight and
+      // writing state into an unmounted component is a real (if silent) leak.
+      if (!cancelledRef.current) setHttpInFlight(false);
+    }
   }, [draft, employeeId, store]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {

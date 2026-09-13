@@ -42,7 +42,7 @@
  * Spec: https://agentclientprotocol.com/protocol/v1/overview
  */
 
-import { readFile } from 'node:fs/promises';
+import { readFile, stat as statFile } from 'node:fs/promises';
 
 import {
   isFailure,
@@ -337,6 +337,29 @@ export async function runAcpTurn(options: AcpTurnOptions): Promise<AcpTurnResult
   };
 
   /**
+   * Refuse a request that names a session this delegation did not open.
+   *
+   * The office opens exactly one session per delegation, and every capability it
+   * serves is scoped to it — but nothing checked. `fs/read_text_file` was served
+   * for *any* path the agent asked for, whatever session it claimed to be in, so
+   * the session id was decorative: confinement was the workspace and nothing more.
+   * A Gateway-backed agent (whose filesystem access goes through dev3d rather than
+   * through its own process) is the case that matters.
+   */
+  const requireOurSession = (raw: unknown, method: string): void => {
+    const named = asString(raw);
+    if (sessionId === null) {
+      throw new Error(`${method} arrived before this delegation opened a session`);
+    }
+    if (named === '') {
+      throw new Error(`${method} named no session; dev3d serves only the session this delegation opened`);
+    }
+    if (named !== sessionId) {
+      throw new Error(`${method} named session ${JSON.stringify(named)}, which this delegation did not open`);
+    }
+  };
+
+  /**
    * Serve a request the agent made of this client.
    *
    * Async because one of the three can ask a human. The transport does not
@@ -348,13 +371,34 @@ export async function runAcpTurn(options: AcpTurnOptions): Promise<AcpTurnResult
     if (method === 'fs/read_text_file') {
       const wanted = asString(p['path']);
       try {
+        requireOurSession(p['sessionId'], 'fs/read_text_file');
         // The confinement, and the whole reason this is served by the office
         // rather than by the agent: the same choke point every built-in tool
         // uses, so an escape attempt fails here rather than being reported.
+        // That choke point resolves symlinks and junctions too, so a link planted
+        // inside the workspace does not become a read outside it.
         const absolute = resolveInWorkspace(options.cwd, wanted);
+        // Bounded *before* reading, not after. The cap used to be applied to a
+        // string already in memory, so a large file inside the workspace — a
+        // video, a database dump, a log — was a memory spike driven by whatever
+        // the remote agent chose to ask for; and `raw.length` counts UTF-16 code
+        // units rather than bytes, so the 2 MB cap was not even 2 MB.
+        const stat = await statFile(absolute);
+        if (!stat.isFile()) {
+          replyError(id, -32001, `dev3d will not read "${wanted}": it is not a regular file.`);
+          return;
+        }
+        if (stat.size > MAX_FILE_BYTES) {
+          replyError(
+            id,
+            -32001,
+            `dev3d will not read "${wanted}": it is ${stat.size} bytes, above the ${MAX_FILE_BYTES}-byte limit ` +
+              'for a delegation. Ask for a specific range in a smaller file, or read it yourself.',
+          );
+          return;
+        }
         const raw = await readFile(absolute, 'utf8');
-        const text = raw.length > MAX_FILE_BYTES ? raw.slice(0, MAX_FILE_BYTES) : raw;
-        reply(id, { content: sliceLines(text, p['line'], p['limit']) });
+        reply(id, { content: sliceLines(raw, p['line'], p['limit']) });
       } catch (e) {
         replyError(id, -32001, `dev3d will not read "${wanted}": ${errMsg(e)}`);
       }
@@ -371,6 +415,23 @@ export async function runAcpTurn(options: AcpTurnOptions): Promise<AcpTurnResult
     }
 
     if (method === 'session/request_permission') {
+      // Checked only when the agent names a session, and that asymmetry is
+      // deliberate: a request that names *another* session is refused, while one
+      // that names none is still answered. A permission prompt is not a capability
+      // dev3d grants, so refusing it would break a working agent over a field the
+      // specification requires but that some do omit — a worse outcome than the
+      // thing being fixed. The read path above, which hands out file contents, is
+      // the one that must be exact.
+      const named = asString(p['sessionId']);
+      if (named !== '' && sessionId !== null && named !== sessionId) {
+        replyError(
+          id,
+          -32001,
+          `dev3d will not answer a permission request for session ${JSON.stringify(named)}, ` +
+            'which this delegation did not open.',
+        );
+        return;
+      }
       const decision = await decidePermission(p, options);
       reply(id, decision);
       return;

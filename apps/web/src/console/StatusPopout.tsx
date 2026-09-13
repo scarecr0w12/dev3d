@@ -17,15 +17,10 @@ import { formatAgo, formatInt, formatUsd } from '../app/format';
 import { useNow } from '../app/hooks';
 import { STATUS_COLOR, STATUS_LABEL, STATUS_ORDER } from '../app/status';
 import { useApprovals, useConnection, useOffice, useStore } from '../app/StoreContext';
+import { POSTURE_HINT } from '../app/vocabulary';
 import { Badge, Metric, cx } from './ui';
 
 const POSTURES: readonly RoutingPosture[] = ['cheap', 'balanced', 'quality'];
-
-const POSTURE_HINT: Record<RoutingPosture, string> = {
-  cheap: 'always take the cheapest model that can do the job',
-  balanced: 'honour each role\u2019s policy, escalate when the work is hard',
-  quality: 'bias every turn one tier up',
-};
 
 export function StatusPopout({ onClose }: { onClose: () => void }) {
   const store = useStore();

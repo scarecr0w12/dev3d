@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Tool, ToolResult } from './types.ts';
-import { resolveInWorkspace, toWorkspaceRelative } from './paths.ts';
+import { resolveInWorkspace, toWorkspaceRelative, assertNotGitControlPath } from './paths.ts';
 import { SKIPPED_DIRS, globMatches, makeExcluder } from './match.ts';
 
 const MAX_FILES = 300;
@@ -455,6 +455,7 @@ const applyPatchTool: Tool = {
         let abs: string;
         try {
           abs = resolveInWorkspace(ctx.workspaceRoot, edit.path);
+          assertNotGitControlPath(ctx.workspaceRoot, abs);
         } catch (e) {
           problems.push(`${edit.path}: ${errMsg(e)}`);
           continue;

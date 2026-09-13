@@ -142,6 +142,29 @@ function serverDouble(tools: Array<{ name: string; description?: string; inputSc
   return transport;
 }
 
+/**
+ * A transport that answers the handshake and any unknown request with an empty
+ * result, so a test can drive one call without scripting the whole protocol.
+ */
+function lenientServerDouble(): FakeTransport {
+  const transport = new FakeTransport();
+  transport.respond = (msg) => {
+    if (msg['method'] === 'initialize') {
+      return {
+        jsonrpc: '2.0',
+        id: msg['id'],
+        result: {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: { tools: {} },
+          serverInfo: { name: 'fake-server', version: '9.9.9' },
+        },
+      };
+    }
+    return { jsonrpc: '2.0', id: msg['id'], result: {} };
+  };
+  return transport;
+}
+
 test('connect performs the handshake and records the server identity', async () => {
   const transport = serverDouble([]);
   const client = new McpClient(transport);
@@ -154,8 +177,37 @@ test('connect performs the handshake and records the server identity', async () 
 
   const methods = transport.sent.map((m) => m['method']);
   assert.deepEqual(methods, ['initialize', 'notifications/initialized']);
-  // The client must not claim capabilities it does not use.
-  assert.deepEqual((transport.sent[0]!['params'] as Record<string, unknown>)['capabilities'], { tools: {} });
+  // The client must not claim capabilities it does not use. `tools` is a
+  // *server* capability — `ClientCapabilities` is `{ experimental?, roots?,
+  // sampling?, elicitation? }` — so advertising it declared something the schema
+  // does not define, and a strict validator may reject the handshake for it. This
+  // client implements none of the four, so it claims none.
+  assert.deepEqual((transport.sent[0]!['params'] as Record<string, unknown>)['capabilities'], {});
+});
+
+test('a tools/list_changed notification is surfaced instead of dropped', async () => {
+  // The published tool set used to be frozen at connect time: the server is
+  // telling us its list moved, and every inbound notification was discarded, so a
+  // server that added or removed a tool at runtime kept advertising stale names.
+  const transport = lenientServerDouble();
+  const client = new McpClient(transport, { requestTimeoutMs: 5_000, handshakeTimeoutMs: 5_000 });
+  let changes = 0;
+  client.onToolsChanged(() => {
+    changes += 1;
+  });
+  await client.connect();
+
+  transport.push({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(changes, 1, 'the notification must be reported');
+
+  // An unrelated notification is still ignored, and must not be answered.
+  const sentBefore = transport.sent.length;
+  transport.push({ jsonrpc: '2.0', method: 'notifications/something/else' });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(changes, 1, 'only a tool-list change counts');
+  assert.equal(transport.sent.length, sentBefore, 'a notification is never answered');
+  await client.close();
 });
 
 test('connect reports a server that refuses the handshake', async () => {
@@ -280,6 +332,62 @@ test('a transport failure rejects pending calls with its reason', async () => {
   await new Promise((r) => setTimeout(r, 10));
   transport.fail(new Error('pipe closed'));
   await assert.rejects(() => pending, /pipe closed/);
+});
+
+test('a server→client request is answered, not mistaken for a response', async () => {
+  // The regression this pins: `handleMessage` checked only for an `id`, and a
+  // server-initiated request has one too. So `sampling/createMessage`,
+  // `roots/list` or `ping` arriving while a `tools/call` was in flight was read
+  // as the *answer* to it — the pending promise resolved with `undefined`, i.e.
+  // silently wrong data — and the server was never replied to.
+  const transport = lenientServerDouble();
+  const client = new McpClient(transport, { requestTimeoutMs: 5_000, handshakeTimeoutMs: 5_000 });
+  await client.connect();
+  const sentBefore = transport.sent.length;
+  // A ping must be answered with an empty result.
+  transport.push({ jsonrpc: '2.0', id: 'server-ping-1', method: 'ping' });
+  await new Promise((r) => setTimeout(r, 5));
+  const pong = transport.sent.slice(sentBefore).find((m) => m['id'] === 'server-ping-1');
+  assert.ok(pong, 'the client must answer a server ping');
+  assert.deepEqual(pong['result'], {});
+  assert.equal('error' in pong, false);
+
+  // Anything else is refused by name, so the server stops asking instead of
+  // waiting on a promise nobody will settle.
+  transport.push({ jsonrpc: '2.0', id: 'server-req-2', method: 'sampling/createMessage' });
+  await new Promise((r) => setTimeout(r, 5));
+  const refusal = transport.sent.slice(sentBefore).find((m) => m['id'] === 'server-req-2');
+  assert.ok(refusal, 'the client must answer an unsupported server request');
+  const error = refusal['error'] as { code: number; message: string };
+  assert.equal(error.code, -32601);
+  assert.match(error.message, /sampling\/createMessage/);
+
+  await client.close();
+});
+
+test('a server request arriving mid-call does not resolve that call with undefined', async () => {
+  // The concrete damage: a `tools/call` in flight, a server request arrives, and
+  // the call resolves to nothing while the tool result is still on its way.
+  const transport = new FakeTransport();
+  let answered = false;
+  transport.respond = (msg) => {
+    if (msg['method'] === 'initialize') {
+      return { jsonrpc: '2.0', id: msg['id'], result: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: 'x', version: '1' } } };
+    }
+    if (msg['method'] === 'tools/call') {
+      answered = true;
+      // Interleave a server-initiated request *before* the real answer.
+      transport.push({ jsonrpc: '2.0', id: 'interleaved', method: 'roots/list' });
+      return { jsonrpc: '2.0', id: msg['id'], result: { content: [{ type: 'text', text: 'THE REAL ANSWER' }] } };
+    }
+    return undefined;
+  };
+  const client = new McpClient(transport, { requestTimeoutMs: 5_000, handshakeTimeoutMs: 5_000 });
+  await client.connect();
+  const result = await client.callTool('t', {});
+  assert.ok(answered, 'the tool call should have been answered');
+  assert.match(JSON.stringify(result), /THE REAL ANSWER/, 'the call must carry the real result, not undefined');
+  await client.close();
 });
 
 // ---------------------------------------------------------------------------

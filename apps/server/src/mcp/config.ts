@@ -28,8 +28,24 @@ export interface McpConfigResult {
   file: string | null;
 }
 
-/** Server ids appear inside tool names, so keep them to a safe alphabet. */
-const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+/**
+ * Server ids appear inside published tool names, so keep them to a safe alphabet.
+ *
+ * `_` is deliberately **not** allowed, and the reason is the naming scheme itself:
+ * a published name is `mcp__<server>__<tool>`, so with `_` in an id, server `a`
+ * with tool `b__c` and server `a__b` with tool `c` both publish `mcp__a__b__c`.
+ * That collision was handled by skipping whichever server connected second, with
+ * a warning — so which server's tool an employee got depended on connect order,
+ * and `parsePublishedToolName` split at the first separator and could not recover
+ * the second form at all. The comment here used to claim ids "cannot be confused
+ * with the `__` separator", which was simply untrue of `_`; the vendor config
+ * already refuses it for the same reason.
+ */
+const ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
+
+/** The rule, phrased so an operator can fix the id they typed. */
+const ID_RULE =
+  'must be letters, digits or "-", and start with a letter or digit (no "_", which is the tool-name separator)';
 
 /**
  * Parse the `DEV3D_MCP_SERVERS` environment variable.
@@ -65,7 +81,7 @@ export function parseServerList(raw: string): { servers: McpServerConfig[]; prob
     const id = entry.slice(0, eq).trim();
     const rest = entry.slice(eq + 1).trim();
     if (!ID_RE.test(id)) {
-      problems.push(`MCP server id ${JSON.stringify(id)} must be letters, digits, "-" or "_", and start with one of the first two.`);
+      problems.push(`MCP server id ${JSON.stringify(id)} ${ID_RULE}.`);
       continue;
     }
     if (rest === '') {
@@ -129,7 +145,7 @@ function readServer(entry: unknown, where: string, problems: string[]): McpServe
   }
   const id = entry['id'];
   if (typeof id !== 'string' || !ID_RE.test(id)) {
-    problems.push(`${where}.id must be letters, digits, "-" or "_", and start with one of the first two.`);
+    problems.push(`${where}.id ${ID_RULE}.`);
     return null;
   }
   const enabled = entry['enabled'] !== false;

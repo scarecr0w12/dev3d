@@ -48,6 +48,7 @@ the office itself.
 """
 
 import bpy
+import bmesh
 import json
 import math
 import os
@@ -192,6 +193,79 @@ _CUBE = None
 _CYLINDER = None
 _SHAPE_CACHE = {}
 
+# ---- edge treatment --------------------------------------------------------
+#
+# A razor-sharp 90 degree corner has no surface for a highlight to land on, which
+# is why an unbevelled box reads as cardboard however carefully it is lit. Six
+# millimetres of bevel and an angle threshold on the shading is what makes the
+# kit's furniture look like the same furniture as the core office's.
+#
+# It is applied to **furniture only**. The shell is `W_*` and the fit-out is
+# `F_*`, and the split is not cosmetic: modules tile flush against each other and
+# against the core, so a bevelled slab or wall would cut a chamfer along every
+# joint and draw a groove across the floor wherever two modules meet. The shell
+# has to stay exactly the size it declares.
+FURNITURE_PREFIX = "F_"
+BEVEL = 0.006
+BEVEL_SEGMENTS = 2
+SMOOTH_ANGLE = math.radians(34.0)
+
+
+def _shade_smooth(ob, angle):
+    """Smooth the rounded edges, and leave the flats flat.
+
+    Blender moved this around: 4.1 replaced `use_auto_smooth` with an operator and
+    renamed the operator on the way. All three are tried in preference order rather
+    than version-sniffed, and the fallback is flat shading - so the worst case is a
+    bevel with a hard edge on it rather than a crash.
+    """
+    for op in ("shade_smooth_by_angle", "shade_auto_smooth"):
+        fn = getattr(bpy.ops.object, op, None)
+        if fn is None:
+            continue
+        try:
+            fn(angle=angle)
+            return op
+        except Exception:
+            continue
+    try:
+        bpy.ops.object.shade_smooth()
+        ob.data.use_auto_smooth = True
+        ob.data.auto_smooth_angle = angle
+        return "legacy"
+    except Exception:
+        bpy.ops.object.shade_flat()
+        return "flat"
+
+
+def _bevel_mesh(mesh, size, width, segments):
+    """Round every edge of a sized mesh, in place.
+
+    A modifier needs an object to live on, and the mesh here is deliberately
+    ownerless until it is instanced - so it is lent a temporary one, bevelled, and
+    handed back. The width is clamped to a third of the part's thinnest axis: an
+    8 mm bevel on a 14 mm-thick art board would round the board into a lozenge.
+    """
+    width = min(width, min(size) / 3.0)
+    if width <= 0.0005:
+        return
+    ob = bpy.data.objects.new("Bevel_Tmp", mesh)
+    bpy.context.scene.collection.objects.link(ob)
+    bpy.context.view_layer.objects.active = ob
+    ob.select_set(True)
+    mod = ob.modifiers.new(name="Bevel", type='BEVEL')
+    mod.width = width
+    mod.segments = segments
+    mod.limit_method = 'ANGLE'
+    mod.angle_limit = math.radians(30.0)
+    try:
+        mod.miter_outer = 'MITER_ARC'
+    except Exception:
+        pass
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+    _shade_smooth(ob, SMOOTH_ANGLE)
+    bpy.data.objects.remove(ob, do_unlink=True)
+
 
 def _cube_mesh():
     global _CUBE
@@ -215,6 +289,40 @@ def _cylinder_mesh(vertices):
     return _CYLINDER
 
 
+def _uv_world_scale(mesh, metres_per_tile=1.0):
+    """Give a part UVs measured in *metres*: one UV unit is one metre of surface.
+
+    Blender's own cube projection would do most of this, but it is an operator that
+    wants a UV editor in the context and this runs headless. Projecting each face
+    along its own dominant normal is not much more code and has no context to get
+    wrong.
+
+    This is the whole of texel density, and it matters more here than anywhere: the
+    kit is a jigsaw of differently-sized modules, so a per-part unwrap made the
+    same floor surface tile at a different real-world size in every module and at a
+    third size again in the core. Measuring in metres means one tile covers one
+    metre on every surface of the whole building, and the browser's per-role tiling
+    becomes an exact figure rather than a guess.
+
+    UVs are metadata, not geometry, so unlike the bevel this is applied to the shell
+    as well - it cannot move a module's edges, and the walls and floors are exactly
+    the surfaces whose tiling was worst.
+    """
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.normal_update()
+    uv_layer = bm.loops.layers.uv.verify()
+    for face in bm.faces:
+        normal = face.normal
+        axis = max(range(3), key=lambda i: abs(normal[i]))
+        u_axis, v_axis = [i for i in range(3) if i != axis]
+        for loop in face.loops:
+            co = loop.vert.co
+            loop[uv_layer].uv = (co[u_axis] / metres_per_tile, co[v_axis] / metres_per_tile)
+    bm.to_mesh(mesh)
+    bm.free()
+
+
 def _sized_mesh(base, size, key, material):
     """A shared mesh scaled to `size`, made once per distinct size *and surface*.
 
@@ -222,6 +330,10 @@ def _sized_mesh(base, size, key, material):
     desk top and a coat rack can be the same box, but they must not be the same
     surface. Twelve primitives times two dozen materials is still a couple of
     hundred meshes instead of fifteen hundred.
+
+    Fit-out parts are bevelled and smooth-shaded here, once per distinct shape, so
+    the treatment costs one modifier per shape rather than one per instance - see
+    the note on `FURNITURE_PREFIX` above for why the shell is left out of it.
     """
     surface = material.name if material is not None else "-"
     cache_key = (key, surface, round(size[0], 4), round(size[1], 4), round(size[2], 4))
@@ -231,6 +343,11 @@ def _sized_mesh(base, size, key, material):
     mesh = base.copy()
     mesh.name = "Shape_%s_%s_%d" % (key, surface, len(_SHAPE_CACHE))
     mesh.transform(Matrix.Diagonal((size[0] / 2.0, size[1] / 2.0, size[2] / 2.0, 1.0)))
+    if surface.startswith(FURNITURE_PREFIX):
+        _bevel_mesh(mesh, size, BEVEL, BEVEL_SEGMENTS)
+    # After the bevel, so the rounded edges get UVs of their own rather than an
+    # interpolation of the primitive's, and applied to the shell too - see above.
+    _uv_world_scale(mesh)
     if material is not None:
         mesh.materials.append(material)
     _SHAPE_CACHE[cache_key] = mesh
@@ -397,30 +514,70 @@ class Block:
         self.part("DeskTop_%s" % tag, (DESK_W, DESK_D, 0.05), (x, y, DESK_H), M["desk_top"], (0, 0, facing))
         self.part("DeskApron_%s" % tag, (DESK_W - 0.2, DESK_D - 0.1, 0.10), (x, y, DESK_H - 0.09),
                   M["desk"], (0, 0, facing))
+        self.part("DeskTray_%s" % tag, (0.95, 0.12, 0.05), (x, y, DESK_H - 0.145), M["frame"], (0, 0, facing))
         for i, side in enumerate((-1, 1)):
             lx = x + side * (DESK_W / 2.0 - 0.09) * cos
             ly = y + side * (DESK_W / 2.0 - 0.09) * sin
             self.part("DeskLeg_%s_%d" % (tag, i), (0.07, DESK_D - 0.12, DESK_H - 0.1),
                       (lx, ly, (DESK_H - 0.1) / 2.0), M["frame"], (0, 0, facing))
 
-        # Screen stand + panel, on the far side of the desk from the seat. Every
-        # third workstation is dark, because a floor of uniformly glowing
-        # monitors looks like a render rather than an office.
-        sx = x - sin * -0.22
-        sy = y + cos * -0.22
+        # A point in the desk's own frame: `dy` runs away from the seat, so a part
+        # at +dy is farther from the person sitting at -0.74.
+        def desk(dx, dy):
+            return (x + dx * cos - dy * sin, y + dx * sin + dy * cos)
+
+        # Screen: a panel inset in a bezel, on a neck and a foot, at the *back* of
+        # the desk. It used to sit 0.22 m towards the seat with the keyboard 0.10 m
+        # away from it, which put the keyboard 0.32 m behind the monitor - you had
+        # to reach past the screen to type. Every third workstation is dark, because
+        # a floor of uniformly glowing monitors looks like a render, not an office.
+        sx, sy = desk(0.0, 0.22)
         screen_mat = M["screen"] if index % 3 != 2 else M["screen_off"]
-        self.part("ScreenPanel_%s" % tag, (0.62, 0.03, 0.36), (sx, sy, DESK_H + 0.30),
+        self.part("ScreenPanel_%s" % tag, (0.595, 0.020, 0.335), (sx, sy, DESK_H + 0.30),
                   screen_mat, (0, 0, facing))
-        self.part("ScreenStand_%s" % tag, (0.12, 0.12, 0.16), (sx, sy, DESK_H + 0.06),
+        for edge, dx, dz, size in (
+            ("T", 0.0, 0.178, (0.625, 0.030, 0.020)),
+            ("B", 0.0, -0.178, (0.625, 0.030, 0.020)),
+            ("L", -0.312, 0.0, (0.020, 0.030, 0.355)),
+            ("R", 0.312, 0.0, (0.020, 0.030, 0.355)),
+        ):
+            ex, ey = desk(dx, 0.215)
+            self.part("ScreenBezel_%s_%s" % (tag, edge), size, (ex, ey, DESK_H + 0.30 + dz),
+                      M["frame"], (0, 0, facing))
+        self.part("ScreenNeck_%s" % tag, (0.05, 0.05, 0.13), (sx, sy, DESK_H + 0.065),
+                  M["frame"], (0, 0, facing))
+        self.part("ScreenFoot_%s" % tag, (0.26, 0.18, 0.016), (sx, sy, DESK_H + 0.008),
                   M["frame"], (0, 0, facing))
 
-        # Chair: seat pad, backrest, post. Behind the desk, where the worker sits.
+        # What is on the desk in front of it.
+        kx, ky = desk(0.0, -0.10)
+        self.part("Keyboard_%s" % tag, (0.36, 0.13, 0.016), (kx, ky, DESK_H + 0.008),
+                  M["frame"], (0, 0, facing))
+        px, py = desk(0.30, -0.10)
+        self.part("Mouse_%s" % tag, (0.065, 0.105, 0.026), (px, py, DESK_H + 0.013),
+                  M["frame"], (0, 0, facing))
+
+        # Chair: a five-star base on casters, a gas lift, and a seat and back. The
+        # same chair the core office has, because a grown room is most of the
+        # building and a chair with no base reads as a stool on a stick from every
+        # angle this model is ever seen from.
         cx = x + sin * (DESK_D / 2.0 + 0.34)
         cy = y - cos * (DESK_D / 2.0 + 0.34)
-        self.part("ChairSeat_%s" % tag, (0.46, 0.44, 0.06), (cx, cy, 0.46), M["soft"], (0, 0, facing))
-        self.part("ChairBack_%s" % tag, (0.44, 0.06, 0.42), (cx + sin * 0.2, cy - cos * 0.2, 0.68),
-                  M["soft_deep"], (0, 0, facing))
-        self.part("ChairPost_%s" % tag, (0.07, 0.07, 0.44), (cx, cy, 0.22), M["frame"], (0, 0, facing))
+        for i in range(5):
+            angle = facing + i * (2.0 * math.pi / 5.0)
+            arm_cos, arm_sin = math.cos(angle), math.sin(angle)
+            self.part("ChairArm_%s_%d" % (tag, i), (0.30, 0.055, 0.030),
+                      (cx + arm_cos * 0.15, cy + arm_sin * 0.15, 0.052), M["frame"], (0, 0, angle))
+            # A caster lies on its side, so its axis runs across the arm rather than
+            # through the floor - which is what makes it read as a wheel.
+            self.tube("ChairCaster_%s_%d" % (tag, i), 0.034, 0.026,
+                      (cx + arm_cos * 0.295, cy + arm_sin * 0.295, 0.034), M["frame"],
+                      (math.pi / 2.0, 0.0, angle))
+        self.tube("ChairLift_%s" % tag, 0.030, 0.31, (cx, cy, 0.20), M["frame"])
+        self.part("ChairSeat_%s" % tag, (0.48, 0.46, 0.070), (cx, cy, 0.450), M["soft"], (0, 0, facing))
+        self.part("ChairPad_%s" % tag, (0.43, 0.41, 0.022), (cx, cy, 0.496), M["soft_deep"], (0, 0, facing))
+        self.part("ChairBack_%s" % tag, (0.46, 0.055, 0.44),
+                  (cx + sin * 0.205, cy - cos * 0.205, 0.72), M["soft_deep"], (0, 0, facing))
 
         self.anchor(seat_name, (cx, cy, 0.0))
         self.seats.append(seat_name)
@@ -435,12 +592,18 @@ class Block:
         at the wrong wall.
         """
         tag = seat_name[len("Seat_"):]
+        cos, sin = math.cos(facing), math.sin(facing)
         self.anchor(desk_name, (x, y, DESK_H) if anchor is None else (anchor[0], anchor[1], DESK_H))
-        self.part("Chair_%s_Seat" % tag, (0.44, 0.42, 0.06), (x, y, 0.45), M["soft"], (0, 0, facing))
-        self.part("Chair_%s_Back" % tag, (0.44, 0.06, 0.40),
-                  (x + math.sin(facing) * 0.19, y - math.cos(facing) * 0.19, 0.66),
+        # Four legs, not a central post. A meeting chair is a side chair, and a
+        # single pedestal under one reads as a bar stool pushed up to a table -
+        # which is exactly what this was.
+        for i, (dx, dy) in enumerate(((-0.185, -0.165), (0.185, -0.165), (-0.185, 0.165), (0.185, 0.165))):
+            self.part("Chair_%s_Leg_%d" % (tag, i), (0.036, 0.036, 0.44),
+                      (x + dx * cos - dy * sin, y + dx * sin + dy * cos, 0.22), M["frame"], (0, 0, facing))
+        self.part("Chair_%s_Seat" % tag, (0.45, 0.43, 0.055), (x, y, 0.468), M["soft"], (0, 0, facing))
+        self.part("Chair_%s_Back" % tag, (0.44, 0.05, 0.40),
+                  (x + math.sin(facing) * 0.195, y - math.cos(facing) * 0.195, 0.68),
                   M["soft_deep"], (0, 0, facing))
-        self.part("Chair_%s_Post" % tag, (0.07, 0.07, 0.42), (x, y, 0.21), M["frame"], (0, 0, facing))
         self.anchor(seat_name, (x, y, 0.0))
         self.seats.append(seat_name)
 
@@ -454,13 +617,34 @@ class Block:
         """
         tag = seat_name[len("Seat_"):]
         cos, sin = math.cos(facing), math.sin(facing)
+
+        def at(dx, dy):
+            """A point in the sofa's own frame; +dy is towards its back."""
+            return (x + dx * cos - dy * sin, y + dx * sin + dy * cos)
+
         self.part("Sofa_%s_Base" % tag, (width, 0.9, 0.40), (x, y, 0.22), M["soft"], (0, 0, facing))
-        self.part("Sofa_%s_Back" % tag, (width, 0.22, 0.44), (x - sin * 0.34, y + cos * 0.34, 0.62),
+        back_x, back_y = at(0.0, 0.34)
+        self.part("Sofa_%s_Back" % tag, (width, 0.22, 0.44), (back_x, back_y, 0.62),
                   M["soft_deep"], (0, 0, facing))
         for side in (-1, 1):
+            arm_x, arm_y = at(side * (width / 2.0 - 0.09), 0.0)
             self.part("Sofa_%s_Arm_%d" % (tag, 0 if side < 0 else 1), (0.18, 0.86, 0.24),
-                      (x + side * (width / 2.0 - 0.09) * cos, y + side * (width / 2.0 - 0.09) * sin, 0.52),
-                      M["soft_deep"], (0, 0, facing))
+                      (arm_x, arm_y, 0.52), M["soft_deep"], (0, 0, facing))
+
+        # Cushions are what make this a sofa rather than a bench, which is what a
+        # base with a back on it is. How many follows the width, so a wider sofa is
+        # not three cushions stretched.
+        inner = width - 0.36
+        count = max(2, min(4, int(round(inner / 0.62))))
+        each = inner / count
+        for i in range(count):
+            offset = (i - (count - 1) / 2.0) * each
+            sx, sy = at(offset, -0.05)
+            self.part("Sofa_%s_SeatCushion_%d" % (tag, i), (each - 0.03, 0.72, 0.15),
+                      (sx, sy, 0.495), M["soft"], (0, 0, facing))
+            bx, by = at(offset, 0.16)
+            self.part("Sofa_%s_BackCushion_%d" % (tag, i), (each - 0.04, 0.17, 0.30),
+                      (bx, by, 0.62), M["soft_deep"], (0, 0, facing))
         self.seat(0, seat_name, desk_name(seat_name), x, y - 0.55, facing)
 
     def stool(self, seat_name, x, y):
@@ -481,16 +665,43 @@ class Block:
 # `blocks.json` so the console can describe a room without loading the GLB.
 
 def prop_plant(b, tag, x, y):
-    b.part("Prop_%s_Pot" % tag, (0.34, 0.34, 0.30), (x, y, 0.15), M["storage"])
-    b.part("Prop_%s_Foliage" % tag, (0.52, 0.52, 0.62), (x, y, 0.60), M["plant"])
-    b.part("Prop_%s_Leaf" % tag, (0.66, 0.30, 0.24), (x, y, 0.86), M["plant"])
+    """A potted plant: a round pot, and leaves that are actually leaves.
+
+    This was a box with a box on top - which is exactly what the core office had
+    before it was rebuilt, and the most obvious way a room reads as a placeholder
+    rather than as a room. Nine tilted leaves cost **one** shared mesh between
+    them, because rotation lives on the object and only the shape is cached, so the
+    whole plant is three distinct shapes however many leaves it has.
+
+    The leaves stay inside the footprint the box occupied (0.52 m across). A prop
+    that grows is a prop that fails `validate()` for not fitting the room it was
+    placed in, which is the check doing its job.
+    """
+    b.tube("Prop_%s_Pot" % tag, 0.145, 0.28, (x, y, 0.14), M["storage"])
+    b.tube("Prop_%s_Rim" % tag, 0.160, 0.045, (x, y, 0.27), M["rail"])
+    for i in range(9):
+        angle = i * (2.0 * math.pi / 9.0)
+        tilt = 0.34 + (i % 3) * 0.15
+        reach = 0.09 + (i % 4) * 0.025
+        height = 0.46 + (i % 5) * 0.07
+        b.part("Prop_%s_Leaf_%d" % (tag, i), (0.085, 0.26, 0.013),
+               (x + math.cos(angle) * reach, y + math.sin(angle) * reach, height),
+               M["plant"], (tilt, 0.0, angle))
 
 
 def prop_tall_plant(b, tag, x, y):
-    b.part("Prop_%s_Pot" % tag, (0.42, 0.42, 0.36), (x, y, 0.18), M["storage"])
-    b.tube("Prop_%s_Stem" % tag, 0.05, 0.9, (x, y, 0.72), M["frame"])
-    b.part("Prop_%s_Crown" % tag, (0.72, 0.72, 0.70), (x, y, 1.38), M["plant"])
-    b.part("Prop_%s_CrownHi" % tag, (0.46, 0.46, 0.40), (x, y, 1.78), M["plant"])
+    """The same idea on a stem, for the corners a plant has to fill."""
+    b.tube("Prop_%s_Pot" % tag, 0.18, 0.34, (x, y, 0.17), M["storage"])
+    b.tube("Prop_%s_Rim" % tag, 0.195, 0.045, (x, y, 0.33), M["rail"])
+    b.tube("Prop_%s_Stem" % tag, 0.038, 1.0, (x, y, 0.85), M["frame"])
+    for i in range(12):
+        angle = i * (2.0 * math.pi / 12.0)
+        tilt = 0.30 + (i % 4) * 0.12
+        reach = 0.10 + (i % 3) * 0.03
+        height = 1.16 + (i % 6) * 0.10
+        b.part("Prop_%s_Leaf_%d" % (tag, i), (0.10, 0.32, 0.015),
+               (x + math.cos(angle) * reach, y + math.sin(angle) * reach, height),
+               M["plant"], (tilt, 0.0, angle))
 
 
 def prop_whiteboard(b, tag, x, y):
@@ -510,8 +721,12 @@ def prop_shelf(b, tag, x, y):
     for i in range(3):
         z = 0.42 + i * 0.46
         b.part("Prop_%s_Shelf_%d" % (tag, i), (1.3, 0.34, 0.04), (x, y - 0.02, z), M["desk"])
-        b.part("Prop_%s_Books_%d" % (tag, i), (0.9, 0.24, 0.22), (x - 0.1, y - 0.04, z + 0.13),
-               M["art"] if i == 0 else M["accent"])
+        # Four books rather than one block: the block read as a slab from above,
+        # which is the angle this whole model is looked at from.
+        for j in range(4):
+            b.part("Prop_%s_Book_%d_%d" % (tag, i, j), (0.055, 0.22, 0.20 + (j % 3) * 0.03),
+                   (x - 0.42 + j * 0.062, y - 0.04, z + 0.12),
+                   M["art"] if (i + j) % 2 == 0 else M["accent"])
 
 
 def prop_storage(b, tag, x, y):
@@ -559,12 +774,14 @@ def prop_printer(b, tag, x, y):
 def prop_lamp(b, tag, x, y):
     b.tube("Prop_%s_Base" % tag, 0.16, 0.04, (x, y, 0.02), M["frame"])
     b.tube("Prop_%s_Post" % tag, 0.035, 1.4, (x, y, 0.72), M["frame"])
-    b.part("Prop_%s_Shade" % tag, (0.34, 0.34, 0.24), (x, y, 1.5), M["fixture"])
+    # A shade is a cone of revolution, so it is turned rather than extruded - a box
+    # here reads as a lampshade only from directly in front of it.
+    b.tube("Prop_%s_Shade" % tag, 0.175, 0.24, (x, y, 1.5), M["fixture"])
 
 
 def prop_pendant(b, tag, x, y):
     b.tube("Prop_%s_Cord" % tag, 0.012, 0.62, (x, y, 2.69), M["frame"])
-    b.part("Prop_%s_Cone" % tag, (0.44, 0.44, 0.28), (x, y, 2.24), M["fixture"])
+    b.tube("Prop_%s_Cone" % tag, 0.22, 0.26, (x, y, 2.24), M["fixture"])
     b.tube("Prop_%s_Bulb" % tag, 0.07, 0.1, (x, y, 2.04), M["neon"])
 
 

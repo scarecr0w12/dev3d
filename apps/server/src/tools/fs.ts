@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Tool, ToolContext, ToolResult } from './types.ts';
-import { resolveInWorkspace, toWorkspaceRelative } from './paths.ts';
+import { resolveInWorkspace, toWorkspaceRelative, assertNotGitControlPath } from './paths.ts';
 import { SKIPPED_DIRS, globMatches } from './match.ts';
 
 const MAX_LIST_ENTRIES = 200;
@@ -324,6 +324,7 @@ const writeFileTool: Tool = {
       return fail('write_file requires a string "content".');
     }
     const target = resolveInWorkspace(ctx.workspaceRoot, args.path);
+    assertNotGitControlPath(ctx.workspaceRoot, target);
     const rel = toWorkspaceRelative(ctx.workspaceRoot, target);
     mkdirSync(join(target, '..'), { recursive: true });
     const bytes = Buffer.byteLength(args.content, 'utf8');
@@ -371,6 +372,7 @@ const editFileTool: Tool = {
       return fail('edit_file requires a string "newString".');
     }
     const target = resolveInWorkspace(ctx.workspaceRoot, args.path);
+    assertNotGitControlPath(ctx.workspaceRoot, target);
     if (!existsSync(target)) return fail(`File does not exist: ${args.path}`);
     const st = statSync(target);
     if (st.isDirectory()) return fail(`"${args.path}" is a directory; edit_file works on files.`);

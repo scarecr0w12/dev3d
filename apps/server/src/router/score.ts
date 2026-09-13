@@ -145,6 +145,25 @@ export function qualityOf(model: ModelSpec): number | undefined {
   return typeof quality === 'number' && Number.isFinite(quality) ? quality : undefined;
 }
 
+/**
+ * The key a candidate is scored under: its provider *and* its model id.
+ *
+ * Every map in this module used to be keyed by the bare `model.id`, while the pool
+ * the router ranks spans every provider — so two providers serving the same model id
+ * collided. The cost map silently kept whichever came last, and the *other* candidate
+ * was then scored with a different model's price; a plugin hint aimed at one
+ * provider's model applied to both. Latent today (all 455 catalog ids are unique, and
+ * OpenRouter's are namespaced), but it becomes real the moment a plugin declares a
+ * provider serving an id a built-in one also serves — which is the whole point of the
+ * plugin model.
+ *
+ * It lives here, exported, so the two maps cannot disagree about how they key: a
+ * second copy of this rule is how the bug comes back.
+ */
+export function candidateKey(model: Pick<ModelSpec, 'providerId' | 'id'>): string {
+  return `${model.providerId}/${model.id}`;
+}
+
 /** Compressed 0..1 cost of each model within one pool, for the cost penalty. */
 function normalizedCosts(models: ModelSpec[]): Map<string, number> {
   const out = new Map<string, number>();
@@ -160,12 +179,12 @@ function normalizedCosts(models: ModelSpec[]): Map<string, number> {
     const value = Math.log1p(Math.max(0, cost));
     if (value < min) min = value;
     if (value > max) max = value;
-    return { id: model.id, value };
+    return { key: candidateKey(model), value };
   });
 
   const span = max - min;
-  for (const { id, value } of logged) {
-    out.set(id, span > 0 ? (value - min) / span : 0);
+  for (const { key, value } of logged) {
+    out.set(key, span > 0 ? (value - min) / span : 0);
   }
   return out;
 }
@@ -185,7 +204,7 @@ export interface ScoreContext {
   /** Every candidate the score is being computed across. */
   pool: ModelSpec[];
   /**
-   * Additive adjustments from plugin routing rules, keyed by model id.
+   * Additive adjustments from plugin routing rules, keyed by `candidateKey`.
    *
    * The *router* builds this map, because scoping a rule to a tier is plugin
    * semantics and this module should not need to know about them. What arrives
@@ -289,7 +308,7 @@ function scoreWith(model: ModelSpec, ctx: ScoreContext, prepared: PreparedPool):
   // A tier that is not on the walk at all is still scorable - the walk is a
   // preference order, not an allow-list - but it sits behind everything on it.
   const affinity = walkPosition >= 0 ? affinityAt(walkPosition) : 0;
-  const normalizedCost = prepared.costs.get(model.id) ?? 0;
+  const normalizedCost = prepared.costs.get(candidateKey(model)) ?? 0;
 
   // Uptime demotes, and only when it is actually known. An unknown provider must
   // not be penalised for being unmeasured, or every model outside OpenRouter
@@ -303,7 +322,7 @@ function scoreWith(model: ModelSpec, ctx: ScoreContext, prepared: PreparedPool):
     SCORE_WEIGHTS.tier * affinity -
     prepared.pressure * normalizedCost -
     reliabilityPenalty +
-    (ctx.hintBonus?.get(model.id) ?? 0);
+    (ctx.hintBonus?.get(candidateKey(model)) ?? 0);
 
   return {
     model,
@@ -362,7 +381,9 @@ export function rankCandidates(models: ModelSpec[], ctx: ScoreContext): ScoredCa
     (a, b) =>
       b.score - a.score ||
       blendedCostPerKTok(a.model) - blendedCostPerKTok(b.model) ||
-      a.model.id.localeCompare(b.model.id),
+      // The full key, not the bare id: two providers serving the same id would
+      // otherwise tie here and the order would depend on the sort's stability.
+      candidateKey(a.model).localeCompare(candidateKey(b.model)),
   );
 }
 

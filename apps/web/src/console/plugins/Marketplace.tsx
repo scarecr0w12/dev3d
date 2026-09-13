@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { ChangeEvent } from 'react';
 
+import { apiCompatible } from '@dev3d/core';
 import type { PluginCatalog, PluginCatalogEntry, PluginRecord, PluginSourceRecord } from '@dev3d/core';
 
 import { api } from '../../app/api';
@@ -499,7 +500,7 @@ function CatalogRow({
           <span className="dim small">plugin API</span>
           <span className="mono small">
             {manifest.apiVersion}
-            {manifest.apiVersion !== '1' ? ' — check compatibility before installing' : ''}
+            {!apiCompatible(manifest.apiVersion) ? ' — check compatibility before installing' : ''}
           </span>
         </span>
 
